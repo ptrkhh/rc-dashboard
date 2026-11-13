@@ -573,3 +573,20 @@ test('running cards put Chat and Open in Claude on one row and the session tools
   assert.ok(/data-term=/.test(full[1]) && /data-copy=/.test(full[1]) && /data-kill=/.test(full[1]));
   assert.equal(rows(card({ name: 'cdash-t', dir: '/p', provider: 'terminal' })).length, 1, 'a bare terminal has no empty row');
 });
+
+test('older history is asked for while the list cannot scroll, and Send again keeps its row offline', async () => {
+  globalThis.document = undefined;
+  await import('../public/chat/store.js');
+  await import('../public/chat/view.js');
+  const { needPage, resend } = globalThis.cdashChat;
+  assert.equal(needPage(true, false, 0, 500, 600), true, 'a first screen that does not scroll still pages');
+  assert.equal(needPage(true, false, 10, 3000, 600), true, 'scrolled to the top');
+  assert.equal(needPage(true, false, 900, 3000, 600), false);
+  assert.equal(needPage(false, false, 0, 500, 600), false, 'nothing older');
+  assert.equal(needPage(true, true, 0, 500, 600), false, 'one page at a time');
+  const s = { mine: [{ cid: 'c1', text: 'hi', status: 'unconfirmed', seq: null }] };
+  assert.equal(resend(s, 'c1', () => false), false);
+  assert.deepEqual(s.mine.map(m => m.cid), ['c1'], 'offline: the row and its text stay');
+  assert.equal(resend(s, 'c1', text => text === 'hi'), true);
+  assert.deepEqual(s.mine, []);
+});

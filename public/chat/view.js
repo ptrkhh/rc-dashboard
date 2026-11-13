@@ -32,10 +32,7 @@
       if (!c) return;
       c.follow = log.scrollHeight - log.scrollTop - log.clientHeight < NEAR;
       $('#chat-jump').hidden = c.follow;
-      if (log.scrollTop < 40 && c.state.more && !c.paging && c.ws?.readyState === WebSocket.OPEN) {
-        c.paging = true;
-        c.ws.send(JSON.stringify({ t: 'page', before: c.state.first }));
-      }
+      askPage(log);
     });
     $('#chat-jump').addEventListener('click', () => {
       if (!c) return;
@@ -54,9 +51,11 @@
       const cid = b.dataset.edit ?? b.dataset.again ?? b.dataset.dismiss;
       const m = c.state.mine.find(x => x.cid === cid);
       if (!m) return;
-      c.state.mine = c.state.mine.filter(x => x !== m);
-      if (b.dataset.edit !== undefined) toBox(m.text);
-      else if (b.dataset.again !== undefined) submitText(m.text);
+      if (b.dataset.again !== undefined) resend(c.state, cid, submitText);
+      else {
+        c.state.mine = c.state.mine.filter(x => x !== m);
+        if (b.dataset.edit !== undefined) toBox(m.text);
+      }
       schedule();
     });
     $('#chat-held').addEventListener('click', e => {
@@ -161,8 +160,27 @@
     };
   }
 
+  // Older history is wanted at the top, or whenever the list is too short to scroll.
+  function needPage(more, paging, top, height, view) {
+    return more && !paging && (top < 40 || height <= view);
+  }
+
+  function askPage(log) {
+    if (!needPage(c.state.more, c.paging, log.scrollTop, log.scrollHeight, log.clientHeight) || c.ws?.readyState !== WebSocket.OPEN) return;
+    c.paging = true;
+    c.ws.send(JSON.stringify({ t: 'page', before: c.state.first }));
+  }
+
+  // Send again: the row goes only once the text has been sent, so offline it stays.
+  function resend(state, cid, send) {
+    const m = state.mine.find(x => x.cid === cid);
+    if (!m || !send(m.text)) return false;
+    state.mine = state.mine.filter(x => x !== m);
+    return true;
+  }
+
   function sendFrame(f) {
-    if (c?.ws?.readyState !== WebSocket.OPEN) { c?.opts.toast?.('Not connected'); return false; }
+    if (c?.ws?.readyState !== WebSocket.OPEN) { c?.opts.toast?.('Offline'); return false; }
     c.ws.send(JSON.stringify(f));
     return true;
   }
@@ -300,6 +318,7 @@
       log.scrollTop = log.scrollHeight;
     }
     $('#chat-jump').hidden = x.follow;
+    askPage(log);
   }
 
   function renderHeld() {
@@ -396,6 +415,8 @@
 
   g.cdashChat = {
     composerMode,
+    needPage,
+    resend,
     open,
     close,
     isOpen: () => !!c,

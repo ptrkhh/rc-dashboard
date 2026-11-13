@@ -83,3 +83,13 @@ test('a message Claude queued shows once, as queued, until Claude takes it', () 
   s = S.apply(s, ev(2, prompt('q1', 'later', { src: 'steer', cid: 'c1' })));
   assert.deepEqual(S.rows(s).map(r => [r.text, r.status]), [['later', 'sent']]);
 });
+
+test('held rows the latest state no longer lists are dropped, or kept as not sent when the session ended', () => {
+  let s = feed([hello(), { t: 'state', working: false, waiting: false, ended: false, held: [] }]);
+  S.addMine(s, 'c1', 'one'); s = S.apply(s, { t: 'ack', cid: 'c1', status: 'held', id: 'h1' });
+  S.addMine(s, 'c2', 'two'); s = S.apply(s, { t: 'ack', cid: 'c2', status: 'held', id: 'h2' });
+  s = S.apply(s, { t: 'state', working: true, waiting: false, ended: false, held: [{ id: 'h2', text: 'two' }] });
+  assert.deepEqual(s.mine.map(m => m.cid), ['c2'], 'h1 left the queue while this client was away');
+  s = S.apply(s, { t: 'state', working: false, waiting: false, ended: true, held: [] });
+  assert.deepEqual(S.rows(s).map(r => [r.text, r.status, r.error]), [['two', 'refused', 'session ended']]);
+});

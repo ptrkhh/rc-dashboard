@@ -74,10 +74,12 @@
         break;
       case 'state':
         Object.assign(s, { working: !!f.working, waiting: !!f.waiting, ended: !!f.ended, unreadable: !!f.unreadable, held: f.held || [] });
-        if (s.forgetHeld) {
-          // An agent that restarted lost its queue; say so instead of waiting forever.
+        {
+          // Held rows the agent no longer lists: the session ended, the agent lost its queue, or they left it elsewhere.
           const ids = new Set(s.held.map(h => h.id));
-          for (const m of s.mine) if (m.status === 'held' && !ids.has(m.heldId)) { m.status = 'refused'; m.error = 'not sent'; }
+          const gone = m => m.status === 'held' && !ids.has(m.heldId);
+          for (const m of s.mine) if (gone(m) && (s.ended || s.forgetHeld)) { m.status = 'refused'; m.error = s.ended ? 'session ended' : 'not sent'; }
+          s.mine = s.mine.filter(m => m.status !== 'held' || ids.has(m.heldId));
           s.forgetHeld = false;
         }
         break;
