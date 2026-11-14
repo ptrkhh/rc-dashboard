@@ -189,6 +189,11 @@ else {
  if(path==='/api/session'&&req.method==='POST')return send(res,{data:{id:'ses_fixture'}});
  if(path==='/api/session/ses_fixture/message'&&process.env.CDASH_TEST_FLAKY&&!fs.existsSync(process.env.CDASH_TEST_FLAKY)){fs.writeFileSync(process.env.CDASH_TEST_FLAKY,'1');return send(res,{data:'broken'});}
  if(path==='/api/session/ses_fixture/message')return send(res,{data:[{id:'msg_u',type:'user',text:'hello'},{id:'msg_a',type:'assistant',time:{completed:1},content:[{type:'text',text:'hi there'}]}],cursor:{}});
+ if(path.includes('/form/')&&path.endsWith('/reply')){res.writeHead(path.includes('/frm_done/')?409:204);return res.end();}
+ if(path==='/api/command')return send(res,{data:[{name:'review',description:'Review changes'}]});
+ if(path==='/api/agent')return send(res,{data:[{id:'build',name:'build',mode:'primary',hidden:false},{id:'plan',name:'plan',mode:'primary',hidden:false},{id:'explore',name:'explore',mode:'subagent',hidden:false},{id:'title',name:'title',mode:'primary',hidden:true}]});
+ if(path==='/api/model')return send(res,{data:[{providerID:'fixture',id:'model',name:'Model',variants:[{id:'high'}]},{providerID:'fixture',id:'other',name:'Other',variants:[]}]});
+ if(req.method==='POST'&&/\\/(agent|model|command)$/.test(path)){res.writeHead(204);return res.end();}
  if(path.endsWith('/form')||path.endsWith('/permission'))return send(res,{data:[]});
  if(path.endsWith('/prompt'))return send(res,{data:{id:body.id,sessionID:'ses_fixture',type:'user'}});
  if(path.endsWith('/interrupt'))return send(res,{data:true});
@@ -279,5 +284,62 @@ test('one failed history read neither leaves chat connecting forever nor freezes
   await until(() => c.lines.some(l => l.t === 'ready'));
   await until(() => c.lines.filter(l => l.t === 'ev').length >= 2);
   assert.deepEqual(c.lines.filter(l => l.t === 'ev').map(l => l.ev.message.content[0].text), ['hello', 'hi there']);
+  c.close();
+});
+
+const res = async (c, rid) => { await until(() => c.lines.some(l => l.t === 'res' && l.rid === rid)); return c.lines.find(l => l.t === 'res' && l.rid === rid); };
+const asksNow = c => c.lines.findLast(l => l.t === 'asks')?.asks ?? [];
+const form = id => ({ id, sessionID: 'ses_fixture', title: 'Questions', metadata: { kind: 'question' }, fields: [
+  { key: 'q0', type: 'string', title: 'Color', description: 'Pick a color', options: [{ value: 'Red', label: 'Red' }, { value: 'Blue', label: 'Blue' }], custom: true },
+  { key: 'q1', type: 'multiselect', title: 'Fruits', description: 'Pick fruits', options: [{ value: 'Apple', label: 'Apple' }, { value: 'Pear', label: 'Pear' }], custom: true }] });
+test('question forms become cards, answers post the form reply, and settled forms drop', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  await f.emit({ type: 'form.created', data: { form: form('frm_1') } });
+  await until(() => asksNow(c).length === 1);
+  assert.deepEqual(asksNow(c)[0], { id: 'frm_1', kind: 'question', tool: 'opencode', questions: [
+    { id: 'q0', header: 'Color', question: 'Pick a color', multi: false, other: true, secret: false, options: [{ label: 'Red', description: '' }, { label: 'Blue', description: '' }] },
+    { id: 'q1', header: 'Fruits', question: 'Pick fruits', multi: true, other: true, secret: false, options: [{ label: 'Apple', description: '' }, { label: 'Pear', description: '' }] }] });
+  await until(() => c.lines.some(l => l.t === 'state' && l.waiting === true));
+  c.write({ t: 'req', rid: 1, op: 'answer', id: 'frm_1', answer: { answers: { q0: { choices: ['Blue'] }, q1: { choices: ['Apple'], text: 'Kiwi' } } } });
+  assert.equal((await res(c, 1)).ok, true);
+  assert.deepEqual(f.posted('/form/frm_1/reply'), { answer: { q0: 'Blue', q1: ['Apple', 'Kiwi'] } });
+  await f.emit({ type: 'form.replied', data: { id: 'frm_1', sessionID: f.native().sid, answer: {} } });
+  await until(() => asksNow(c).length === 0);
+  await f.emit({ type: 'form.created', data: { form: form('frm_done') } });
+  await until(() => asksNow(c).length === 1);
+  c.write({ t: 'req', rid: 2, op: 'answer', id: 'frm_done', answer: { answers: { q0: { choices: ['Red'] }, q1: { choices: ['Pear'] } } } });
+  assert.deepEqual(await res(c, 2), { t: 'res', rid: 2, ok: false, error: 'already answered' });
+  await until(() => asksNow(c).length === 0);
+  c.close();
+});
+test('pickers and the menu use the session API, and listed slash commands run as commands', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  c.write({ t: 'req', rid: 1, op: 'menu' });
+  assert.deepEqual((await res(c, 1)).data, { commands: [{ name: 'review', description: 'Review changes' }],
+    models: [{ value: 'fixture/model', label: 'Model', variants: ['high'] }, { value: 'fixture/other', label: 'Other', variants: [] }],
+    efforts: [], agents: [{ value: 'build', label: 'build' }, { value: 'plan', label: 'plan' }] });
+  c.write({ t: 'req', rid: 2, op: 'set', what: 'agent', value: 'plan' }); await res(c, 2);
+  assert.deepEqual(f.posted('/agent'), { agent: 'plan' });
+  c.write({ t: 'req', rid: 3, op: 'set', what: 'agent', value: 'explore' });
+  assert.deepEqual(await res(c, 3), { t: 'res', rid: 3, ok: false, error: 'unknown agent' });
+  c.write({ t: 'req', rid: 4, op: 'set', what: 'variant', value: 'high' }); await res(c, 4);
+  assert.deepEqual(f.posted('/model'), { model: { providerID: 'fixture', id: 'model', variant: 'high' } });
+  c.write({ t: 'req', rid: 5, op: 'set', what: 'model', value: 'fixture/other' }); await res(c, 5);
+  assert.deepEqual(f.posted('/model'), { model: { providerID: 'fixture', id: 'other' } });
+  c.write({ t: 'send', cid: 'c1', text: '/review src', steer: false });
+  await until(() => f.posted('/command'));
+  assert.deepEqual(f.posted('/command'), { name: 'review', text: 'src' });
+  await until(() => c.lines.some(l => l.t === 'ack' && l.cid === 'c1'));
+  assert.deepEqual(c.lines.find(l => l.t === 'ack' && l.cid === 'c1'), { t: 'ack', cid: 'c1', ok: true, done: true });
+  c.write({ t: 'send', cid: 'c2', text: '/unknown x', steer: false });
+  await until(() => f.posted('/prompt')?.text === '/unknown x');
+  await f.emit({ type: 'session.agent.selected', data: { sessionID: f.native().sid, agent: 'plan' } });
+  await until(() => c.lines.some(l => l.t === 'settings' && l.settings.agent === 'plan'));
   c.close();
 });

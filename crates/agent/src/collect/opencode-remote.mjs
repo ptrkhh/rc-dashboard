@@ -335,6 +335,26 @@ function modelRef(model, variant) {
   return { providerID: model.slice(0, split), id: model.slice(split + 1), ...(variant ? { variant } : {}) };
 }
 
+// A question form becomes a card only when every field is a plain string or
+// multiselect; any other form keeps the Terminal banner.
+export function formAsk(form) {
+  const fields = form?.fields;
+  if (!Array.isArray(fields) || !fields.length || !fields.every(f => ['string', 'multiselect'].includes(f.type) && f.when === undefined)) return null;
+  return { id: form.id, kind: 'question', tool: 'opencode', questions: fields.map(f => ({
+    id: f.key, header: f.title ?? '', question: f.description ?? f.title ?? '', multi: f.type === 'multiselect',
+    other: f.custom === true || !f.options?.length, secret: false,
+    options: (f.options ?? []).map(o => ({ label: o.label ?? o.value, description: o.description ?? '' })) })) };
+}
+
+// answers: { <key>: { choices, text } } -> { <key>: "text" | ["a", "b"] }
+export function formAnswer(form, answers) {
+  return Object.fromEntries(form.fields.map(f => {
+    const a = answers?.[f.key], text = typeof a?.text === 'string' ? a.text.trim() : '';
+    const choices = Array.isArray(a?.choices) ? a.choices : [];
+    return [f.key, f.type === 'multiselect' ? [...choices, ...(text ? [text] : [])] : text || choices[0] || ''];
+  }));
+}
+
 function stopGroup(child) {
   if (!child?.pid) return;
   const kill = signal => { try { process.kill(-child.pid, signal); } catch {} };
@@ -395,11 +415,62 @@ async function supervise(statePath, name) {
     // mode (steer) whether or not a turn is running, so `steer` is not consulted.
     const { ChatFeed } = await import(new URL('./chat-feed.mjs', import.meta.url));
     chatDir = await mkdtemp(join(tmpdir(), 'cdash-opencode-'));
-    const chatState = { sid: state.sid, model: state.model, remote_inputs: {} };
+    const chatState = { sid: state.sid, model: state.model, variant: state.variant, remote_inputs: {} };
+    const sessionPath = '/api/session/' + encodeURIComponent(state.sid);
+    const forms = new Map(); // form id -> form shown as a card, shared by every ChatBridge
+    const publishSettings = () => feed.setSettings({ model: chatState.model, effort: null, plan: null, agent: chatState.agent ?? null, variant: chatState.variant ?? null });
+    const dropForm = id => { forms.delete(id); feed.dropAsk(id); };
+    const list = async path => { const data = (await client.request(path)).data; if (!Array.isArray(data)) throw new Error('Invalid OpenCode list'); return data; };
+    // The agents the TUI's Tab cycle keeps.
+    const agents = async () => (await list('/api/agent')).filter(a => a.mode !== 'subagent' && !a.hidden);
+    const models = async () => normalizeModels(await client.request('/api/model'));
+    const ops = {
+      answer: async ({ id, answer }) => {
+        const form = forms.get(id);
+        if (!form) throw new Error('already answered');
+        try { await client.request(`${sessionPath}/form/${encodeURIComponent(id)}/reply`, { method: 'POST', body: { answer: formAnswer(form, answer?.answers) } }); }
+        catch (error) { if (error.status === 409 || error.status === 404) { dropForm(id); throw new Error('already answered'); } throw error; }
+        dropForm(id);
+      },
+      set: async ({ what, value }) => {
+        if (what === 'agent') {
+          if (!(await agents()).some(a => a.id === value)) throw new Error('unknown agent');
+          await client.request(`${sessionPath}/agent`, { method: 'POST', body: { agent: value } });
+          chatState.agent = value;
+        } else if (what === 'model' || what === 'variant') {
+          const all = await models();
+          const m = all.find(x => x.model === (what === 'model' ? value : chatState.model));
+          if (!m) throw new Error('unknown model');
+          let variant = chatState.variant;
+          if (what === 'variant') {
+            if (value && !m.variants.includes(value)) throw new Error('unknown variant');
+            variant = value || null;
+          } else if (!m.variants.includes(variant)) variant = null;
+          await client.request(`${sessionPath}/model`, { method: 'POST', body: { model: modelRef(m.model, variant) } });
+          chatState.model = m.model; chatState.variant = variant;
+        } else throw new Error('not supported');
+        publishSettings();
+      },
+      menu: async () => ({
+        commands: (await commands()).slice(0, 150).map(c => ({ name: c.name, description: (c.description ?? '').slice(0, 100) })),
+        models: (await models()).map(m => ({ value: m.model, label: m.label.replace(/^OpenCode: /, ''), variants: m.variants })),
+        efforts: [], agents: (await agents()).map(a => ({ value: a.id, label: a.name ?? a.id })),
+      }),
+    };
+    const commands = () => list('/api/command');
     feed = new ChatFeed({
-      send: (text, { cid }) => submitPrompt(client, chatState, 'dash:' + cid, text, async () => {}),
-      stop: () => client.request('/api/session/' + encodeURIComponent(state.sid) + '/interrupt', { method: 'POST', body: {} }),
+      ops,
+      send: async (text, { cid }) => {
+        const [, name, rest = ''] = /^\/([A-Za-z0-9_:-]+)(?:\s+([\s\S]*))?$/.exec(text) || []; // `/usr/bin/x ...` is a prompt
+        if (name && (await commands()).some(c => c.name === name)) {
+          await client.request(`${sessionPath}/command`, { method: 'POST', body: { name, text: rest.trim() } });
+          return { done: true }; // the server expands the template, so no prompt row matches this cid
+        }
+        return submitPrompt(client, chatState, 'dash:' + cid, text, async () => {});
+      },
+      stop: () => client.request(sessionPath + '/interrupt', { method: 'POST', body: {} }),
     });
+    publishSettings();
     // The bridge reports a stopped turn as a failed one; chat must tell them
     // apart so a stop from any door holds the queue.
     let lastExecution = '';
@@ -410,8 +481,34 @@ async function supervise(statePath, name) {
     };
     class ChatBridge extends RemoteBridge {
       async nativeEvent(event) {
+        const data = event.data || {};
         if (event.type?.startsWith('session.execution.')) lastExecution = event.type;
+        if (event.type === 'form.created' && data.form?.sessionID === this.state.sid) return this.addForm(data.form);
+        if (data.sessionID === this.state.sid) {
+          if (event.type === 'form.replied' || event.type === 'form.cancelled') dropForm(data.id);
+          else if (event.type === 'session.model.selected') { updateModel(this.state, data.model); publishSettings(); }
+          else if (event.type === 'session.agent.selected') { this.state.agent = data.agent; publishSettings(); }
+        }
         return super.nativeEvent(event);
+      }
+      async reconcile() {
+        await super.reconcile();
+        this.state.agent = (await this.client.request(this.path)).data?.agent ?? null;
+        publishSettings();
+      }
+      // A form with a card never gets RemoteBridge's "Use Terminal" message.
+      async addForm(form) {
+        if (!form?.id || this.forms.has(form.id)) return;
+        this.forms.add(form.id); forms.set(form.id, form);
+        const ask = formAsk(form);
+        if (ask) feed.putAsk(ask);
+        await this.remote.state('requires_action', { tool_name: 'Terminal', action_description: 'Answer the pending form.' });
+      }
+      async syncForms() {
+        const mine = (await list(`${this.path}/form`)).filter(form => form.sessionID === this.state.sid);
+        const ids = new Set(mine.map(form => form.id));
+        for (const id of this.forms) if (!ids.has(id)) { this.forms.delete(id); dropForm(id); }
+        for (const form of mine) await this.addForm(form);
       }
     }
     state.chat_sock = await feed.listen(chatDir);
