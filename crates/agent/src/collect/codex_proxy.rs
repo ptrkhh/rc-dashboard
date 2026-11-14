@@ -52,9 +52,11 @@ async fn forward(target: &OsStr) -> Result<(), Box<dyn std::error::Error>> {
     pump(unix(target).await?, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
-// ponytail: no read limit; the peer is Codex's own app-server on a private socket. Cap it if this proxy ever faces another peer.
+/// 64 MiB covers an image-sized message (images go as data URLs, 32 MiB budget) and still bounds a misbehaving peer.
+const MAX_FRAME: usize = 64 << 20;
+
 fn config() -> WebSocketConfig {
-    WebSocketConfig::default().max_message_size(None).max_frame_size(None)
+    WebSocketConfig::default().max_message_size(Some(MAX_FRAME)).max_frame_size(Some(MAX_FRAME))
 }
 
 async fn unix(path: &OsStr) -> Result<WebSocketStream<tokio::net::UnixStream>, Box<dyn std::error::Error>> {
