@@ -151,9 +151,11 @@
       if (f.t === 'page') { x.paging = false; x.paged = true; }
       const wasWorking = x.state.working;
       const wasWaiting = x.state.waiting;
+      const prevAsks = x.state.asks.length;
       cdashChatStore.apply(x.state, f);
       if (x.state.working && !wasWorking) x.since = Date.now();
-      if (x.state.waiting && !wasWaiting) { x.waitSince = Date.now(); setTimeout(() => { if (c === x) schedule(); }, 550); } // the banner waits 500 ms for an ask
+      const hadAsks = prevAsks > 0 && x.state.asks.length === 0;
+      if (x.state.waiting && (!wasWaiting || hadAsks)) { x.waitSince = Date.now(); setTimeout(() => { if (c === x) schedule(); }, 550); } // the banner waits 500 ms for an ask
       schedule();
     };
     ws.onclose = e => {

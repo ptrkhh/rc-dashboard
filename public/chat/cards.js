@@ -4,6 +4,8 @@
    functions so node --test can import the pure helpers. */
 (function (g) {
   const ui = new Map(); // ask id -> {picks, note, sent, stale}; pruned when the ask goes
+  const stamps = new WeakMap(); let stamp = 0; // answered entries are compared by identity, never by text
+  const idOf = e => e ? (stamps.get(e) || (stamps.set(e, ++stamp), stamp)) : 0;
   let shown = null;     // signature of what the box currently holds
 
   const pick = (picks, id) => picks[id] || { choices: [], text: '' };
@@ -36,25 +38,23 @@
     const opts = el('div', 'chat-card-opts');
     for (const o of q.options) {
       const on = p.choices.includes(o.label);
-      const b = el('button', 'chat-card-opt');
-      b.type = 'button';
-      b.title = o.description || '';
+      let b;
       if (q.multi) {
+        b = el('label', 'chat-card-opt');
         const cb = el('input');
         cb.type = 'checkbox';
         cb.checked = on;
+        cb.disabled = u.locked;
+        cb.onchange = () => { p.choices = on ? p.choices.filter(l => l !== o.label) : [...p.choices, o.label]; refresh(true); };
         b.append(cb, el('span', '', o.label));
       } else {
+        b = el('button', 'chat-card-opt', o.label);
+        b.type = 'button';
+        b.disabled = u.locked;
         b.setAttribute('aria-pressed', on ? 'true' : 'false');
-        b.textContent = o.label;
+        b.onclick = () => { p.choices = on ? [] : [o.label]; refresh(true); };
       }
       if (o.description) b.append(el('span', 'chat-card-desc', o.description));
-      b.onclick = e => {
-        if (q.multi) p.choices = on ? p.choices.filter(l => l !== o.label) : [...p.choices, o.label];
-        else p.choices = on ? [] : [o.label];
-        e.preventDefault();
-        refresh(true);
-      };
       opts.append(b);
     }
     box.append(opts);
@@ -63,6 +63,8 @@
       t.type = q.secret ? 'password' : 'text';
       t.placeholder = 'Other answer';
       t.value = p.text;
+      t.disabled = u.locked;
+      if (q.secret) t.autocomplete = 'off';
       t.oninput = () => { p.text = t.value; refresh(false); };
       box.append(t);
     }
@@ -76,6 +78,7 @@
     const gone = live && !live.ok && live.error === 'already answered';
     if (live && !live.ok && !gone) u.sent = false;
     const busy = u.sent && !(live && !live.ok);
+    u.locked = busy || gone;
     const fire = f => { if (send(f)) { u.sent = true; u.stale = answered.get(ask.id); refresh(true); } };
     if (ask.kind === 'plan') {
       const codex = ask.tool === 'codex';
@@ -103,7 +106,7 @@
       for (const q of ask.questions) root.append(question(q, u, refresh));
       if (!gone) {
         const go = btn('Submit', () => fire(frame(ask, u.picks)), busy || !complete(ask, u.picks));
-        go.className = 'chat-card-submit';
+        u.submit = go;
         root.append(el('div', 'chat-card-actions')).append(go);
       }
     }
@@ -115,25 +118,24 @@
   function render(box, state, send) {
     const asks = state.asks || [];
     for (const id of ui.keys()) if (!asks.some(a => a.id === id)) ui.delete(id);
-    const sig = JSON.stringify(asks.map(a => [a.id, state.answered.get(a.id) || null, ui.get(a.id)?.sent || false]));
+    const sig = JSON.stringify(asks.map(a => [a.id, idOf(state.answered.get(a.id)), ui.get(a.id)?.sent || false]));
     if (sig === shown && box.firstChild) return;
     if (!asks.length && !box.firstChild) { shown = sig; return; }
     shown = sig;
     // A pick toggle rebuilds; typing only re-checks Submit, so the field keeps focus.
     const refresh = full => {
       if (full) { shown = null; render(box, state, send); return; }
-      const subs = box.querySelectorAll('.chat-card-submit');
-      asks.filter(a => a.kind !== 'plan').forEach((a, i) => {
+      for (const a of asks) {
         const u = ui.get(a.id);
-        if (subs[i]) subs[i].disabled = u.sent || !complete(a, u.picks);
-      });
+        if (a.kind !== 'plan' && u.submit) u.submit.disabled = u.locked || !complete(a, u.picks);
+      }
     };
     box.textContent = '';
     for (const a of asks) {
       if (!ui.has(a.id)) ui.set(a.id, { picks: {}, note: '', sent: false, stale: null });
       box.append(card(a, ui.get(a.id), state.answered, send, refresh));
     }
-    shown = JSON.stringify(asks.map(a => [a.id, state.answered.get(a.id) || null, ui.get(a.id).sent]));
+    shown = JSON.stringify(asks.map(a => [a.id, idOf(state.answered.get(a.id)), ui.get(a.id).sent]));
   }
 
   g.cdashCards = { render, complete, frame };
