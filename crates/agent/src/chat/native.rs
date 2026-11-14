@@ -15,7 +15,8 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 
-const ACK_WAIT: Duration = Duration::from_secs(10);
+/// How long a send waits for its ack, and a page for the source.
+pub(crate) const ACK_WAIT: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_secs(1);
 /// Consecutive failed connects before the session counts as gone.
 const GIVE_UP: u32 = 5;
@@ -82,34 +83,31 @@ impl Engine for NativeEngine {
     }
 
     /// A second connection that resumes after `from - 1`; the supervisor's
-    /// replay ends with its `state` line.
+    /// replay ends with its `state` line. The hub bounds how long it waits.
     async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
         let epoch = self.shared.epoch.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("not connected")?;
-        let read = async {
-            let (r, mut w) = UnixStream::connect(&self.sock).await.map_err(|e| e.to_string())?.into_split();
-            let hello = serde_json::to_string(&Hello { after: from.saturating_sub(1), epoch: Some(&epoch) }).map_err(|e| e.to_string())?;
-            w.write_all(format!("{hello}\n").as_bytes()).await.map_err(|e| e.to_string())?;
-            let (mut lines, mut out) = (BufReader::new(r).lines(), Vec::new());
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(mut v) = serde_json::from_str::<Value>(&line) else { continue };
-                match v["t"].as_str() {
-                    Some("hello") if v["epoch"].as_str() != Some(epoch.as_str()) => return Err("the session restarted".to_string()),
-                    Some("ev") => {
-                        let seq = v["seq"].as_u64().unwrap_or(0);
-                        if (from..=to).contains(&seq) {
-                            out.push(v["ev"].take());
-                        }
-                        if seq >= to {
-                            break;
-                        }
+        let (r, mut w) = UnixStream::connect(&self.sock).await.map_err(|e| e.to_string())?.into_split();
+        let hello = serde_json::to_string(&Hello { after: from.saturating_sub(1), epoch: Some(&epoch) }).map_err(|e| e.to_string())?;
+        w.write_all(format!("{hello}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+        let (mut lines, mut out) = (BufReader::new(r).lines(), Vec::new());
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(mut v) = serde_json::from_str::<Value>(&line) else { continue };
+            match v["t"].as_str() {
+                Some("hello") if v["epoch"].as_str() != Some(epoch.as_str()) => return Err("the session restarted".to_string()),
+                Some("ev") => {
+                    let seq = v["seq"].as_u64().unwrap_or(0);
+                    if (from..=to).contains(&seq) {
+                        out.push(v["ev"].take());
                     }
-                    Some("state") => break,
-                    _ => {}
+                    if seq >= to {
+                        break;
+                    }
                 }
+                Some("state") => break,
+                _ => {}
             }
-            Ok(out)
-        };
-        tokio::time::timeout(ACK_WAIT, read).await.map_err(|_| "no answer from the session".to_string())?
+        }
+        Ok(out)
     }
 }
 

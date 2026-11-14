@@ -2,6 +2,7 @@
 //! held-message queue and the delivery rules.
 
 pub use super::wire::{ClientFrame, HeldOp};
+use super::native::ACK_WAIT;
 use super::notify::{NoteKind, Sink};
 use super::queue::Queue;
 use super::wire::sanitize;
@@ -501,7 +502,7 @@ impl<E: Engine> Actor<E> {
         }
     }
 
-    // ponytail: an older page blocks this hub while the source is re-read; move it off the actor if it shows.
+    // ponytail: an older page blocks this hub while the source is re-read, O(transcript) per page for Claude; move it off the actor if it shows.
     async fn page(&self, before: u64, limit: Option<usize>) -> Value {
         let limit = limit.unwrap_or(PAGE_MAX).min(PAGE_MAX);
         let end = (before as usize).saturating_sub(1).min(self.head());
@@ -512,10 +513,13 @@ impl<E: Engine> Actor<E> {
         let gone: Vec<usize> = (start + 1..=end.min(self.base)).filter(|&p| own(p).is_none()).collect();
         let (mut source, mut ok) = (Vec::new(), true);
         if let (Some(&a), Some(&b)) = (gone.first(), gone.last()) {
-            match self.engine.history(number(a), number(b)).await {
-                Ok(v) => source = v,
-                Err(e) => {
+            let read = tokio::time::timeout(ACK_WAIT, self.engine.history(number(a), number(b))).await;
+            match read.unwrap_or_else(|_| Err("no answer from the source".into())) {
+                Ok(v) if v.len() == gone.len() => source = v,
+                // Short: a transcript cut or replaced since; its numbers no longer line up.
+                r => {
                     ok = false;
+                    let e = r.err().unwrap_or_else(|| "the source came up short".into());
                     self.log.push(format!("chat page failed {}: {e}", self.name));
                 }
             }
@@ -599,6 +603,8 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         accepts: bool,
         slow: Option<Duration>,
+        /// The last event number the source still has.
+        has: u64,
     }
     impl Engine for FakeEngine {
         async fn send(&self, text: &str, steer: bool, _cid: &str) -> Result<bool, String> {
@@ -620,7 +626,7 @@ mod tests {
             self.calls.lock().unwrap().push(format!("clear:{text}"));
         }
         async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
-            Ok((from..=to).map(|k| json!({"type":"user","n":k})).collect())
+            Ok((from..=to.min(self.has)).map(|k| json!({"type":"user","n":k})).collect())
         }
     }
 
@@ -631,10 +637,11 @@ mod tests {
         accepts: bool,
         notes: Option<Sink>,
         ready: bool,
+        has: u64,
     ) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         let calls = Calls::default();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let engine = FakeEngine { calls: calls.clone(), accepts, slow };
+        let engine = FakeEngine { calls: calls.clone(), accepts, slow, has };
         let log = Arc::new(crate::host::log::LogBuffer::new());
         let hub = Hub::spawn_with("claude", engine, rx, log, "cdash-a".into(), notes);
         if ready {
@@ -643,11 +650,11 @@ mod tests {
         (hub, tx, calls)
     }
     fn rig_with(slow: Option<Duration>) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(slow, false, None, true)
+        build(slow, false, None, true, u64::MAX)
     }
     /// A rig whose engine confirms what it accepts, as Codex and OpenCode do.
     fn rig_accepting() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(None, true, None, true)
+        build(None, true, None, true, u64::MAX)
     }
     fn rig_noting(ready: bool) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Arc<Ctx>, broadcast::Receiver<Note>) {
         let ctx = crate::chat::claude::tests::ctx_with_path(
@@ -656,7 +663,7 @@ mod tests {
         );
         let notes = ctx.notes.subscribe();
         let sink = Sink { ctx: Arc::clone(&ctx), project: "proj".into() };
-        let (hub, tx, _) = build(None, false, Some(sink), ready);
+        let (hub, tx, _) = build(None, false, Some(sink), ready, u64::MAX);
         (hub, tx, ctx, notes)
     }
     fn note_kinds(rx: &mut broadcast::Receiver<Note>) -> Vec<&'static str> {
@@ -668,9 +675,12 @@ mod tests {
     fn engine_status(working: bool, waiting: bool) -> EngineMsg {
         EngineMsg::Status { working, waiting, waiting_for: None }
     }
-    /// The fake re-reads history as `{"type":"user","n":k}`.
+    /// The fake re-reads history as `{"type":"user","n":k}`, up to number `has`.
+    fn rig_history_to(has: u64) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+        build(None, false, None, true, has)
+    }
     fn rig_history() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        rig()
+        rig_history_to(u64::MAX)
     }
     fn rig() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_with(None)
@@ -1073,5 +1083,26 @@ mod tests {
         let got: Vec<(u64, Value)> = page["events"].as_array().unwrap().iter()
             .map(|e| (e["seq"].as_u64().unwrap(), if e["ev"]["subtype"] == "retract" { json!("retract") } else { e["ev"]["n"].clone() })).collect();
         assert_eq!(got, [(1, json!(1)), (2, json!("retract")), (3, json!(2))], "the engine's own numbers skip what the hub added");
+    }
+
+    #[tokio::test]
+    async fn a_page_across_the_window_edge_joins_the_source_and_memory() {
+        let (hub, tx, _) = rig_history();
+        for i in 0..2100 { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
+        settle().await;
+        let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 120, limit: Some(50) }).await.unwrap()).unwrap();
+        let ev = page["events"].as_array().unwrap();
+        assert_eq!(ev.iter().map(|e| e["seq"].as_u64().unwrap()).collect::<Vec<_>>(), (70..=119).collect::<Vec<_>>());
+        assert_eq!((ev[0]["ev"]["n"].as_u64(), ev[30]["ev"]["n"].as_u64(), ev[31]["ev"]["uuid"].as_str()), (Some(70), Some(100), Some("u100")));
+        assert_eq!(page["more"], true);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_comes_up_short_ends_paging() {
+        let (hub, tx, _) = rig_history_to(60); // a transcript cut short since it was read
+        for i in 0..2100 { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
+        settle().await;
+        let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 101, limit: Some(50) }).await.unwrap()).unwrap();
+        assert_eq!(page["more"], false, "asking again would loop on the same short page");
     }
 }
