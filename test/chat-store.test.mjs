@@ -93,3 +93,18 @@ test('held rows the latest state no longer lists are dropped, or kept as not sen
   s = S.apply(s, { t: 'state', working: false, waiting: false, ended: true, held: [] });
   assert.deepEqual(S.rows(s).map(r => [r.text, r.status, r.error]), [['two', 'refused', 'session ended']]);
 });
+
+test('every row carries a signature that changes when what the view shows changes', () => {
+  let s = feed([hello(), ev(1, prompt('u1', 'hi')), ev(2, use('a', 't1', 'Bash', { command: 'ls' })), { t: 'delta', id: 'm9', text: 'Hel' }]);
+  S.addMine(s, 'c1', 'mine');
+  const sigs = st => S.rows(st).map(r => r.sig);
+  const before = sigs(s);
+  assert.deepEqual(sigs(s), before, 'stable for the same state');
+  assert.ok(before.every(x => typeof x === 'string'));
+  s = S.apply(s, { t: 'delta', id: 'm9', text: 'lo' });
+  s = S.apply(s, ev(3, done('b', 't1', 'out')));
+  s = S.apply(s, { t: 'ack', cid: 'c1', status: 'unconfirmed' });
+  const after = sigs(s);                                   // rows: prompt, tools, streaming text, mine
+  assert.equal(after[0], before[0], 'an unchanged row keeps its signature');
+  for (const i of [1, 2, 3]) assert.notEqual(after[i], before[i], i);
+});

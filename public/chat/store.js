@@ -174,6 +174,15 @@
       if (m.error) r.error = m.error;
       out.push(r);
     }
+    // What build() shows, as a short string; the view compares it instead of serializing the row.
+    // A row's text only grows under its key, so lengths stand in for the text.
+    for (const r of out) {
+      r.sig = r.kind === 'user' ? [r.status, r.error, r.text.length].join('|')
+        : r.kind === 'text' ? r.text.length + '|' + r.streaming
+        : r.kind === 'tools' ? [r.label, r.running, r.calls.map(c => c.error ? 'e' : c.done ? 'd' : 'r').join('')].join('|')
+        : r.kind === 'shell' ? [r.command, r.stdout.length, r.stderr.length].join('|')
+        : r.text;
+    }
     return out;
   }
 

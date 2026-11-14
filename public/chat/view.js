@@ -294,7 +294,7 @@
     let prev = null;
     for (const r of rows) {
       keep.add(r.key);
-      const sig = JSON.stringify(r);
+      const sig = r.sig;
       let n = x.nodes.get(r.key);
       if (!n) {
         n = { el: build(r), sig };
