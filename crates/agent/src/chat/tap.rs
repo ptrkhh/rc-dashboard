@@ -515,4 +515,16 @@ mod tests {
         let b = tap.feed(r#"{"type":"user","uuid":"o2","parentUuid":null,"promptSource":"typed","message":{"role":"user","content":"y"}}"#);
         assert!(a.iter().chain(&b).all(|e| e["subtype"] != "cut"));
     }
+    #[test]
+    fn sidechains_stay_off_the_chain_and_hidden_records_stay_on_it() {
+        let cuts = |lines: &[&str]| feed_all(&lines.join("\n")).iter().filter(|e| is_cut(e)).map(|e| e["after"].clone()).collect::<Vec<_>>();
+        let end = r#"{"type":"system","subtype":"turn_duration","uuid":"s1","parentUuid":null}"#;
+        let side = r#"{"type":"assistant","uuid":"x1","parentUuid":"s1","isSidechain":true,"message":{"id":"m","role":"assistant","content":[{"type":"text","text":"sub"}]}}"#;
+        let next = r#"{"type":"user","uuid":"u2","parentUuid":"s1","promptSource":"typed","message":{"role":"user","content":"next"}}"#;
+        assert!(cuts(&[end, side, next]).is_empty(), "a sidechain record does not move the chain's end");
+        let meta = r#"{"type":"user","uuid":"m1","parentUuid":"s1","isMeta":true,"message":{"role":"user","content":"Caveat"}}"#;
+        let info = r#"{"type":"system","subtype":"informational","uuid":"i1","parentUuid":"m1"}"#;
+        let back = r#"{"type":"user","uuid":"u3","parentUuid":"m1","promptSource":"typed","message":{"role":"user","content":"back"}}"#;
+        assert_eq!(cuts(&[end, meta, info, back]), [json!("s1")], "a hidden record is on the chain, so branching from it cuts");
+    }
 }
