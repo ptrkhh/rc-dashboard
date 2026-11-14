@@ -33,10 +33,10 @@ pub fn cache_root() -> PathBuf {
     std::env::temp_dir().join(format!("cdash-test-{}", std::process::id())).join("cdash")
 }
 
-/// `session` must be one plain path component (pane names are `cdash-[A-Za-z0-9_-]+`).
-pub fn uploads_dir(session: &str) -> PathBuf {
-    assert!(!session.is_empty() && session != ".." && session != "." && !session.contains(['/', '\\', '\0']), "bad session name");
-    cache_root().join("uploads").join(session)
+/// `None` unless `session` is one plain path component (pane names are `cdash-[A-Za-z0-9_-]+`).
+pub fn uploads_dir(session: &str) -> Option<PathBuf> {
+    let plain = !session.is_empty() && session != ".." && session != "." && !session.contains(['/', '\\', '\0']);
+    plain.then(|| cache_root().join("uploads").join(session))
 }
 pub fn media_dir() -> PathBuf {
     cache_root().join("media")
@@ -202,7 +202,7 @@ pub(crate) mod tests {
         assert_eq!(r(Some("/x/cache"), Some("/home/u")), PathBuf::from("/x/cache/cdash"));
         assert_eq!(r(Some("relative"), Some("/home/u")), PathBuf::from("/home/u/.cache/cdash"));
         assert_eq!(r(None, None), PathBuf::from("/.cache/cdash"));
-        assert_eq!(uploads_dir("cdash-a"), cache_root().join("uploads/cdash-a"));
+        assert_eq!(uploads_dir("cdash-a"), Some(cache_root().join("uploads/cdash-a")));
     }
     #[test]
     fn names_are_reduced_to_a_safe_base_name_that_keeps_its_extension() {
@@ -308,8 +308,10 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    #[should_panic(expected = "bad session name")]
-    fn a_session_name_with_a_slash_is_refused() { uploads_dir("../x"); }
+    fn a_session_name_that_is_not_one_plain_component_has_no_folder() {
+        for bad in ["", ".", "..", "a/b", "../x"] { assert_eq!(uploads_dir(bad), None, "{bad:?}"); }
+        assert!(uploads_dir("cdash-a_1").is_some());
+    }
     #[test]
     fn a_trimmed_long_name_never_ends_in_a_space() {
         let n = sanitize_name(&format!("{} {}.pdf", "a".repeat(95), "b".repeat(20)));
