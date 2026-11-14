@@ -79,6 +79,22 @@ impl Runner {
         Err(format!("{key}: {reason}"))
     }
 
+    /// A long-lived child with stdin and stdout piped, for a protocol rather
+    /// than one answer. Dropping it kills it; the caller bounds every await on
+    /// it with `tokio::time::timeout`.
+    pub fn spawn_piped(&self, program: &str, args: &[&str], cwd: &std::path::Path) -> std::io::Result<tokio::process::Child> {
+        #[allow(clippy::disallowed_types)]
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .current_dir(cwd)
+            .env("PATH", &self.path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        cmd.spawn()
+    }
+
     /// Log a given failing key once per process lifetime. The KEY IS EXPLICIT:
     /// deriving it from `program + args[0]` is what made every `git status`
     /// failure across every repository collapse into one silenced entry.

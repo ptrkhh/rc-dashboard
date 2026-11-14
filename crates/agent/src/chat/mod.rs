@@ -9,6 +9,7 @@ pub mod hook;
 pub mod hub;
 pub mod native;
 pub mod notify;
+pub mod picker;
 #[cfg(test)]
 mod perf;
 pub mod push;

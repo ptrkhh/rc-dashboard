@@ -49,6 +49,9 @@ pub struct Ctx {
     pub focus: Mutex<HashMap<String, usize>>,
     /// Finished, failed and needs-an-answer notes from every hub.
     pub notes: tokio::sync::broadcast::Sender<crate::chat::notify::Note>,
+    /// Pids of headless `claude` processes the agent started itself.
+    // external.rs already skips `sdk-cli` sessions; this survives a change of that entrypoint.
+    pub own_pids: Mutex<HashSet<i32>>,
     /// The port Claude's permission hook posts to, while that listener runs.
     pub hook_port: Option<u16>,
     /// Whether tmux has `new-session -e` (3.2+), once `tmux -V` answered; see `spawn::launch_hook_port`.
@@ -83,6 +86,7 @@ impl Ctx {
             chats: tokio::sync::Mutex::new(HashMap::new()),
             focus: Mutex::new(HashMap::new()),
             notes: tokio::sync::broadcast::channel(64).0,
+            own_pids: Mutex::new(HashSet::new()),
             hook_port: None,
             tmux_env: tokio::sync::OnceCell::new(),
         }

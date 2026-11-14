@@ -1,0 +1,14 @@
+{"commands":[
+{"name":"clear","description":"Clear conversation history and free up context","argumentHint":"[name]","aliases":["reset","new"],"builtin":true},
+{"name":"compact","description":"Free up context by summarizing the conversation so far","argumentHint":"<optional custom summarization instructions>","builtin":true},
+{"name":"config","description":"Open config panel","argumentHint":"","builtin":true},
+{"name":"model","description":"Set the AI model for Claude Code","argumentHint":"[model]","builtin":true},
+{"name":"usage","description":"Show plan usage limits","argumentHint":"","aliases":["cost","stats"],"builtin":true},
+{"name":"superpowers:brainstorming","description":"Explore intent and design before building","argumentHint":""}
+],
+"models":[
+{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)"},
+{"value":"opus","resolvedModel":"claude-opus-5-5","displayName":"Opus 5.5"},
+{"value":"haiku","resolvedModel":"claude-haiku-5-5","displayName":"Haiku 5.5"},
+{"value":"claude-opus-4-8","resolvedModel":"claude-opus-4-8","displayName":"Opus 4.8"}
+]}

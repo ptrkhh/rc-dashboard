@@ -3,6 +3,7 @@
 
 use super::asks::Cards;
 use super::hub::{Answer, Engine, EngineMsg, Sent};
+use super::picker;
 use super::tap::Tap;
 use super::tmux_io;
 use crate::collect::ctx::Ctx;
@@ -82,7 +83,6 @@ impl Tail {
 
 pub struct ClaudeEngine {
     ctx: Arc<Ctx>,
-    #[expect(dead_code, reason = "the pickers read it")]
     pid: i32,
     name: String,
     /// The pane was launched with the permission hook and the listener runs.
@@ -142,8 +142,22 @@ struct Shared {
 
 impl Engine for ClaudeEngine {
     async fn send(&self, text: &str, _steer: bool, _cid: &str) -> Result<Sent, String> {
-        // A paste cannot be confirmed by the TUI; the transcript confirms it.
-        tmux_io::paste(&self.ctx.runner, &self.name, text).await.map(|()| Sent::Unconfirmed)
+        match picker::route(text) {
+            // A paste cannot be confirmed by the TUI; the transcript confirms it.
+            picker::Route::Paste => tmux_io::paste(&self.ctx.runner, &self.name, text).await.map(|()| Sent::Unconfirmed),
+            // The engine ran it itself: no prompt will ever show it.
+            picker::Route::Set(what, v) => self.set(what, &v).await.map(|()| Sent::Done),
+            picker::Route::Refuse(why) => Err(why),
+        }
+    }
+
+    async fn menu(&self) -> Value {
+        let cwd = session_file_for(&self.ctx.claude_dir, self.pid).await.and_then(|f| f.cwd);
+        let init = match cwd {
+            Some(cwd) => picker::initialize(&self.ctx, std::path::Path::new(&cwd)).await.ok(),
+            None => None,
+        };
+        init.map_or_else(|| picker::menu_from(&Value::Null), |i| picker::menu_from(&i))
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -253,6 +267,7 @@ async fn run(
     let mut last: Option<(bool, bool, Option<String>)> = None;
     let (mut last_asks, mut last_settings) = (None, None);
     let mut blind_sent = false;
+    let mut warmed = false;
     let mut slow = false;
     let mut idle_since: Option<Instant> = None;
     let mut alive_at = Instant::now();
@@ -268,6 +283,14 @@ async fn run(
             idle_since = Some(Instant::now());
         }
         if let Some((sid, cwd)) = file.as_ref().and_then(|f| Some((f.session_id.clone()?, f.cwd.clone()?))) {
+            if !warmed {
+                // The first menu should find the command list cached, not wait for `claude -p`.
+                warmed = true;
+                let (ctx, cwd) = (Arc::clone(&ctx), PathBuf::from(&cwd));
+                tokio::spawn(async move {
+                    let _ = picker::initialize(&ctx, &cwd).await;
+                });
+            }
             if conv.as_ref().is_none_or(|c| c.sid != sid) {
                 // `/clear` or `/resume` gave the pane a new conversation.
                 if conv.is_some() && tx.send(EngineMsg::Reset).await.is_err() {
@@ -445,6 +468,15 @@ pub(crate) mod tests {
 
     fn fixture_ctx(tag: &str) -> (Arc<Ctx>, PathBuf) {
         fixture_with(tag, "")
+    }
+
+    #[tokio::test]
+    async fn without_a_command_list_the_menu_still_offers_the_effort_levels() {
+        let (ctx, dir) = fixture_ctx("menu");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/no-such-dir-menu","status":"idle"}"#);
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        assert_eq!(engine.menu().await, json!({"commands":[],"models":[],"efforts":["low","medium","high","xhigh","max","auto"],"agents":[]}));
     }
 
     async fn next_msg(rx: &mut mpsc::Receiver<EngineMsg>) -> EngineMsg {
