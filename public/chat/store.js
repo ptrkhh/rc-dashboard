@@ -21,6 +21,8 @@
     const c = ev.message?.content;
     return typeof c === 'string' ? c : Array.isArray(c) ? c.filter(b => b?.type === 'text').map(b => b.text).join('') : '';
   };
+  const HEX64 = /^[0-9a-f]{64}$/;
+  const keepFiles = fs => (Array.isArray(fs) ? fs : []).filter(f => f && (f.kind === 'image' ? typeof f.ref === 'string' && HEX64.test(f.ref) : f.kind === 'file' && typeof f.name === 'string'));
   const flatten = c => typeof c === 'string' ? c : Array.isArray(c) ? c.map(b => b?.text ?? '').join('\n') : '';
 
   function clearConversation(s) {
@@ -120,8 +122,8 @@
     return s;
   }
 
-  function addMine(s, cid, text) {
-    s.mine.push({ cid, text, status: 'sending', seq: null });
+  function addMine(s, cid, text, files = []) {
+    s.mine.push({ cid, text, status: 'sending', seq: null, files });
     s.rev++;
     return s;
   }
@@ -179,7 +181,10 @@
         const text = promptText(e);
         const queued = out.findIndex(r => r.kind === 'user' && r.status === 'queued' && r.text === text);
         if (queued >= 0) out.splice(queued, 1);
-        out.push({ kind: 'user', key: 'e' + q, text, status: 'sent' });
+        const row = { kind: 'user', key: 'e' + q, text, status: 'sent' };
+        const files = keepFiles(e.files);
+        if (files.length) row.files = files;
+        out.push(row);
       } else if (e.type === 'user') {
         for (const b of e.message.content) {
           const c = calls.get(b?.tool_use_id);
@@ -218,12 +223,13 @@
       if (m.seq != null) continue;
       const r = { kind: 'user', key: 'm' + m.cid, cid: m.cid, text: m.text, status: m.status };
       if (m.error) r.error = m.error;
+      if (m.files?.length) r.files = m.files;
       out.push(r);
     }
     // What build() shows, as a short string; the view compares it instead of serializing the row.
     // A row's text only grows under its key, so lengths stand in for the text.
     for (const r of out) {
-      r.sig = r.kind === 'user' ? [r.status, r.error, r.text.length].join('|')
+      r.sig = r.kind === 'user' ? [r.status, r.error, r.text.length, r.files?.length].join('|')
         : r.kind === 'text' ? r.text.length + '|' + r.streaming
         : r.kind === 'tools' ? [r.label, r.running, r.calls.map(c => c.error ? 'e' : c.done ? 'd' : 'r').join('')].join('|')
         : r.kind === 'shell' ? [r.command, r.stdout.length, r.stderr.length].join('|')

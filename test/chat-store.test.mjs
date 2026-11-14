@@ -176,3 +176,18 @@ test('the header chip reads model, effort, Plan and a non-default agent', () => 
   assert.equal(S.chipText({ tool: 'opencode', settings: { model: 'a/b', variant: null, agent: 'build' } }), 'b');
   assert.equal(S.chipText({ tool: 'claude', settings: {} }), '');
 });
+
+test('prompt rows carry their attachments and drop malformed ones', () => {
+  const ref = 'ab'.repeat(32);
+  const s = feed([hello(), ev(1, prompt('u1', 'see', { files: [{ kind: 'image', ref, mime: 'image/png' }, { kind: 'image', ref: '../../api/kill' },
+    { kind: 'file', name: 'r.pdf', size: 9 }, { kind: 'file' }] }))]);
+  assert.deepEqual(S.rows(s)[0].files, [{ kind: 'image', ref, mime: 'image/png' }, { kind: 'file', name: 'r.pdf', size: 9 }]);
+});
+test('my attachments show until the prompt event replaces them', () => {
+  let s = feed([hello()]);
+  const files = [{ id: '0123456789abcdef', name: 'a.png', kind: 'image', size: 8, mime: 'image/png' }];
+  S.addMine(s, 'c1', '', files);
+  assert.deepEqual(S.rows(s).map(r => [r.text, r.status, r.files]), [['', 'sending', files]]);
+  s = S.apply(s, ev(1, prompt('u1', '', { cid: 'c1', files: [{ kind: 'image', ref: 'ab'.repeat(32), mime: 'image/png' }] })));
+  assert.deepEqual(S.rows(s).map(r => [r.status, r.files[0].ref]), [['sent', 'ab'.repeat(32)]]);
+});
