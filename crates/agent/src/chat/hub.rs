@@ -707,6 +707,10 @@ impl<E: Engine> Actor<E> {
                     Some(e) => Err(e.to_string()),
                     None => self.engine.rewind_undo().await,
                 };
+                match &r {
+                    Ok(()) => self.log.push(format!("chat rewind undo {}", self.name)),
+                    Err(e) => self.log.push(format!("chat rewind undo failed {}: {e}", self.name)),
+                }
                 Some(frame(rewound(Value::Null, r.map(|()| json!({})))))
             }
             ClientFrame::Aside { .. } | ClientFrame::AsideCancel { .. } => None,
@@ -714,9 +718,17 @@ impl<E: Engine> Actor<E> {
     }
 
     /// Why the conversation may not be rewound now: only an idle session that
-    /// waits for nothing is, so no key lands in a turn or a dialog.
+    /// waits for nothing is, so no key lands in a turn or a dialog. A prompt
+    /// just typed counts as a turn: the engine's `working` lags it.
     fn rewind_refusal(&self) -> Option<&'static str> {
-        if self.working { Some("Stop the turn or wait for it to finish") } else { self.refusal() }
+        const BUSY: &str = "Stop the turn or wait for it to finish";
+        if self.working {
+            Some(BUSY)
+        } else if let Some(e) = self.refusal() {
+            Some(e)
+        } else {
+            self.pending.iter().any(|p| !p.exempt).then_some(BUSY)
+        }
     }
 
     /// Runs inside the actor, so no paste, release or other key interleaves.
@@ -734,6 +746,10 @@ impl<E: Engine> Actor<E> {
         }
         let attachments = target["files"].as_array().map_or(0, Vec::len);
         // A uuid-less row just before it (a `cdash/queued`) announced this prompt.
+        // ponytail: a queued row further back (the turn it waited on wrote more)
+        // stays and shows as "waiting" again. Dropping it from the middle would
+        // shift every later position off the engine's numbering that paging and
+        // Claude's history replay use; hide it in the store if that shows.
         let len = i - self.log_events.range(..i).rev().take_while(|e| !e["uuid"].is_string()).count();
         match self.engine.rewind(&uuid, files).await {
             Ok(text) => {
@@ -1730,7 +1746,22 @@ mod tests {
         for e in [prompt("u1", "a"), answer("k1"), json!({"type":"cdash","subtype":"queued","text":"b"}), prompt("u2", "b")] { tx.send(EngineMsg::Ev(e)).await.unwrap(); }
         settle().await;
         assert_eq!(reply(hub.command(rewind("u2")).await)["ok"], true);
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&sub.backlog[0]).unwrap()["head"], 2);
+        tx.send(EngineMsg::Ev(cut(Some("k1")))).await.unwrap(); // the tap's cut when the edited prompt lands
+        settle().await;
+        assert!(!frames(&mut sub).iter().any(|x| x["t"] == "hello"), "the tap's cut removes nothing more");
         assert_eq!(serde_json::from_str::<Value>(&hub.subscribe(None, None).await.unwrap().backlog[0]).unwrap()["head"], 2);
+    }
+    #[tokio::test]
+    async fn a_rewind_right_after_a_send_waits_for_that_prompt() {
+        let (hub, tx, calls) = rig();
+        log6(&tx).await;
+        assert_eq!(reply(hub.command(send("c1", "next")).await)["status"], "sent");
+        let r = reply(hub.command(rewind("u2")).await);
+        assert_eq!((r["ok"].as_bool(), r["error"].as_str()), (Some(false), Some("Stop the turn or wait for it to finish")));
+        assert_eq!(reply(hub.command(ClientFrame::RewindUndo).await)["ok"], false);
+        assert_eq!(*calls.lock().unwrap(), ["send:next:false"], "neither reached the engine");
     }
     #[tokio::test]
     async fn undo_reaches_the_engine_only_while_idle() {
