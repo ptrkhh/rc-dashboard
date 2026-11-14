@@ -37,10 +37,17 @@ class WatchService : Service() {
             .setContentText("Watching for replies")
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTE_ID, own, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTE_ID, own)
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTE_ID, own, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTE_ID, own)
+            }
+        } catch (_: IllegalStateException) {
+            // ForegroundServiceStartNotAllowedException (31+): a sticky restart in the
+            // background without the battery exemption. Give up until the app starts it again.
+            stopSelf()
+            return START_NOT_STICKY
         }
         val next = intent?.getStringExtra(PREF_BASE)
             ?: getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(PREF_BASE, null)
@@ -51,7 +58,8 @@ class WatchService : Service() {
         if (next != base || reader == null) {
             halt()
             base = next
-            reader = Thread({ watch(next) }, "cdash-watch").also { it.start() }
+            // Assigned before it runs: `watch` loops only while it is the current reader.
+            Thread({ watch(next) }, "cdash-watch").also { reader = it }.start()
         }
         return START_STICKY
     }
@@ -70,6 +78,7 @@ class WatchService : Service() {
             try {
                 c = URL("$base/api/notify").openConnection() as HttpURLConnection
                 conn = c
+                if (reader !== me) break // halted while connecting; finally disconnects
                 c.connectTimeout = 10_000
                 c.readTimeout = 60_000 // the agent sends a comment every 25 s
                 if (c.responseCode == 200) {

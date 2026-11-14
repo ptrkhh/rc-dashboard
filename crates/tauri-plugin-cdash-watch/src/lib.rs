@@ -41,6 +41,11 @@ mod android {
             self.run("start", json!({ "base": base })).map(drop)
         }
 
+        /// Points a running service at a new agent; does nothing when it is off.
+        pub fn retarget(&self, base: &str) -> Result<(), String> {
+            self.run("retarget", json!({ "base": base })).map(drop)
+        }
+
         pub fn stop(&self) -> Result<(), String> {
             self.run("stop", json!({})).map(drop)
         }

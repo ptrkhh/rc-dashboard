@@ -122,6 +122,12 @@ class WatchPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    /** A profile switch: point a running watch at the new agent, with no dialogs. */
+    @Command
+    fun retarget(invoke: Invoke) {
+        if (prefs().getString(PREF_BASE, null) == null) invoke.resolve() else begin(invoke)
+    }
+
     @Command
     fun stop(invoke: Invoke) {
         prefs().edit().remove(PREF_BASE).apply()

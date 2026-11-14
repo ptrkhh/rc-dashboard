@@ -443,6 +443,11 @@ fn profile_activate(app: tauri::AppHandle, name: String) -> Result<(), String> {
         use tauri::Manager;
         app.state::<notify::NotifyState>().restart(app.clone());
     }
+    // Like the desktop restart, a failure leaves the old watch running and is not the switch's error.
+    #[cfg(target_os = "android")]
+    if let Ok(base) = current_base(&app, &tauri::Manager::state::<ServerState>(&app)) {
+        tauri::async_runtime::spawn(on_watch(app, move |w| w.retarget(&base)));
+    }
     Ok(())
 }
 
