@@ -73,7 +73,7 @@ test('every req gets exactly one res, matched by rid; unknown ops and errors com
   a.write({ t: 'req', rid: 3, op: 'rewind' }); a.write({ t: 'req', rid: 4, op: 'big' });
   a.write({ t: 'req', rid: 5, op: 'set', what: 'plan', value: true });
   await until(() => a.lines.filter(l => l.t === 'res').length === 5);
-  assert.deepEqual(a.lines.filter(l => l.t === 'res'), [
+  assert.deepEqual(a.lines.filter(l => l.t === 'res').sort((x, y) => x.rid - y.rid), [
     { t: 'res', rid: 1, ok: true, data: { commands: [{ name: 'compact' }] } },
     { t: 'res', rid: 2, ok: false, error: 'nope' },
     { t: 'res', rid: 3, ok: false, error: 'not supported' },
@@ -110,5 +110,19 @@ test('a send handler that returns done gets done in the ack', async t => {
   a.write({ t: 'send', cid: 'c1', text: '/x' });
   await until(() => a.lines.some(l => l.t === 'ack'));
   assert.deepEqual(a.lines.find(l => l.t === 'ack'), { t: 'ack', cid: 'c1', ok: true, done: true });
+  a.close();
+});
+test('a hanging op does not delay send or stop, and times out once; inherited names are unsupported', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cdash-feed-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  let stopped = false;
+  const feed = new ChatFeed({ send: async () => {}, stop: async () => { stopped = true; }, opTimeout: 200, ops: { hang: () => new Promise(() => {}) } });
+  t.after(() => feed.close());
+  const a = await client(await feed.listen(dir), { after: 0, epoch: null });
+  a.write({ t: 'req', rid: 1, op: 'hang' }); a.write({ t: 'req', rid: 2, op: 'constructor' });
+  a.write({ t: 'send', cid: 'c1', text: 'hi' }); a.write({ t: 'stop' });
+  await until(() => a.lines.some(l => l.t === 'ack') && stopped);
+  assert.ok(!a.lines.some(l => l.rid === 1), 'the op is still pending');
+  await until(() => a.lines.some(l => l.rid === 1));
+  assert.deepEqual(a.lines.filter(l => l.t === 'res'), [{ t: 'res', rid: 2, ok: false, error: 'not supported' }, { t: 'res', rid: 1, ok: false, error: 'timed out' }]);
   a.close();
 });

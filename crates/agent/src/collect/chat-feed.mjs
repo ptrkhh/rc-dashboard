@@ -10,7 +10,7 @@ import { randomBytes } from 'node:crypto';
 const LINE_MAX = 64 * 1024;
 
 export class ChatFeed {
-  #send; #stop; #ops;
+  #send; #stop; #ops; #opTimeout;
   #asks = new Map();
   #settings = null;
   #settingsJson = '';
@@ -23,7 +23,8 @@ export class ChatFeed {
   #server = null;
   epoch = randomBytes(8).toString('hex');
 
-  constructor({ send, stop, ops = {} }) {
+  constructor({ send, stop, ops = {}, opTimeout = 10000 }) {
+    this.#opTimeout = opTimeout;
     this.#send = send;
     this.#stop = stop;
     this.#ops = ops;
@@ -113,10 +114,11 @@ export class ChatFeed {
   }
 
   #asksLine() {
-    const line = JSON.stringify({ t: 'asks', asks: this.asks });
+    const asks = this.asks;
+    const line = JSON.stringify({ t: 'asks', asks });
     if (Buffer.byteLength(line) < LINE_MAX) return line;
     // ponytail: only plans are cut; many huge questions would still overflow.
-    const cut = this.asks.map(a => typeof a.plan === 'string' && a.plan.length > 8000 ? { ...a, plan: a.plan.slice(0, 8000) + '\n\n…' } : a);
+    const cut = asks.map(a => typeof a.plan === 'string' && a.plan.length > 8000 ? { ...a, plan: a.plan.slice(0, 8000) + '\n\n…' } : a);
     return JSON.stringify({ t: 'asks', asks: cut });
   }
 
@@ -148,6 +150,7 @@ export class ChatFeed {
           hello = true;
           this.#attach(socket, m && typeof m === 'object' ? m : {});
         } else if (m && typeof m === 'object') {
+          if (m.t === 'req') { this.#op(socket, m); continue; } // matched by rid; never waits behind sends
           chain = chain.then(() => this.#request(socket, m));
         }
       }
@@ -171,9 +174,10 @@ export class ChatFeed {
   async #op(socket, m) {
     let res;
     try {
-      const op = this.#ops[m.op];
-      if (typeof op !== 'function') throw Error('not supported');
-      res = { t: 'res', rid: m.rid, ok: true, data: (await op(m)) ?? null };
+      if (!Object.hasOwn(this.#ops, m.op) || typeof this.#ops[m.op] !== 'function') throw Error('not supported');
+      let timer;
+      const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(Error('timed out')), this.#opTimeout); });
+      try { res = { t: 'res', rid: m.rid, ok: true, data: (await Promise.race([this.#ops[m.op](m), timeout])) ?? null }; } finally { clearTimeout(timer); }
     } catch (e) {
       res = { t: 'res', rid: m.rid, ok: false, error: String(e?.message ?? e) };
     }
@@ -183,7 +187,6 @@ export class ChatFeed {
   }
 
   async #request(socket, m) {
-    if (m.t === 'req') return this.#op(socket, m);
     if (m.t === 'stop') {
       try { await this.#stop(); } catch { /* nothing to stop */ }
       return;

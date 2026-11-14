@@ -419,6 +419,25 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_request_times_out_ignores_its_late_response_and_a_dropped_connection_fails_pending_ones() {
+        let (sock, mut sup) = fake_supervisor("reqtimeout");
+        let (engine, _rx) = start(sock, log(), "cdash-a".into());
+        let engine = Arc::new(engine);
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
+        let e = Arc::clone(&engine);
+        let slow = tokio::spawn(async move { e.request("x", json!({})).await });
+        let first: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        assert_eq!(slow.await.unwrap(), Err("no answer from the session".to_string()));
+        sup.write_line(&json!({"t":"res","rid":first["rid"],"ok":true}).to_string()).await;
+        let e = Arc::clone(&engine);
+        let pending = tokio::spawn(async move { e.request("y", json!({})).await });
+        sup.read_line().await;
+        sup.drop_connection().await;
+        assert_eq!(pending.await.unwrap(), Err("not connected".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_supervisor_that_is_gone_ends_the_engine() {
         let sock = tempfile_path("gone").join("chat.sock");                  // nothing listens there
         let (_engine, mut rx) = start(sock, log(), "cdash-a".into());
