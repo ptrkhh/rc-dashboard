@@ -281,8 +281,13 @@ impl<E: Engine> Actor<E> {
             EngineMsg::Reset => {
                 self.epoch = new_epoch();
                 self.log_events.clear();
-                self.pending.clear();
                 self.broadcast(json!({"t":"reset","epoch":self.epoch}));
+                // As CONFIRM_AFTER would have: what no event showed (and the tool never accepted).
+                for p in std::mem::take(&mut self.pending) {
+                    if !p.exempt && p.uuid.is_none() {
+                        self.broadcast(ack(&p.cid, "unconfirmed", None));
+                    }
+                }
             }
             EngineMsg::Unreadable => self.unreadable = true,
             EngineMsg::Ended => self.end(),
@@ -297,8 +302,10 @@ impl<E: Engine> Actor<E> {
             }
             self.turn_ok = false;
         } else if ev["type"] == "assistant" || ev["type"] == "user" || ev["type"] == "result" {
-            self.pending.retain(|p| p.uuid.is_none());
-            if ev["type"] == "result" {
+            // A finished turn also settles what the tool itself confirmed.
+            let done = ev["type"] == "result";
+            self.pending.retain(|p| p.uuid.is_none() && !(done && p.exempt));
+            if done {
                 if ev["subtype"] == "interrupted" {
                     self.queue.stop_all();
                 } else {
@@ -498,14 +505,24 @@ mod tests {
 
     type Calls = Arc<Mutex<Vec<String>>>;
 
-    fn rig_with(slow: Option<Duration>) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+    fn build(slow: Option<Duration>, accepts: bool) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         let calls = Calls::default();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let engine = FakeEngine { calls: calls.clone(), accepts: false, slow };
+        let engine = FakeEngine { calls: calls.clone(), accepts, slow };
         let log = Arc::new(crate::host::log::LogBuffer::new());
         let hub = Hub::spawn("claude", engine, rx, log, "cdash-a".into());
         tx.try_send(EngineMsg::Ready).unwrap();
         (hub, tx, calls)
+    }
+    fn rig_with(slow: Option<Duration>) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+        build(slow, false)
+    }
+    /// A rig whose engine confirms what it accepts, as Codex and OpenCode do.
+    fn rig_accepting() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+        build(None, true)
+    }
+    fn engine_status(working: bool, waiting: bool) -> EngineMsg {
+        EngineMsg::Status { working, waiting }
     }
     fn rig() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_with(None)
@@ -536,6 +553,28 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    #[tokio::test]
+    async fn a_reset_reports_what_the_old_conversation_never_showed_as_unconfirmed() {
+        let (hub, tx, _) = rig();
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        hub.command(send("c1", "never shown")).await;
+        hub.command(send("c2", "shown")).await;
+        tx.send(EngineMsg::Ev(prompt("u2", "shown"))).await.unwrap();
+        tx.send(EngineMsg::Reset).await.unwrap();
+        settle().await;
+        let acks: Vec<(String, String)> = frames(&mut sub).iter().filter(|f| f["t"] == "ack")
+            .map(|f| (f["cid"].as_str().unwrap().into(), f["status"].as_str().unwrap().into())).collect();
+        assert_eq!(acks, [("c1".to_string(), "unconfirmed".to_string())], "c2 was shown; it leaves with the old conversation");
+    }
+    #[tokio::test]
+    async fn a_message_the_tool_confirmed_is_forgotten_at_the_next_turn_end() {
+        let (hub, tx, calls) = rig_accepting();
+        hub.command(send("c1", "the tool reworded this")).await;
+        tx.send(EngineMsg::Ev(json!({"type":"result","subtype":"success"}))).await.unwrap();
+        settle().await;
+        hub.command(ClientFrame::Stop).await;
+        assert_eq!(*calls.lock().unwrap(), ["send:the tool reworded this:false"], "idle with nothing pending: Stop interrupts nothing");
+    }
     #[tokio::test]
     async fn a_fresh_subscriber_gets_hello_backlog_and_state_then_live_events() {
         let (hub, tx, _) = rig();
@@ -570,7 +609,7 @@ mod tests {
     async fn idle_sends_go_out_busy_sends_are_held_and_a_turn_that_ends_on_its_own_releases_one() {
         let (hub, tx, calls) = rig();
         assert_eq!(ack_of(hub.command(send("c1", "first")).await)["status"], "sent");
-        tx.send(EngineMsg::Status { working: true, waiting: false }).await.unwrap();
+        tx.send(engine_status(true, false)).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
         settle().await;
         let held = ack_of(hub.command(send("c2", "second")).await);
