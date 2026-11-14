@@ -1,6 +1,7 @@
 //! Client frames and the text sanitizer.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// What a browser may send on `/api/chat`. Anything else fails to parse and is
 /// ignored by the socket loop.
@@ -13,6 +14,9 @@ pub enum ClientFrame {
     Page { before: u64, limit: Option<usize> },
     /// This socket's device is (or is no longer) looking at the session.
     Focus { on: bool },
+    Answer { id: String, choice: Option<String>, text: Option<String>, answers: Option<Value> },
+    Set { what: String, value: Value },
+    Menu,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -68,6 +72,11 @@ mod tests {
         assert!(matches!(f(r#"{"t":"held","op":"now","id":"h1"}"#), Ok(ClientFrame::Held { op: HeldOp::Now, .. })));
         assert!(matches!(f(r#"{"t":"page","before":40}"#), Ok(ClientFrame::Page { before: 40, limit: None })));
         assert!(matches!(f(r#"{"t":"focus","on":true}"#), Ok(ClientFrame::Focus { on: true })));
+        assert!(matches!(f(r#"{"t":"answer","id":"a1","choice":"yes"}"#), Ok(ClientFrame::Answer { answers: None, .. })));
+        assert!(matches!(f(r#"{"t":"answer","id":"a1","answers":{"q0":{"choices":["Red"]}}}"#), Ok(ClientFrame::Answer { answers: Some(_), .. })));
+        assert!(matches!(f(r#"{"t":"set","what":"plan","value":true}"#), Ok(ClientFrame::Set { .. })));
+        assert!(matches!(f(r#"{"t":"menu"}"#), Ok(ClientFrame::Menu)));
+        assert!(f(r#"{"t":"set","what":"plan"}"#).is_err(), "value is required");
         assert!(f(r#"{"t":"keys","data":"x"}"#).is_err());
     }
 }

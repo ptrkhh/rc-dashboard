@@ -2,12 +2,14 @@
 //! held-message queue and the delivery rules.
 
 pub use super::wire::{ClientFrame, HeldOp};
+use super::asks::check_answer;
 use super::native::ACK_WAIT;
 use super::notify::{NoteKind, Sink};
 use super::queue::Queue;
 use super::wire::sanitize;
 use super::Frame;
 use crate::host::log::LogBuffer;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -39,6 +41,10 @@ pub enum EngineMsg {
     Ev(Value),
     Delta { id: String, text: String },
     Status { working: bool, waiting: bool, waiting_for: Option<String> },
+    /// The open questions and plans, replacing the last list.
+    Asks(Vec<Value>),
+    /// The session's model, effort, plan switch and so on, replacing the last.
+    Settings(Value),
     /// History has been replayed; subscribers may be answered.
     Ready,
     /// The conversation in the pane changed; positions restart at 1.
@@ -46,6 +52,17 @@ pub enum EngineMsg {
     /// The record's format is not understood; nothing is typed from now on.
     Unreadable,
     Ended,
+}
+
+/// What the user chose on an ask card.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Answer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<Value>,
 }
 
 /// The input side of a session.
@@ -61,6 +78,20 @@ pub trait Engine: Send + Sync + 'static {
     /// re-read from the source.
     fn history(&self, _from: u64, _to: u64) -> impl Future<Output = Result<Vec<Value>, String>> + Send {
         async { Err("not supported".to_string()) }
+    }
+    fn answer(&self, _id: &str, _a: &Answer) -> impl Future<Output = Result<(), String>> + Send {
+        async { Err("not supported".to_string()) }
+    }
+    fn set(&self, _what: &str, _value: &Value) -> impl Future<Output = Result<(), String>> + Send {
+        async { Err("not supported".to_string()) }
+    }
+    /// Commands, models, efforts and agents for the composer's menus.
+    fn menu(&self) -> impl Future<Output = Value> + Send {
+        async { json!({}) }
+    }
+    /// Whether answers arrive through hooks; read once when the hub starts.
+    fn hooks(&self) -> bool {
+        true
     }
     /// How many clients are attached now; the hub reports each change.
     fn watchers(&self, _n: usize) -> impl Future<Output = ()> + Send {
@@ -103,6 +134,7 @@ impl Hub {
         notes: Option<Sink>,
     ) -> Hub {
         let (cmds, rx) = mpsc::channel(64);
+        let hooks = engine.hooks();
         let (out, _) = broadcast::channel(1024);
         let actor = Actor {
             tool,
@@ -119,6 +151,9 @@ impl Hub {
             working: false,
             waiting: false,
             waiting_for: None,
+            asks: Vec::new(),
+            settings: json!({}),
+            hooks,
             ended: false,
             unreadable: false,
             ready: false,
@@ -144,7 +179,7 @@ impl Hub {
         rx.await.ok()
     }
 
-    /// The reply for `send` and `page`; `None` for the rest.
+    /// The reply for `send`, `page`, `answer`, `set` and `menu`; `None` for the rest.
     pub async fn command(&self, frame: ClientFrame) -> Option<Frame> {
         let (reply, rx) = oneshot::channel();
         self.cmds.send(Cmd::Client { frame, reply }).await.ok()?;
@@ -217,6 +252,9 @@ struct Actor<E> {
     working: bool,
     waiting: bool,
     waiting_for: Option<String>,
+    asks: Vec<Value>,
+    settings: Value,
+    hooks: bool,
     ended: bool,
     unreadable: bool,
     ready: bool,
@@ -285,7 +323,7 @@ impl<E: Engine> Actor<E> {
 
     fn state(&self) -> Value {
         let held: Vec<Value> = self.queue.list().iter().map(|h| json!({"id":h.id,"text":h.text})).collect();
-        json!({"t":"state","working":self.working,"waiting":self.waiting,"waiting_for":self.waiting_for,"ended":self.ended,"unreadable":self.unreadable,"held":held})
+        json!({"t":"state","working":self.working,"waiting":self.waiting,"waiting_for":self.waiting_for,"asks":self.asks,"settings":self.settings,"hooks":self.hooks,"ended":self.ended,"unreadable":self.unreadable,"held":held})
     }
 
     fn publish_state(&mut self) {
@@ -351,6 +389,8 @@ impl<E: Engine> Actor<E> {
                 self.waiting = waiting;
                 self.waiting_for = waiting_for;
             }
+            EngineMsg::Asks(a) => self.asks = a,
+            EngineMsg::Settings(v) => self.settings = v,
             EngineMsg::Ready => {
                 self.ready = true;
                 self.live = true;
@@ -446,6 +486,36 @@ impl<E: Engine> Actor<E> {
             ClientFrame::Page { before, limit } => Some(frame(self.page(before, limit).await)),
             // The socket pump consumes focus frames itself.
             ClientFrame::Focus { .. } => None,
+            ClientFrame::Answer { id, choice, text, answers } => {
+                let a = Answer { choice, text, answers };
+                let r = match self.asks.iter().find(|k| k["id"] == id.as_str()) {
+                    None => Err("already answered".to_string()),
+                    Some(ask) => match check_answer(ask, &a) {
+                        Ok(()) => self.engine.answer(&id, &a).await,
+                        Err(e) => Err(e.to_string()),
+                    },
+                };
+                self.log.push(format!("chat answer {}", self.name));
+                let mut v = json!({"t":"answered","id":id,"ok":r.is_ok()});
+                if let Err(e) = r {
+                    v["error"] = json!(e);
+                }
+                Some(frame(v))
+            }
+            ClientFrame::Set { what, value } => {
+                let r = self.engine.set(&what, &value).await;
+                self.log.push(format!("chat set {} {what}", self.name));
+                let mut v = json!({"t":"set","ok":r.is_ok()});
+                if let Err(e) = r {
+                    v["error"] = json!(e);
+                }
+                Some(frame(v))
+            }
+            ClientFrame::Menu => {
+                let m = self.engine.menu().await;
+                let list = |k: &str| m.get(k).cloned().unwrap_or_else(|| json!([]));
+                Some(frame(json!({"t":"menu","commands":list("commands"),"models":list("models"),"efforts":list("efforts"),"agents":list("agents")})))
+            }
         }
     }
 
@@ -473,7 +543,7 @@ impl<E: Engine> Actor<E> {
         } else if self.unreadable {
             Some("cannot read this session; use Terminal")
         } else if self.waiting {
-            Some("answer in Terminal first")
+            Some(if self.asks.is_empty() { "answer in Terminal first" } else { "answer the card first" })
         } else if self.stopped_at.is_some() && self.pending.iter().any(|p| !p.exempt) {
             // A paste now could join a prompt Claude is handing back.
             Some("stopping; send again in a moment")
@@ -485,6 +555,11 @@ impl<E: Engine> Actor<E> {
     async fn deliver(&mut self, cid: &str, text: &str, steer: bool) -> Value {
         match self.engine.send(text, steer, cid).await {
             Err(e) => ack(cid, "refused", Some(&e)),
+            // A command the engine ran itself: no prompt will ever show it.
+            Ok(true) if text.starts_with('/') => {
+                self.log.push(format!("chat send {}", self.name));
+                ack(cid, "done", None)
+            }
             Ok(confirmed) => {
                 self.pending.push(Pending {
                     cid: cid.to_string(),
@@ -599,6 +674,7 @@ impl<E: Engine> Actor<E> {
             return;
         }
         self.ended = true;
+        self.asks.clear();
         let held: Vec<String> = self.queue.clear().into_iter().map(|h| h.cid).collect();
         let pending: Vec<String> = self.pending.drain(..).map(|p| p.cid).collect();
         for cid in held.iter().chain(&pending) {
@@ -643,6 +719,17 @@ mod tests {
         }
         async fn clear_input(&self, text: &str) {
             self.calls.lock().unwrap().push(format!("clear:{text}"));
+        }
+        async fn answer(&self, id: &str, a: &Answer) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("answer:{id}:{}", a.choice.as_deref().unwrap_or("-")));
+            Ok(())
+        }
+        async fn set(&self, what: &str, value: &Value) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("set:{what}:{value}"));
+            if what == "nope" { Err("not here".into()) } else { Ok(()) }
+        }
+        async fn menu(&self) -> Value {
+            json!({"commands":[{"name":"compact"}]})
         }
         async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
             Ok((from..=to.min(self.has)).map(|k| json!({"type":"user","n":k})).collect())
@@ -723,8 +810,11 @@ mod tests {
     fn send(cid: &str, text: &str) -> ClientFrame {
         ClientFrame::Send { cid: cid.into(), text: text.into() }
     }
-    fn ack_of(reply: Option<Frame>) -> Value {
+    fn reply(reply: Option<Frame>) -> Value {
         serde_json::from_str(&reply.expect("a reply")).unwrap()
+    }
+    fn plan_ask(id: &str) -> Value {
+        json!({"id":id,"kind":"plan","tool":"claude","plan":"# P"})
     }
     async fn settle() {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -785,11 +875,11 @@ mod tests {
     #[tokio::test]
     async fn idle_sends_go_out_busy_sends_are_held_and_a_turn_that_ends_on_its_own_releases_one() {
         let (hub, tx, calls) = rig();
-        assert_eq!(ack_of(hub.command(send("c1", "first")).await)["status"], "sent");
+        assert_eq!(reply(hub.command(send("c1", "first")).await)["status"], "sent");
         tx.send(engine_status(true, false)).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
         settle().await;
-        let held = ack_of(hub.command(send("c2", "second")).await);
+        let held = reply(hub.command(send("c2", "second")).await);
         assert_eq!((held["status"].as_str(), held["id"].as_str()), (Some("held"), Some("h1")));
         hub.command(send("c3", "third")).await;
         tx.send(EngineMsg::Ev(answer("k1"))).await.unwrap();
@@ -816,7 +906,7 @@ mod tests {
         assert!(f.iter().any(|x| x["t"] == "ack" && x["cid"] == "c1" && x["status"] == "returned"));
         let state = f.iter().rev().find(|x| x["t"] == "state").unwrap();
         assert_eq!(state["held"][0]["text"], "second", "still listed, not sent");
-        assert_eq!(ack_of(hub.command(send("c4", "typed while idle")).await)["status"], "sent");
+        assert_eq!(reply(hub.command(send("c4", "typed while idle")).await)["status"], "sent");
         assert!(!calls.lock().unwrap().iter().any(|c| c.starts_with("send:second")));
     }
     #[tokio::test]
@@ -868,14 +958,14 @@ mod tests {
         hub.command(send("c1", "held")).await;
         tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: None }).await.unwrap();
         settle().await;
-        assert_eq!(ack_of(hub.command(send("c2", "x")).await)["status"], "refused");
+        assert_eq!(reply(hub.command(send("c2", "x")).await)["status"], "refused");
         assert!(calls.lock().unwrap().is_empty(), "nothing is typed into a dialog");
         tx.send(EngineMsg::Ended).await.unwrap();
         settle().await;
         let f = frames(&mut sub);
         assert!(f.iter().any(|x| x["t"] == "ack" && x["cid"] == "c1" && x["status"] == "refused" && x["error"] == "session ended"));
         assert!(f.iter().any(|x| x["t"] == "state" && x["ended"] == true && x["held"] == json!([])));
-        assert_eq!(ack_of(hub.command(send("c3", "x")).await)["status"], "refused");
+        assert_eq!(reply(hub.command(send("c3", "x")).await)["status"], "refused");
     }
     #[tokio::test]
     async fn sends_from_two_clients_reach_the_engine_one_at_a_time() {
@@ -909,7 +999,7 @@ mod tests {
         settle().await;
         let sub = hub.subscribe(None, None).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(sub.backlog.last().unwrap()).unwrap()["unreadable"], true);
-        let ack = ack_of(hub.command(send("c1", "x")).await);
+        let ack = reply(hub.command(send("c1", "x")).await);
         assert_eq!((ack["status"].as_str(), ack["error"].as_str()), (Some("refused"), Some("cannot read this session; use Terminal")));
         assert!(calls.lock().unwrap().is_empty());
     }
@@ -955,11 +1045,11 @@ mod tests {
         hub.command(ClientFrame::Stop).await;
         tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
         settle().await;
-        let early = ack_of(hub.command(send("c2", "second")).await);
+        let early = reply(hub.command(send("c2", "second")).await);
         assert_eq!((early["status"].as_str(), early["error"].as_str()), (Some("refused"), Some("stopping; send again in a moment")));
         assert!(STOP_SETTLE >= Duration::from_millis(2500), "transcript writes were seen up to 2.2 s late");
         tokio::time::sleep(STOP_SETTLE + Duration::from_millis(300)).await;
-        assert_eq!(ack_of(hub.command(send("c3", "third")).await)["status"], "sent");
+        assert_eq!(reply(hub.command(send("c3", "third")).await)["status"], "sent");
         assert_eq!(*calls.lock().unwrap(), ["send:first:false", "stop", "clear:first", "send:third:false"]);
     }
 
@@ -1142,5 +1232,54 @@ mod tests {
         assert_eq!(n.load(Ordering::Relaxed), 2, "told before the subscriber hears back, not at the next tick");
         drop((a, b));
         crate::chat::tmux_io::tests::eventually("none attached", || n.load(Ordering::Relaxed) == 0).await;
+    }
+    #[tokio::test]
+    async fn asks_settings_and_hooks_are_state_and_always_present() {
+        let (hub, tx, _) = rig();
+        let last = |s: Subscription| serde_json::from_str::<Value>(s.backlog.last().unwrap()).unwrap();
+        let st = last(hub.subscribe(None, None).await.unwrap());
+        assert_eq!((&st["asks"], &st["settings"], &st["hooks"]), (&json!([]), &json!({}), &json!(true)));
+        assert!(st.get("waiting_for").is_some(), "Part 4's key stays");
+        tx.send(EngineMsg::Asks(vec![plan_ask("a1")])).await.unwrap();
+        tx.send(EngineMsg::Settings(json!({"model":"m","effort":"high","plan":true,"agent":null,"variant":null}))).await.unwrap();
+        settle().await;
+        let st = last(hub.subscribe(None, None).await.unwrap());
+        assert_eq!((st["asks"][0]["id"].as_str(), st["settings"]["effort"].as_str()), (Some("a1"), Some("high")));
+    }
+    #[tokio::test]
+    async fn only_a_pending_ask_reaches_the_engine_and_a_bad_answer_does_not() {
+        let (hub, tx, calls) = rig();
+        let ans = |id: &str, c: &str| ClientFrame::Answer { id: id.into(), choice: Some(c.into()), text: None, answers: None };
+        assert_eq!(reply(hub.command(ans("gone", "yes")).await), json!({"t":"answered","id":"gone","ok":false,"error":"already answered"}));
+        tx.send(EngineMsg::Asks(vec![plan_ask("a1")])).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(ans("a1", "maybe")).await)["error"], "not a valid answer");
+        assert_eq!(reply(hub.command(ans("a1", "yes")).await), json!({"t":"answered","id":"a1","ok":true}));
+        assert_eq!(*calls.lock().unwrap(), ["answer:a1:yes"]);
+    }
+    #[tokio::test]
+    async fn waiting_refuses_sends_with_the_card_or_the_terminal_message() {
+        let (hub, tx, _) = rig();
+        tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: Some("permission prompt".into()) }).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(send("c1", "x")).await)["error"], "answer in Terminal first");
+        tx.send(EngineMsg::Asks(vec![plan_ask("a1")])).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(send("c2", "x")).await)["error"], "answer the card first");
+    }
+    #[tokio::test]
+    async fn set_and_menu_reply_with_what_the_engine_said() {
+        let (hub, _tx, calls) = rig();
+        assert_eq!(reply(hub.command(ClientFrame::Set { what: "plan".into(), value: json!(true) }).await), json!({"t":"set","ok":true}));
+        assert_eq!(reply(hub.command(ClientFrame::Set { what: "nope".into(), value: json!(1) }).await), json!({"t":"set","ok":false,"error":"not here"}));
+        assert_eq!(reply(hub.command(ClientFrame::Menu).await), json!({"t":"menu","commands":[{"name":"compact"}],"models":[],"efforts":[],"agents":[]}));
+        assert_eq!(*calls.lock().unwrap(), ["set:plan:true", "set:nope:1"]);
+    }
+    #[tokio::test]
+    async fn a_command_the_engine_ran_itself_is_done_and_leaves_nothing_pending() {
+        let (hub, _tx, calls) = rig_accepting();
+        assert_eq!(reply(hub.command(send("c1", "/compact")).await)["status"], "done");
+        hub.command(ClientFrame::Stop).await;
+        assert_eq!(*calls.lock().unwrap(), ["send:/compact:false"], "nothing pending: Stop interrupts nothing");
     }
 }
