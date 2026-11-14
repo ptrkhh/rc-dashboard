@@ -325,6 +325,7 @@ pub async fn serve(cfg: Config) -> std::io::Result<Bound> {
         router(Arc::clone(&ctx), Arc::clone(&cfg.auth), cfg.password.clone(), cf);
 
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    crate::chat::notify::spawn(Arc::clone(&ctx), stop_rx.clone());
     let task = tokio::spawn(async move {
         // `ConnectInfo` needs the peer address, which the trusted-proxy guard
         // checks against its allowlist.

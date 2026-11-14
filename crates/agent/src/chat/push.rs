@@ -1,12 +1,14 @@
 //! Web Push: the VAPID identity (RFC 8292) and the subscription store.
 
 use super::ece::b64;
+use super::notify::{Note, NoteKind};
 use crate::collect::ctx::Ctx;
 use crate::collect::fsio::write_atomic_private;
 use serde::{Deserialize, Serialize};
 use std::io;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use ring::rand::SystemRandom;
+use sha2::{Digest, Sha256};
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 
 /// Contact claim: the project page, never a person.
@@ -134,6 +136,54 @@ pub async fn subscriptions(ctx: &Ctx) -> Vec<Sub> {
     match tokio::fs::read_to_string(file(ctx)).await {
         Ok(t) => serde_json::from_str::<Store>(&t).map(|s| s.subs).unwrap_or_default(),
         Err(_) => vec![],
+    }
+}
+
+/// One push per subscription, in file order. A dead or unreachable device never
+/// stops the next; 404 and 410 drop the subscription. Logs name only the host.
+// ponytail: one push at a time; send concurrently if several slow devices make notes late.
+pub async fn send(ctx: &Ctx, http: &reqwest::Client, note: &Note) {
+    let subs = subscriptions(ctx).await;
+    if subs.is_empty() {
+        return;
+    }
+    let Ok(vapid) = vapid(ctx).await else {
+        ctx.host.log.push("push failed: no signing key");
+        return;
+    };
+    let payload = note.payload();
+    let topic = b64(&Sha256::digest(note.session.as_bytes()))[..32].to_string();
+    let urgency = if note.kind == NoteKind::Done { "normal" } else { "high" };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    for sub in subs {
+        let host = reqwest::Url::parse(&sub.endpoint).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
+        let sent = async {
+            let ua = super::ece::unb64(&sub.p256dh).ok_or("bad p256dh")?;
+            let auth = super::ece::unb64(&sub.auth).ok_or("bad auth")?;
+            let body = super::ece::encrypt(&ua, &auth, payload.as_bytes())?;
+            let res = http
+                .post(&sub.endpoint)
+                .header("Authorization", vapid.authorization(&sub.endpoint, now)?)
+                .header("Content-Encoding", "aes128gcm")
+                .header("TTL", "86400")
+                .header("Urgency", urgency)
+                .header("Topic", &topic)
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| "unreachable".to_string())?;
+            Ok::<_, String>(res.status())
+        }
+        .await;
+        match sent {
+            Ok(s) if s.is_success() => {}
+            Ok(s) if s.as_u16() == 404 || s.as_u16() == 410 => {
+                let _ = remove(ctx, &sub.endpoint).await;
+                ctx.host.log.push(format!("push failed {} {host}", s.as_u16()));
+            }
+            Ok(s) => ctx.host.log.push(format!("push failed {} {host}", s.as_u16())),
+            Err(e) => ctx.host.log.push(format!("push failed {e} {host}")),
+        }
     }
 }
 
