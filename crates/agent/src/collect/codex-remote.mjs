@@ -197,7 +197,7 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
 // A userMessage item as chat shows it: its text without the `Attached:` lines, and files
 // as cache refs. Image bytes (a data URL, or a file Codex names) never leave this function.
 async function chatPrompt(item) {
-  const { MAX_MEDIA, splitAttached, stashMedia } = await import('./chat-feed.mjs'); // lazy: the worker is also copied alone
+  const { MAX_MEDIA, splitAttached, stashMedia } = await import(new URL('./chat-feed.mjs', import.meta.url)); // lazy: the worker is also copied alone
   const blocks = item.content || [];
   const { text, files: attached } = splitAttached(blocks.filter(b => b.type === 'text').map(b => b.text).join(''));
   const images = [];
@@ -210,7 +210,8 @@ async function chatPrompt(item) {
       name = basename(b.path);
       try { if ((await stat(b.path)).size <= MAX_MEDIA) bytes = await readFile(b.path); } catch { /* gone */ }
     } else continue;
-    const m = bytes && await stashMedia(process.env.CDASH_MEDIA_DIR, bytes);
+    // a failed stash (EACCES, ENOSPC) must not reach the notification chain: fatal() would end the session
+    const m = bytes && await stashMedia(process.env.CDASH_MEDIA_DIR, bytes).catch(() => null);
     images.push(m ? { kind: 'image', ref: m.ref, mime: m.mime } : { kind: 'file', name });
   }
   return { text, files: [...images, ...attached] };
@@ -237,13 +238,19 @@ async function chatMessages(m, sid) {
 
 // A prompt's input blocks: text with the other files as `Attached:` lines, then each image as a data URL.
 async function codexInput(text, files) {
-  const { withAttached } = await import('./chat-feed.mjs');
+  const { withAttached } = await import(new URL('./chat-feed.mjs', import.meta.url));
   const images = files.filter(f => f.kind === 'image');
   const sizes = await Promise.all(images.map(async f => Math.max(f.size || 0, (await stat(f.path)).size)));
   if (sizes.reduce((a, b) => a + b, 0) > CODEX_IMAGES_MAX) throw Error('too many images for one Codex message');
   const body = withAttached(text, files.filter(f => f.kind !== 'image').map(f => f.path));
-  return [...(body ? [{ type: 'text', text: body, text_elements: [] }] : []),
-    ...await Promise.all(images.map(async f => ({ type: 'image', url: `data:${f.mime};base64,${(await readFile(f.path)).toString('base64')}` })))];
+  let total = 0;
+  const urls = [];
+  for (const f of images) { // the file may have grown since stat
+    const buf = await readFile(f.path);
+    if ((total += buf.length) > CODEX_IMAGES_MAX) throw Error('too many images for one Codex message');
+    urls.push({ type: 'image', url: `data:${f.mime};base64,${buf.toString('base64')}` });
+  }
+  return [...(body ? [{ type: 'text', text: body, text_elements: [] }] : []), ...urls];
 }
 
 const CODEX_COMMANDS = [

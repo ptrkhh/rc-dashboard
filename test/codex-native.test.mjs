@@ -467,3 +467,17 @@ test('image prompts from the native TUI and from history reach chat as cache ref
   assert.ok(c.sizes.every(n => n < 64 * 1024), 'no line on the agent socket carries image bytes');
   c.close();
 });
+test('a media folder that cannot be written, or a bad data URL, still shows the message and keeps the supervisor up', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  await writeFile(join(f.dir, 'media'), 'a file, so mkdir under it fails');   // CDASH_MEDIA_DIR is this path
+  await f.inject({ method: 'item/completed', params: { turnId: 't2', item: { id: 'u3', type: 'userMessage', content: [
+    { type: 'text', text: 'see' }, { type: 'image', url: 'data:image/png;base64,' + PNG.toString('base64') },
+    { type: 'image', url: 'data:image/png;base64' }, { type: 'image', url: 'data:text/plain;base64,aGk=' }] } } });
+  await until(() => c.lines.some(l => l.t === 'ev' && l.ev.message?.id === 'u3'));
+  assert.deepEqual(c.lines.find(l => l.t === 'ev' && l.ev.message?.id === 'u3').ev.files, [{ kind: 'file', name: 'image' }, { kind: 'file', name: 'image' }, { kind: 'file', name: 'image' }]);
+  assert.ok(f.alive(f.child.pid), 'the supervisor is still running');
+  c.close();
+});
