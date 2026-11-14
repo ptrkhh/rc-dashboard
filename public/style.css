@@ -778,6 +778,32 @@ button, input, select { font: inherit; }
   .chat-held-item button:first-of-type { margin-left: auto; }
 }
 
+.chat-chip {
+  flex: 0 1 auto; min-width: 0; max-width: 40%; height: 28px; padding: 0 12px; cursor: pointer;
+  font: inherit; font-size: 12px; color: var(--text-muted); background: var(--surface-2);
+  border: 1px solid var(--border-strong); border-radius: var(--r-pill);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.chat-chip:hover { background: var(--surface-hover); }
+.chat-chip[hidden] { display: none; }
+/* In flow above the composer; Part 3's attachment chips go between this and the form. */
+.chat-menu {
+  max-height: 40vh; overflow-y: auto; margin: 0 var(--chat-pad) 4px;
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow-sm);
+}
+.chat-menu[hidden] { display: none; }
+.chat-menu-item { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 8px 12px; cursor: pointer; }
+.chat-menu-item[aria-selected="true"] { background: var(--accent-ring); box-shadow: inset 2px 0 var(--accent); }
+.chat-menu-name { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
+.chat-menu-hint, .chat-menu-desc, .chat-menu-note { font-size: 12px; color: var(--text-muted); }
+.chat-menu-note { padding: 8px 12px; }
+.chat-menu-desc { flex-basis: 100%; }
+.chat-set-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; }
+.chat-set-row select { min-width: 0; max-width: 60%; font: inherit; }
+.chat-set-label { font-weight: 600; }
+.chat-set-note { flex-basis: 100%; margin: 0; font-size: 12px; color: var(--text-muted); }
+.chat-set-error { margin: 0; font-size: 13px; color: var(--danger); }
+
 .chat-form {
   display: flex; align-items: flex-end; gap: 8px;
   padding: 10px var(--chat-pad) calc(10px + env(safe-area-inset-bottom));

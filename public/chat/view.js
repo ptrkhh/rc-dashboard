@@ -44,6 +44,7 @@
       const b = e.target.closest('[data-tools]');
       if (b && c) showTools(b.dataset.tools);
     });
+    cdashMenu.wire(sendFrame, () => c?.state ?? null);
     $('#chat-sheet-close').addEventListener('click', () => $('#chat-sheet').close());
     log.addEventListener('click', e => {
       const b = e.target.closest('[data-edit],[data-again],[data-dismiss]');
@@ -130,6 +131,7 @@
     $('#chat-held').textContent = '';
     $('#chat-cards').textContent = '';
     if ($('#chat-sheet').open) $('#chat-sheet').close();
+    cdashMenu.reset();
   }
 
   async function connect() {
@@ -317,6 +319,7 @@
     renderStatus();
     renderBanner();
     cdashCards.render($('#chat-cards'), x.state, sendFrame);
+    cdashMenu.render(x.state);
     renderHeld();
     renderComposer();
     // Last: the held list and composer above change how tall the log is.

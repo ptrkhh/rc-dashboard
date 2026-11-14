@@ -205,6 +205,7 @@ External sessions without a Claude link show instructions instead of a waiting s
 - A message sent while the session works is held by the dashboard and listed above the composer with **Send now**, **Edit** and **Remove**. When a turn ends on its own, the next held message goes out, one per turn.
 - **Stop** interrupts the running turn. After a stop, from any door, held messages stay held until you choose what to do with each. A Claude Code prompt stopped before any reply is marked not sent and its text can be edited.
 - Questions and plan approvals appear as cards above the composer and can be answered from chat; the first answer from any door wins and the card closes everywhere. Permission prompts and other dialogs still point to Terminal, as do Claude Code sessions started before upgrading until they are restarted.
+- Type `/` for the session's commands. The chip at the top shows the model, effort and plan mode (for OpenCode, the variant and agent); tap it to change them. Claude Code's pickers work while the session is idle, and a model or effort change there also becomes the default for new Claude sessions; Codex applies changes from the next turn.
 - Chat reconnects on its own and catches up without gaps or repeats. Held messages live in the agent's memory; if the agent restarts, the device that wrote them shows them as not sent.
 - Codex and OpenCode sessions started before upgrading need a restart before **Chat** appears on their cards.
 

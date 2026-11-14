@@ -138,5 +138,5 @@
     shown = JSON.stringify(asks.map(a => [a.id, idOf(state.answered.get(a.id)), ui.get(a.id).sent]));
   }
 
-  g.cdashCards = { render, complete, frame };
+  g.cdashCards = { render, complete, frame, el };
 })(typeof globalThis === 'undefined' ? this : globalThis);
