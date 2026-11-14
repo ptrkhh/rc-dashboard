@@ -105,7 +105,7 @@
       const gen = this._gen;
       const live = () => gen === this._gen && item.state === 'uploading';
       const fail = error => {
-        this._wait = null;
+        if (this._wait?.item === item) this._wait = null; // a stale loop must not drop a newer upload's wait
         if (live()) { Object.assign(item, { state: 'failed', error }); this._change(); }
       };
       item.state = 'uploading';
