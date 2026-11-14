@@ -289,6 +289,7 @@ struct Actor<E> {
     pending: Vec<Pending>,
     queue: Queue,
     /// Finished uploads by id, for the sends that name them.
+    // ponytail: one entry per upload for the hub's life; prune on send or on the sweep if it grows.
     uploads: HashMap<String, Attachment>,
     working: bool,
     waiting: bool,
@@ -946,7 +947,7 @@ mod tests {
             assert_eq!((a["status"].as_str(), a["error"].as_str()), (Some("refused"), Some("attachment expired")), "{cid}");
         }
         assert_eq!(reply(hub.command(send_with("c5", " ", &[])).await)["error"], "empty message");
-        assert_eq!(reply(hub.command(send_with("c6", "x", &["aaaa"; 11])).await)["error"], "too many attachments");
+        assert_eq!(reply(hub.command(send_with("c6", "x", &["nope"; 11])).await)["error"], "too many attachments");
         assert_eq!(*calls.lock().unwrap(), ["send:look:false:shot.png", "send::false:shot.png"]);
     }
     #[tokio::test]
