@@ -10,6 +10,10 @@
     mine: [],            // {cid, text, status, error, seq}; seq set once an event showed it
     rev: 0,              // bumped by whatever rows() reads; rows() is reused while it holds still
     forgetHeld: false,   // after a reset, the next state frame says which held ones survived
+    asks: [], settings: {}, hooks: true, waiting_for: null,
+    menu: null,          // {commands, models, efforts, agents} once the menu frame arrived
+    answered: new Map(), // ask id -> {ok, error}; forgotten once the ask leaves `asks`
+    setReply: null,      // {ok, error} of the last settings change
   });
 
   const isPrompt = ev => ev.type === 'user' && !(Array.isArray(ev.message?.content) && ev.message.content.some(b => b?.type === 'tool_result'));
@@ -76,6 +80,8 @@
         break;
       case 'state':
         Object.assign(s, { working: !!f.working, waiting: !!f.waiting, ended: !!f.ended, unreadable: !!f.unreadable, held: f.held || [] });
+        Object.assign(s, { asks: f.asks ?? [], settings: f.settings ?? {}, hooks: f.hooks !== false, waiting_for: f.waiting_for ?? null });
+        for (const id of s.answered.keys()) if (!s.asks.some(a => a.id === id)) s.answered.delete(id);
         {
           // Held rows the agent no longer lists: the session ended, the agent lost its queue, or they left it elsewhere.
           const ids = new Set(s.held.map(h => h.id));
@@ -90,6 +96,8 @@
       case 'ack': {
         const m = s.mine.find(x => x.cid === f.cid);
         if (!m) break;
+        // `done`: the engine ran the command itself, so no prompt event will ever show this row.
+        if (f.status === 'done') { s.mine = s.mine.filter(x => x !== m); break; }
         m.status = f.status;
         if (f.id) m.heldId = f.id;
         if (f.error) m.error = f.error;
@@ -97,6 +105,17 @@
         if (['returned', 'refused', 'unconfirmed'].includes(f.status)) m.seq = null;
         break;
       }
+      case 'answered':
+        s.answered.set(f.id, { ok: f.ok, error: f.error });
+        break;
+      case 'menu': {
+        const l = k => f[k] || [];
+        s.menu = { commands: l('commands'), models: l('models'), efforts: l('efforts'), agents: l('agents') };
+        break;
+      }
+      case 'set':
+        s.setReply = { ok: f.ok, error: f.error };
+        break;
     }
     return s;
   }
@@ -112,6 +131,16 @@
     s.mine = s.mine.filter(x => x.cid !== cid);
     s.rev++;
     return s;
+  }
+
+  // The Terminal banner waits 500 ms for a card, unless none can come.
+  const needsTerminal = (s, waitedMs) => s.waiting && s.asks.length === 0 && (s.waiting_for === 'dialog open' || !s.hooks || waitedMs >= 500);
+
+  function chipText(s) {
+    const { model, effort, variant, plan, agent } = s.settings || {};
+    const label = !model ? '' : s.tool === 'claude' ? model.replace(/^claude-/, '').split('-')[0].replace(/^./, c => c.toUpperCase())
+      : s.tool === 'opencode' ? model.split('/').pop() : model;
+    return [label, effort ?? variant, plan === true && 'Plan', s.tool === 'opencode' && agent && agent !== 'build' && agent].filter(Boolean).join(' · ');
   }
 
   const base = p => String(p || '').split('/').filter(Boolean).pop() || '';
@@ -203,5 +232,5 @@
     return out;
   }
 
-  g.cdashChatStore = { initial, apply, rows, addMine, dropMine, toolLabel };
+  g.cdashChatStore = { initial, apply, rows, addMine, dropMine, toolLabel, needsTerminal, chipText };
 })(typeof globalThis === 'undefined' ? this : globalThis);

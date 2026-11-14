@@ -133,3 +133,46 @@ test('dropMine removes an own row even after rows() was memoized', () => {
   S.dropMine(s, 'c1');
   assert.equal(S.rows(s).length, 0);
 });
+
+const st = o => ({ t: 'state', working: false, waiting: false, ended: false, unreadable: false, held: [], ...o });
+test('asks, settings and hooks come from state frames; menu, answered and set replies are kept', () => {
+  let s = S.initial();
+  assert.deepEqual([s.asks, s.settings, s.hooks, s.waiting_for, s.menu, s.setReply], [[], {}, true, null, null, null]);
+  s = S.apply(s, st({ waiting: true, waiting_for: 'input needed', asks: [{ id: 'a1', kind: 'plan', tool: 'claude', plan: '# P' }], settings: { model: 'claude-opus-5-5' }, hooks: false }));
+  assert.deepEqual([s.asks[0].id, s.settings.model, s.hooks, s.waiting_for], ['a1', 'claude-opus-5-5', false, 'input needed']);
+  s = S.apply(s, { t: 'answered', id: 'a1', ok: false, error: 'already answered' });
+  assert.deepEqual(s.answered.get('a1'), { ok: false, error: 'already answered' });
+  s = S.apply(s, st({ asks: [] }));
+  assert.equal(s.answered.size, 0, 'replies about asks that are gone are forgotten');
+  s = S.apply(s, { t: 'menu', commands: [{ name: 'compact' }] });
+  assert.deepEqual(s.menu, { commands: [{ name: 'compact' }], models: [], efforts: [], agents: [] });
+  s = S.apply(s, { t: 'set', ok: false, error: 'Stop the turn or wait for it to finish' });
+  assert.deepEqual(s.setReply, { ok: false, error: 'Stop the turn or wait for it to finish' });
+});
+test('a state frame without the new keys uses defaults', () => {
+  const s = S.apply(S.initial(), st({}));
+  assert.deepEqual([s.asks, s.settings, s.hooks, s.waiting_for], [[], {}, true, null]);
+});
+test('an ack with status done drops the own row and refreshes rows()', () => {
+  const s = S.initial();
+  S.addMine(s, 'c1', '/compact');
+  assert.equal(S.rows(s).length, 1);
+  S.apply(s, { t: 'ack', cid: 'c1', status: 'done' });
+  assert.equal(S.rows(s).length, 0);
+});
+test('the Terminal banner waits 500 ms for a card, except where no card can come', () => {
+  const w = o => ({ waiting: true, asks: [], hooks: true, waiting_for: null, ...o });
+  assert.equal(S.needsTerminal(w({}), 100), false);
+  assert.equal(S.needsTerminal(w({}), 600), true);
+  assert.equal(S.needsTerminal(w({ waiting_for: 'dialog open' }), 0), true);
+  assert.equal(S.needsTerminal(w({ hooks: false }), 0), true);
+  assert.equal(S.needsTerminal(w({ asks: [{ id: 'a' }] }), 9999), false);
+  assert.equal(S.needsTerminal(w({ waiting: false }), 9999), false);
+});
+test('the header chip reads model, effort, Plan and a non-default agent', () => {
+  assert.equal(S.chipText({ tool: 'claude', settings: { model: 'claude-opus-5-5', effort: 'high', plan: true } }), 'Opus · high · Plan');
+  assert.equal(S.chipText({ tool: 'codex', settings: { model: 'gpt-5.4', effort: 'low', plan: false } }), 'gpt-5.4 · low');
+  assert.equal(S.chipText({ tool: 'opencode', settings: { model: 'anthropic/claude-sonnet-5', variant: 'max', agent: 'plan' } }), 'claude-sonnet-5 · max · plan');
+  assert.equal(S.chipText({ tool: 'opencode', settings: { model: 'a/b', variant: null, agent: 'build' } }), 'b');
+  assert.equal(S.chipText({ tool: 'claude', settings: {} }), '');
+});
