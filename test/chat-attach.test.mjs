@@ -79,3 +79,9 @@ test('a closed socket fails the item as Offline', async () => {
 test('sizes read the way the chips show them', () => {
   assert.deepEqual([900, 1536, 2.5 * MiB, 20 * MiB].map(A.fmtSize), ['900 B', '1.5 KB', '2.5 MB', '20 MB']);
 });
+test('Edit brings back at most 10 attachments', () => {
+  const { u } = rig();
+  u.add(new File(['a'], 'a.txt'));
+  u.restore(Array.from({ length: 12 }, (_, n) => ({ id: String(n).padStart(16, '0'), name: n + '.txt', kind: 'file', size: 1 })));
+  assert.equal(u.items.length, A.MAX);
+});

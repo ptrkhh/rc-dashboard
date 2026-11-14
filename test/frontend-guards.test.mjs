@@ -597,6 +597,7 @@ test('older history is asked for while the list cannot scroll, and Send again ke
   const { needPage, resend, httpBase } = globalThis.cdashChat;
   assert.equal(httpBase('wss://h.example:8443/api/chat?name=a'), 'https://h.example:8443', 'thumbnails come from the agent the socket reached');
   assert.equal(httpBase('ws://127.0.0.1:41234/api/chat?name=a'), 'http://127.0.0.1:41234');
+  assert.equal(httpBase('wss://h/prefix/api/chat?name=a&after=3'), 'https://h/prefix', "a profile's path prefix stays");
   assert.equal(needPage(true, false, 0, 500, 600), true, 'a first screen that does not scroll still pages');
   assert.equal(needPage(true, false, 10, 3000, 600), true, 'scrolled to the top');
   assert.equal(needPage(true, false, 900, 3000, 600), false);

@@ -53,8 +53,10 @@
       this._pump();
     }
 
+    // Edit puts a message's attachments back, up to the per-message cap.
     restore(files) {
-      for (const f of files || []) this.items.push(this._item({ ...f, state: 'done', progress: 1 }));
+      const room = MAX - this.items.filter(i => i.state !== 'refused').length;
+      for (const f of (files || []).slice(0, Math.max(0, room))) this.items.push(this._item({ ...f, state: 'done', progress: 1 }));
       this._change();
     }
 
@@ -146,7 +148,7 @@
   function wire(current, changed) {
     const add = files => {
       const u = current();
-      if (!u || !files.length) return;
+      if (!u || !files.length || $('#chat-attach').disabled) return; // the composer is off
       for (const f of files) u.add(f);
       changed();
     };

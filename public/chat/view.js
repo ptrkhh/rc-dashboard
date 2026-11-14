@@ -15,6 +15,8 @@
     if (state.waiting || state.ended || state.unreadable) return 'off';
     return state.working || hasPending ? 'stop' : 'send';
   }
+  // Stop while a turn runs and nothing would go out: an empty box, and no chip but failed ones.
+  const stopOffered = (mode, text, u) => mode === 'stop' && !text && u.items.every(i => i.error);
   const pending = s => s.mine.some(m => m.seq == null && (m.status === 'sending' || m.status === 'sent'));
 
   function el(tag, cls, text) {
@@ -78,10 +80,11 @@
       const text = input.value.trim();
       const mode = composerMode(c.state, pending(c.state));
       const u = c.uploads;
-      if (mode === 'off' || u.pending()) return;
-      const files = u.ready();
-      if (!text && !files.length) { if (mode === 'stop') sendFrame({ t: 'stop' }); return; }
-      if (submitText(text, files)) {
+      if (mode === 'off') return;
+      if (stopOffered(mode, text, u)) { sendFrame({ t: 'stop' }); return; }
+      const ready = u.ready();
+      if (u.pending() || (!text && !ready.length)) return;
+      if (submitText(text, ready)) {
         input.value = '';
         // remove(), not clear(): an upload removed mid-flight still holds the queue until the agent answers it.
         for (const i of [...u.items]) u.remove(i.key);
@@ -205,7 +208,8 @@
   }
 
   // Thumbnails load over http(s) from the agent the socket reached: in the apps that is not the page's origin.
-  const httpBase = url => { const u = new URL(url); return u.protocol.replace('ws', 'http') + '//' + u.host; };
+  // The socket URL minus its /api/chat part, so a profile's path prefix stays.
+  const httpBase = url => url.slice(0, url.indexOf('/api/chat')).replace(/^ws/, 'http');
 
   // Send again: the row goes only once the text has been sent, so offline it stays.
   function resend(state, cid, send) {
@@ -309,7 +313,7 @@
 
   // Images with a ref as thumbnails, then chips; my own not yet shown images have no ref and show as chips.
   function files(fs) {
-    const g = el('div', 'chat-files');
+    const box = el('div', 'chat-files');
     const thumbs = fs.filter(f => f.kind === 'image' && f.ref);
     for (const f of thumbs) {
       const src = c.base + '/api/chat/media/' + f.ref; // the store let through only 64-hex refs
@@ -320,16 +324,16 @@
       const img = el('img');
       Object.assign(img, { loading: 'lazy', decoding: 'async', alt: 'Image', src });
       b.append(img);
-      g.append(b);
+      box.append(b);
     }
     for (const f of fs) {
       if (thumbs.includes(f)) continue;
       const chip = el('div', 'chat-file');
       chip.append(el('span', 'chat-file-name', f.name ?? 'Image'));
       if (typeof f.size === 'number') chip.append(el('span', 'chat-file-size', cdashAttach.fmtSize(f.size)));
-      g.append(chip);
+      box.append(chip);
     }
-    return g;
+    return box;
   }
 
   // "Ran `npm test`": the command shows as code, without the backticks.
@@ -411,14 +415,16 @@
     const go = $('#chat-go');
     const mode = c.done ? 'off' : composerMode(s, pending(s));
     const u = c.uploads;
-    const stop = mode === 'stop' && !input.value.trim() && !u.items.length;
+    const stop = stopOffered(mode, input.value.trim(), u);
     input.disabled = $('#chat-attach').disabled = mode === 'off';
-    go.disabled = mode === 'off' || u.pending();
+    go.disabled = mode === 'off' || (!stop && u.pending());
     input.placeholder = s.ended || c.done ? 'Session ended'
       : s.unreadable ? 'Use Terminal for this session'
       : s.waiting ? (s.asks.length ? 'Answer the card first' : 'Answer in Terminal first')
       : s.working ? 'Queue a message…' : 'Message…';
-    go.textContent = stop ? 'Stop' : u.items.some(i => i.state === 'uploading' || i.state === 'queued') ? 'Uploading…' : 'Send';
+    go.textContent = stop ? 'Stop'
+      : u.items.some(i => i.state === 'uploading' || i.state === 'queued') ? 'Uploading…'
+      : u.items.some(i => i.error) ? 'Remove failed files' : 'Send';
     go.classList.toggle('stop', stop);
     cdashAttach.renderChips(u);
   }
