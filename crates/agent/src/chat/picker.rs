@@ -259,7 +259,7 @@ pub async fn type_setting(ctx: &Arc<Ctx>, name: &str, pid: i32, cmd: &str, value
     let text = format!("/{cmd} {value}");
     idle(ctx, pid).await?;
     clear_leftover(ctx, name, pid, leftover).await;
-    tmux_io::paste_text(&ctx.runner, name, &text).await?;
+    tmux_io::paste_raw(&ctx.runner, name, &text).await?;
     tokio::time::sleep(tmux_io::PASTE_PAUSE).await;
     if let Err(e) = idle(ctx, pid).await {
         // Behind a dialog the text waits; the next send or picker clears it.

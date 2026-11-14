@@ -1,6 +1,7 @@
 //! Typing into a Claude pane through tmux. Every call goes through `Runner`.
 
 use crate::host::cmd::Runner;
+use std::path::Path;
 use std::time::Duration;
 
 /// Exact-match target, the form `codex::terminal_supported` uses.
@@ -14,7 +15,7 @@ pub const PASTE_PAUSE: Duration = Duration::from_millis(400);
 
 /// Paste `text` with bracketed paste, then press Enter.
 pub async fn paste(runner: &Runner, name: &str, text: &str) -> Result<(), String> {
-    paste_text(runner, name, text).await?;
+    paste_raw(runner, name, text).await?;
     tokio::time::sleep(PASTE_PAUSE).await;
     key(runner, name, "Enter").await
 }
@@ -22,7 +23,7 @@ pub async fn paste(runner: &Runner, name: &str, text: &str) -> Result<(), String
 /// Paste `text` with bracketed paste, without Enter. The text goes through
 /// a private file because `Runner` gives the child no stdin and tmux refuses
 /// commands longer than about 16 KB. Assumes `wire::sanitize`d text.
-pub async fn paste_text(runner: &Runner, name: &str, text: &str) -> Result<(), String> {
+pub async fn paste_raw(runner: &Runner, name: &str, text: &str) -> Result<(), String> {
     let buffer = format!("cdash-chat-{name}");
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -56,6 +57,40 @@ pub async fn key(runner: &Runner, name: &str, key: &str) -> Result<(), String> {
 /// The pane's visible text.
 pub async fn capture(runner: &Runner, name: &str) -> Result<String, String> {
     runner.run_checked("tmux", &["capture-pane", "-p", "-t", &target(name)], "tmux capture-pane").await
+}
+
+/// How often `attach_image` looks for the new chip.
+pub const CHIP_POLL: Duration = Duration::from_millis(50);
+
+/// The `[Image #N]` chips in the input box: from the last line starting
+/// with `❯` down (the conversation above also shows chips), or on the whole
+/// screen when there is no such line.
+pub fn input_chips(screen: &str) -> usize {
+    let lines: Vec<&str> = screen.lines().collect();
+    let from = lines.iter().rposition(|l| l.trim_start().starts_with('❯')).unwrap_or(0);
+    let chip = |l: &str, i: usize| {
+        let after = &l[i + "[Image #".len()..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && after[digits..].starts_with(']')
+    };
+    lines[from..].iter().map(|l| l.match_indices("[Image #").filter(|&(i, _)| chip(l, i)).count()).sum()
+}
+
+/// Paste an image's path alone, without Enter, and wait until Claude shows
+/// exactly one more chip for it. The screen is read before anything is typed.
+pub async fn attach_image(runner: &Runner, name: &str, path: &Path, wait: Duration) -> Result<(), String> {
+    let before = input_chips(&capture(runner, name).await?);
+    paste_raw(runner, name, &path.to_string_lossy()).await?;
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        tokio::time::sleep(CHIP_POLL).await;
+        if capture(runner, name).await.is_ok_and(|s| input_chips(&s) == before + 1) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("image did not attach".into());
+        }
+    }
 }
 
 /// Empty the input box after Claude handed a prompt back into it. Ctrl+U
@@ -94,7 +129,7 @@ pub async fn pane(runner: &Runner, name: &str) -> Option<Pane> {
 pub(crate) mod tests {
     use super::*;
     use crate::host::log::LogBuffer;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -132,6 +167,27 @@ pub(crate) mod tests {
             .success();
         assert!(ok);
         bin.to_string_lossy().into_owned()
+    }
+
+    /// A stub `tmux` for image pastes: `capture-pane` prints `<dir>/screen`
+    /// (`❯ ` at first), `load-buffer` appends the pasted file and `\n--\n` to
+    /// `<dir>/pastes`, and `paste-buffer` moves `<dir>/after-paste` (written
+    /// from `after_paste`) over the screen. Arguments go to `<dir>/tmux-args`.
+    /// It sets its own PATH: callers' runners see only the stub.
+    pub(crate) fn chip_stub(dir: &Path, after_paste: Option<&str>) -> String {
+        std::fs::write(dir.join("screen"), "❯ ").unwrap();
+        if let Some(a) = after_paste {
+            std::fs::write(dir.join("after-paste"), a).unwrap();
+        }
+        let script = format!(
+            "#!/bin/sh\nPATH=/usr/bin:/bin\ncd '{}' || exit 1\nprintf '%s\\n' \"$*\" >> tmux-args\ncase \"$1\" in\n\
+             capture-pane) cat screen ;;\n\
+             load-buffer) cat \"$4\" >> pastes; printf '\\n--\\n' >> pastes ;;\n\
+             paste-buffer) [ -f after-paste ] && mv -f after-paste screen ;;\n\
+             esac\nexit 0\n",
+            dir.display()
+        );
+        install_stub(dir, "tmux", &script)
     }
 
     fn stub_runner(tag: &str) -> (Runner, PathBuf) {
@@ -217,6 +273,34 @@ pub(crate) mod tests {
             let p = pane(&runner, "cdash-a").await.unwrap();
             assert_eq!((p.pid, p.bare, p.hook.as_deref()), (4242, bare, hook));
         }
+    }
+    #[test]
+    fn chips_are_counted_in_the_input_box_only() {
+        let screen = "❯ [Image #1] What color?\n  ⎿  [Image #1]\n● Red.\n────\n❯ [Image #2] [Image #3]\n────\n  ⏵⏵ bypass permissions on";
+        assert_eq!(input_chips(screen), 2, "the conversation above the box does not count");
+        assert_eq!(input_chips("❯ \n────\n  ⏵⏵ bypass permissions on"), 0);
+        assert_eq!(input_chips("[Image #7] and no prompt line"), 1, "no box found: the whole screen counts");
+        assert_eq!(input_chips("❯ [Image #] [Image #x] [Image #12"), 0, "only whole tokens count");
+    }
+    #[tokio::test]
+    async fn an_image_path_is_pasted_alone_and_attach_waits_for_its_chip() {
+        let dir = tempfile_path("chip-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = Runner::new(chip_stub(&dir, Some("❯ [Image #3]")), Arc::new(LogBuffer::new()));
+        attach_image(&runner, "cdash-a", Path::new("/u/up/Shot 1.png"), Duration::from_secs(2)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("pastes")).unwrap(), "/u/up/Shot 1.png\n--\n");
+        let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap();
+        assert!(args.starts_with("capture-pane -p -t =cdash-a:"));
+        assert!(args.contains("paste-buffer -p -d -b cdash-chat-cdash-a -t =cdash-a:") && !args.contains("send-keys"), "no Enter");
+    }
+    #[tokio::test]
+    async fn an_image_that_never_shows_a_chip_fails_within_the_wait() {
+        let dir = tempfile_path("chip-none");
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = Runner::new(chip_stub(&dir, None), Arc::new(LogBuffer::new()));
+        let started = std::time::Instant::now();
+        assert_eq!(attach_image(&runner, "cdash-a", Path::new("/u/a.png"), Duration::from_millis(300)).await, Err("image did not attach".to_string()));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
     #[tokio::test]
     async fn text_reaches_a_real_pane_as_typed_and_multiline_stays_one_paste() {

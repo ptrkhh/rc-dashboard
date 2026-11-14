@@ -2,12 +2,14 @@
 //! file, and types through tmux.
 
 use super::asks::Cards;
-use super::hub::{Answer, Attachment, Engine, EngineMsg, Sent};
+use super::hub::{Answer, Attachment, Engine, EngineMsg, Kind, Sent};
+use super::media;
 use super::picker;
 use super::tap::Tap;
 use super::tmux_io;
 use crate::collect::ctx::Ctx;
 use crate::collect::lookup::session_file_for;
+use crate::host::log::LogBuffer;
 use crate::parse::paths::project_dir_name;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -31,6 +33,8 @@ const ALIVE_EVERY: Duration = Duration::from_secs(2);
 /// command such as `/model` opens a turn that never ends.
 // ponytail: a turn end written later than this is read at the next slow pass, up to `SLOW_TICK` late.
 const TURN_END_GRACE: Duration = Duration::from_millis(2500);
+/// How long a pasted image path has to turn into a chip.
+pub const CHIP_WAIT: Duration = Duration::from_secs(5);
 
 /// Complete lines appended to a file since the last poll.
 pub struct Tail {
@@ -91,6 +95,7 @@ pub struct ClaudeEngine {
     /// The transcript of the conversation the loop follows.
     transcript: Arc<Mutex<Option<PathBuf>>>,
     shared: Arc<Shared>,
+    chip_wait: Duration,
 }
 
 /// The hook cards and the session's settings, shared by the engine, its loop
@@ -143,12 +148,27 @@ struct Shared {
 }
 
 impl Engine for ClaudeEngine {
-    async fn send(&self, text: &str, _steer: bool, _cid: &str, _files: &[Attachment]) -> Result<Sent, String> {
+    async fn send(&self, text: &str, _steer: bool, _cid: &str, files: &[Attachment]) -> Result<Sent, String> {
+        // ponytail: attachments on a command are ignored; refuse them if owners hit it.
         match picker::route(text) {
             // A paste cannot be confirmed by the TUI; the transcript confirms it.
             picker::Route::Paste => {
                 picker::clear_leftover(&self.ctx, &self.name, self.pid, &self.shared.leftover).await;
-                tmux_io::paste(&self.ctx.runner, &self.name, text).await.map(|()| Sent::Unconfirmed)
+                let (runner, name) = (&self.ctx.runner, self.name.as_str());
+                let (images, others): (Vec<_>, Vec<_>) = files.iter().partition(|f| f.kind == Kind::Image);
+                let body = media::with_attached(text, &others.iter().map(|f| f.path.as_path()).collect::<Vec<_>>());
+                if images.is_empty() {
+                    return tmux_io::paste(runner, name, &body).await.map(|()| Sent::Unconfirmed);
+                }
+                // Each path alone becomes a chip; text on the same line would stay text.
+                for img in &images {
+                    if tmux_io::attach_image(runner, name, &img.path, self.chip_wait).await.is_err() {
+                        let typed: Vec<_> = images.iter().map(|i| i.path.to_string_lossy()).collect();
+                        self.clear_input(&typed.join("\n")).await;
+                        return Err("image did not attach".into());
+                    }
+                }
+                tmux_io::paste(runner, name, &format!(" {body}")).await.map(|()| Sent::Unconfirmed)
             }
             // The engine ran it itself: no prompt will ever show it.
             picker::Route::Set(what, v) => self.set(what, &v).await.map(|()| Sent::Done),
@@ -215,7 +235,7 @@ impl Engine for ClaudeEngine {
                 for ev in tap.feed(&line) {
                     n += 1;
                     if n >= from {
-                        out.push(ev);
+                        out.push(stash_images(ev, &self.name, &self.ctx.host.log));
                     }
                     if n >= to {
                         return Ok(out);
@@ -281,6 +301,7 @@ pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Rece
         live: Arc::clone(&live),
         transcript: Arc::clone(&transcript),
         shared: Arc::clone(&shared),
+        chip_wait: CHIP_WAIT,
     };
     tokio::spawn(async move {
         run(ctx, name, pid, tx, transcript, shared, &live).await;
@@ -288,6 +309,29 @@ pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Rece
         lock(&live).cards.clear();
     });
     (engine, rx)
+}
+
+/// Image entries `{kind:"image",mime,data}` become `{kind:"image",ref,mime}`
+/// through the media cache, so no bytes travel on to the hub. Transcript
+/// content is untrusted: only allowed image types within the upload limit
+/// are cached, under their hash; anything else becomes `{kind:"file",name:"image"}`.
+// ponytail: decodes, hashes and writes on the engine task; move to spawn_blocking if large transcripts stall the tick.
+pub fn stash_images(mut ev: Value, session: &str, log: &LogBuffer) -> Value {
+    use base64::Engine as _;
+    let Some(files) = ev.get_mut("files").and_then(Value::as_array_mut) else { return ev };
+    for f in files.iter_mut().filter(|f| f.get("data").is_some()) {
+        let mime = f["mime"].as_str().filter(|m| media::image_ext(m).is_some());
+        let data = f["data"].as_str().filter(|d| d.len() as u64 / 4 * 3 <= media::MAX_UPLOAD);
+        let stashed = mime.zip(data).and_then(|(mime, data)| {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+            media::stash(&bytes, mime).ok().map(|r| json!({"kind":"image","ref":r,"mime":mime}))
+        });
+        *f = stashed.unwrap_or_else(|| {
+            log.push(format!("chat image not cached {session}"));
+            json!({"kind":"file","name":"image"})
+        });
+    }
+    ev
 }
 
 /// The conversation currently followed.
@@ -381,7 +425,7 @@ async fn run(
             }
             for line in lines {
                 for ev in c.tap.feed(&line) {
-                    if tx.send(EngineMsg::Ev(ev)).await.is_err() {
+                    if tx.send(EngineMsg::Ev(stash_images(ev, &name, &ctx.host.log))).await.is_err() {
                         return;
                     }
                 }
@@ -447,7 +491,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::chat::asks::tests::{ask_request, plan_request, result_line, use_line};
     use crate::chat::hub::Answer;
-    use crate::chat::tmux_io::tests::{stub_tmux, tempfile_path};
+    use crate::chat::hub::Kind;
+    use crate::chat::tmux_io::tests::{chip_stub, stub_tmux, tempfile_path};
     use crate::host::cmd::Runner;
     use crate::host::log::LogBuffer;
     use serde_json::{json, Value};
@@ -793,6 +838,80 @@ pub(crate) mod tests {
         assert_eq!(model_effort(r#"{"type":"assistant","message":{"model":"m"}}"#), Some(("m".into(), None)));
         assert_eq!(model_effort(&r("<synthetic>")), None);
         assert_eq!(model_effort("not json"), None);
+    }
+    fn att(path: &str, kind: Kind) -> Attachment {
+        let mime = if kind == Kind::Image { "image/png" } else { "application/pdf" };
+        let name = path.rsplit('/').next().unwrap().to_string();
+        Attachment { path: path.into(), kind, mime: mime.into(), name, size: 8 }
+    }
+
+    fn engine(ctx: &Arc<Ctx>, wait: Duration) -> ClaudeEngine {
+        let shared = Arc::new(Shared::default());
+        let live = Arc::new(Mutex::new(Live { wake: Arc::clone(&shared.wake), ..Live::default() }));
+        ClaudeEngine {
+            ctx: Arc::clone(ctx),
+            pid: 4242,
+            name: "cdash-a".into(),
+            hooked: false,
+            live,
+            transcript: Arc::new(Mutex::new(None)),
+            shared,
+            chip_wait: wait,
+        }
+    }
+
+    #[tokio::test]
+    async fn images_go_first_then_the_text_with_attached_lines_then_enter() {
+        let (ctx, dir) = fixture_with("send-img", "");
+        chip_stub(&dir, Some("❯ [Image #1]"));
+        let files = [att("/u/up/a.png", Kind::Image), att("/u/up/r.pdf", Kind::File)];
+        assert_eq!(engine(&ctx, Duration::from_secs(2)).send("what is this", false, "c1", &files).await, Ok(Sent::Unconfirmed), "the transcript confirms it");
+        assert_eq!(std::fs::read_to_string(dir.join("pastes")).unwrap(), "/u/up/a.png\n--\n what is this\nAttached: /u/up/r.pdf\n--\n");
+        assert_eq!(std::fs::read_to_string(dir.join("tmux-args")).unwrap().lines().last(), Some("send-keys -t =cdash-a: Enter"));
+    }
+    #[tokio::test]
+    async fn an_image_that_does_not_attach_clears_the_box_and_nothing_is_sent() {
+        let (ctx, dir) = fixture_with("send-noimg", "");
+        chip_stub(&dir, None);
+        assert_eq!(engine(&ctx, Duration::from_millis(300)).send("x", false, "c1", &[att("/u/up/a.png", Kind::Image)]).await, Err("image did not attach".to_string()));
+        let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap();
+        assert!(args.lines().last().unwrap().starts_with("send-keys -t =cdash-a: C-u") && !args.contains("Enter"));
+    }
+    #[tokio::test]
+    async fn image_blocks_reach_the_hub_as_media_refs() {
+        use base64::Engine as _;
+        let (ctx, dir) = fixture_with("stash", "");
+        let png = [crate::chat::media::tests::PNG, b"engine"].concat();
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let line = json!({"type":"user","uuid":"g9","parentUuid":"s2","promptSource":"typed","message":{"role":"user","content":[
+            {"type":"text","text":"[Image #1] [Image #2] see"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":b64(&png)}},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":b64(b"not an image")}}]}});
+        append(&dir.join("projects/-proj/sid-1.jsonl"), &format!("{line}\n"));
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        let got = collect_until_ready(&mut rx).await;
+        let ev = got.iter().find_map(|m| match m { EngineMsg::Ev(e) if e["uuid"] == "g9" => Some(e), _ => None }).unwrap();
+        let r = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&png));
+        assert_eq!(ev["files"], json!([{"kind":"image","ref":r,"mime":"image/png"}, {"kind":"file","name":"image"}]));
+        assert!(crate::chat::media::media_dir().join(format!("{r}.png")).exists());
+        let page = serde_json::to_string(&engine.history(1, 1000).await.unwrap()).unwrap();
+        assert!(page.contains(&r) && !page.contains("\"data\""), "an older page carries refs too");
+    }
+    #[test]
+    fn only_allowed_images_within_the_upload_limit_are_cached() {
+        use base64::Engine as _;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let svg = b64(b"<svg xmlns='http://www.w3.org/2000/svg'/>");
+        let huge = "A".repeat((crate::chat::media::MAX_UPLOAD as usize / 3 + 1) * 4);
+        let ev = json!({"type":"user","files":[
+            {"kind":"image","mime":"image/svg+xml","data":svg},
+            {"kind":"image","mime":"image/png","data":huge},
+            {"kind":"file","name":"r.pdf"}]});
+        let log = LogBuffer::new();
+        let out = stash_images(ev, "cdash-a", &log);
+        assert_eq!(out["files"], json!([{"kind":"file","name":"image"}, {"kind":"file","name":"image"}, {"kind":"file","name":"r.pdf"}]));
+        let lines = log.lines();
+        assert!(lines.len() == 2 && lines.iter().all(|l| l.ends_with("chat image not cached cdash-a")), "{lines:?}");
     }
     #[tokio::test]
     async fn history_replays_the_transcript_from_its_start() {

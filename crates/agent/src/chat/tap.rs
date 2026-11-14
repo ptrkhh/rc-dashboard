@@ -3,7 +3,8 @@
 //! The record shapes are internal to Claude Code (checked on 2.1.322, see
 //! `CLAUDE_FINDINGS.md`). Anything not understood produces nothing.
 
-use super::{media::split_attached, CAP};
+use super::media::{split_attached, MAX_FILES};
+use super::CAP;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -186,7 +187,8 @@ fn injected(text: &str) -> bool {
     ["<task-notification>", "<system-reminder>", "<local-command-"].iter().any(|p| t.starts_with(p))
 }
 
-fn prompt_event(uuid: Option<&str>, text: &str, src: &str, files: Vec<Value>) -> Value {
+fn prompt_event(uuid: Option<&str>, text: &str, src: &str, mut files: Vec<Value>) -> Value {
+    files.truncate(MAX_FILES);
     let mut ev = json!({"type":"user","uuid":uuid,"message":{"role":"user","content":text},"src":src});
     if !files.is_empty() {
         ev["files"] = Value::Array(files);
@@ -249,6 +251,9 @@ fn steer(r: &Rec) -> Option<Value> {
     let (text, mut files) = parts(&a["prompt"])?;
     let (text, attached) = clean(&text);
     files.extend(attached);
+    if text.is_empty() && files.is_empty() {
+        return None;
+    }
     Some(prompt_event(r.uuid.as_deref(), &text, "steer", files))
 }
 
@@ -433,5 +438,15 @@ mod tests {
             "prompt":[{"type":"text","text":format!("[Image #5] later\nAttached: {pdf}")}, img]}}).to_string())[0];
         assert_eq!((steer["src"].as_str(), steer["message"]["content"].as_str()), (Some("steer"), Some("later")));
         assert_eq!(steer["files"].as_array().unwrap().iter().map(|f| f["kind"].as_str().unwrap()).collect::<Vec<_>>(), ["image", "file"]);
+    }
+    #[test]
+    fn an_empty_absorbed_prompt_shows_nothing_and_one_event_holds_at_most_ten_files() {
+        let mut tap = Tap::default();
+        let empty = |p: Value| json!({"type":"attachment","uuid":"q8","attachment":{"type":"queued_command","commandMode":"prompt","prompt":p}}).to_string();
+        assert!(tap.feed(&empty(json!(""))).is_empty());
+        assert!(tap.feed(&empty(json!([{"type":"text","text":"[Image #1] "}]))).is_empty(), "a token alone is no prompt");
+        let img: Value = serde_json::from_str(IMG).unwrap();
+        let many = &tap.feed(&rec("m1", Value::Array(vec![img; 12])))[0];
+        assert_eq!(many["files"].as_array().map(Vec::len), Some(crate::chat::media::MAX_FILES));
     }
 }

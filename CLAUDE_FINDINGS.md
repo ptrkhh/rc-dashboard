@@ -127,3 +127,13 @@ Chat reads them in `crates/agent/src/chat/tap.rs` and `claude.rs`.
 - **API error turns (observed on 2.1.323).** In 29 of 30 observed turns, a turn
   whose last message has `isApiErrorMessage` still ends with a
   `turn_duration` record.
+- **Image paste (observed on 2.1.323).** A bracketed paste of a line holding
+  only an image's absolute path attaches it as an `[Image #N]` chip within
+  about 32 ms; spaces in the path are fine. `N` counts up across the session.
+  A path followed by text on the same line stays text. An Enter sent before
+  the chip is drawn is dropped. The prompt record's content is then a block
+  list: a text block (`[Image #N] <text>`) followed by
+  `{type:"image", source:{type:"base64", media_type, data}}`, with
+  `imagePasteIds`, and an `isMeta` record `[Image: source: <path>]` follows.
+  Chat pastes each path alone and waits for exactly one new chip in the input
+  box (`tmux_io::attach_image`), then pastes a space and the text.
