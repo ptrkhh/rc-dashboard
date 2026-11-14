@@ -10,7 +10,10 @@ import { randomBytes } from 'node:crypto';
 const LINE_MAX = 64 * 1024;
 
 export class ChatFeed {
-  #send; #stop;
+  #send; #stop; #ops;
+  #asks = new Map();
+  #settings = null;
+  #settingsJson = '';
   #log = [];
   #uuids = new Set();
   #approvals = new Set();
@@ -20,9 +23,29 @@ export class ChatFeed {
   #server = null;
   epoch = randomBytes(8).toString('hex');
 
-  constructor({ send, stop }) {
+  constructor({ send, stop, ops = {} }) {
     this.#send = send;
     this.#stop = stop;
+    this.#ops = ops;
+  }
+
+  get asks() { return [...this.#asks.values()]; }
+
+  putAsk(ask) {
+    this.#asks.set(ask.id, ask);
+    this.#publishAsks();
+  }
+
+  dropAsk(id) {
+    if (this.#asks.delete(id)) this.#publishAsks();
+  }
+
+  setSettings(settings) {
+    const json = JSON.stringify(settings);
+    if (json === this.#settingsJson) return;
+    this.#settingsJson = json;
+    this.#settings = settings;
+    this.#broadcast({ t: 'settings', settings });
   }
 
   get head() { return this.#log.length; }
@@ -89,6 +112,19 @@ export class ChatFeed {
     this.#broadcast({ t: 'state', ...this.state });
   }
 
+  #asksLine() {
+    const line = JSON.stringify({ t: 'asks', asks: this.asks });
+    if (Buffer.byteLength(line) < LINE_MAX) return line;
+    // ponytail: only plans are cut; many huge questions would still overflow.
+    const cut = this.asks.map(a => typeof a.plan === 'string' && a.plan.length > 8000 ? { ...a, plan: a.plan.slice(0, 8000) + '\n\n…' } : a);
+    return JSON.stringify({ t: 'asks', asks: cut });
+  }
+
+  #publishAsks() {
+    const line = this.#asksLine() + '\n';
+    for (const s of this.#clients) s.write(line);
+  }
+
   #broadcast(frame) {
     const line = JSON.stringify(frame) + '\n';
     for (const s of this.#clients) s.write(line);
@@ -124,12 +160,30 @@ export class ChatFeed {
     const lines = [{ t: 'hello', epoch: this.epoch, head: this.head }];
     for (const e of this.#log.slice(from)) lines.push({ t: 'ev', seq: e.seq, ev: e.ev });
     lines.push({ t: 'state', ...this.state });
-    if (this.#ready) lines.push({ t: 'ready' });
-    socket.write(lines.map(l => JSON.stringify(l) + '\n').join(''));
+    const out = lines.map(l => JSON.stringify(l) + '\n');
+    out.push(this.#asksLine() + '\n'); // also when empty: a reconnecting agent drops asks settled meanwhile
+    if (this.#settings) out.push(JSON.stringify({ t: 'settings', settings: this.#settings }) + '\n');
+    if (this.#ready) out.push('{"t":"ready"}\n');
+    socket.write(out.join(''));
     this.#clients.add(socket);
   }
 
+  async #op(socket, m) {
+    let res;
+    try {
+      const op = this.#ops[m.op];
+      if (typeof op !== 'function') throw Error('not supported');
+      res = { t: 'res', rid: m.rid, ok: true, data: (await op(m)) ?? null };
+    } catch (e) {
+      res = { t: 'res', rid: m.rid, ok: false, error: String(e?.message ?? e) };
+    }
+    let line = JSON.stringify(res);
+    if (Buffer.byteLength(line) >= LINE_MAX) line = JSON.stringify({ t: 'res', rid: m.rid, ok: false, error: 'reply too large' });
+    if (!socket.destroyed) socket.write(line + '\n');
+  }
+
   async #request(socket, m) {
+    if (m.t === 'req') return this.#op(socket, m);
     if (m.t === 'stop') {
       try { await this.#stop(); } catch { /* nothing to stop */ }
       return;
@@ -137,8 +191,8 @@ export class ChatFeed {
     if (m.t !== 'send' || typeof m.text !== 'string') return;
     let ack;
     try {
-      await this.#send(m.text, { steer: !!m.steer, cid: m.cid });
-      ack = { t: 'ack', cid: m.cid, ok: true };
+      const r = await this.#send(m.text, { steer: !!m.steer, cid: m.cid });
+      ack = { t: 'ack', cid: m.cid, ok: true, ...(r?.done ? { done: true } : {}) };
     } catch (e) {
       ack = { t: 'ack', cid: m.cid, ok: false, error: String(e?.message ?? e) };
     }

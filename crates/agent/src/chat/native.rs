@@ -2,12 +2,13 @@
 //! The supervisor (`chat-feed.mjs`) numbers events and replays from a
 //! position, so this side only remembers the last position and epoch it saw.
 
-use super::hub::{Engine, EngineMsg, Sent};
+use super::hub::{Answer, Engine, EngineMsg, Sent};
 use crate::host::log::LogBuffer;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -37,7 +38,11 @@ struct SendFrame<'a> {
 
 type Acks = Mutex<HashMap<String, oneshot::Sender<Result<Sent, String>>>>;
 
+type Reqs = Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>;
+
 struct Shared {
+    reqs: Reqs,
+    next_rid: AtomicU64,
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
     acks: Acks,
     /// The supervisor's epoch the reader last saw.
@@ -54,6 +59,29 @@ impl NativeEngine {
         let mut w = self.shared.writer.lock().await;
         let Some(w) = w.as_mut() else { return Err("not connected".into()) };
         w.write_all(format!("{line}\n").as_bytes()).await.map_err(|_| "not connected".to_string())
+    }
+
+    /// One request/response round trip; concurrent requests are matched by `rid`.
+    pub async fn request(&self, op: &str, fields: Value) -> Result<Value, String> {
+        let rid = self.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+        let mut frame = if fields.is_object() { fields } else { json!({}) };
+        frame["t"] = json!("req");
+        frame["rid"] = json!(rid);
+        frame["op"] = json!(op);
+        let (tx, rx) = oneshot::channel();
+        self.shared.reqs.lock().unwrap_or_else(|e| e.into_inner()).insert(rid, tx);
+        if let Err(e) = self.write(frame.to_string()).await {
+            self.shared.reqs.lock().unwrap_or_else(|e| e.into_inner()).remove(&rid);
+            return Err(e);
+        }
+        match tokio::time::timeout(ACK_WAIT, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err("not connected".into()),
+            Err(_) => {
+                self.shared.reqs.lock().unwrap_or_else(|e| e.into_inner()).remove(&rid);
+                Err("no answer from the session".into())
+            }
+        }
     }
 }
 
@@ -79,6 +107,18 @@ impl Engine for NativeEngine {
 
     async fn stop(&self) -> Result<(), String> {
         self.write(r#"{"t":"stop"}"#.into()).await
+    }
+
+    async fn answer(&self, id: &str, a: &Answer) -> Result<(), String> {
+        self.request("answer", json!({"id": id, "answer": a})).await.map(|_| ())
+    }
+
+    async fn set(&self, what: &str, value: &Value) -> Result<(), String> {
+        self.request("set", json!({"what": what, "value": value})).await.map(|_| ())
+    }
+
+    async fn menu(&self) -> Value {
+        self.request("menu", json!({})).await.unwrap_or_else(|_| json!({}))
     }
 
     /// A second connection that resumes after `from - 1`; the supervisor's
@@ -114,7 +154,7 @@ pub fn start(sock: PathBuf, log: Arc<LogBuffer>, name: String) -> (NativeEngine,
     // Roomy: the hub reads this channel while it waits on an ack the reader
     // routes, and Codex streams deltas.
     let (tx, rx) = mpsc::channel(4096);
-    let shared = Arc::new(Shared { writer: tokio::sync::Mutex::new(None), acks: Mutex::new(HashMap::new()), epoch: Mutex::new(None) });
+    let shared = Arc::new(Shared { reqs: Mutex::new(HashMap::new()), next_rid: AtomicU64::new(1), writer: tokio::sync::Mutex::new(None), acks: Mutex::new(HashMap::new()), epoch: Mutex::new(None) });
     tokio::spawn(run(sock.clone(), Arc::clone(&shared), tx, log, name));
     (NativeEngine { shared, sock }, rx)
 }
@@ -177,6 +217,16 @@ async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, lo
                     waiting: v["waiting"].as_bool().unwrap_or(false),
                     waiting_for: None,
                 },
+                Some("asks") => EngineMsg::Asks(v["asks"].as_array().cloned().unwrap_or_default()),
+                Some("settings") => EngineMsg::Settings(v["settings"].take()),
+                Some("res") => {
+                    let waiter = v["rid"].as_u64().and_then(|rid| shared.reqs.lock().unwrap_or_else(|e| e.into_inner()).remove(&rid));
+                    if let Some(w) = waiter {
+                        let result = if v["ok"] == true { Ok(v["data"].take()) } else { Err(v["error"].as_str().unwrap_or("failed").to_string()) };
+                        let _ = w.send(result);
+                    }
+                    continue;
+                }
                 Some("ready") => EngineMsg::Ready,
                 Some("delta") => EngineMsg::Delta {
                     id: v["id"].as_str().unwrap_or_default().to_string(),
@@ -200,6 +250,7 @@ async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, lo
         *shared.writer.lock().await = None;
         // Waiters for acks on the dropped connection learn it at once.
         shared.acks.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        shared.reqs.lock().unwrap_or_else(|e| e.into_inner()).clear();
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -329,6 +380,42 @@ mod tests {
         let reading = tokio::spawn(async move { e.history(1, 1).await });
         answer_once(&sup, concat!(r#"{"t":"hello","epoch":"e2","head":0}"#, "\n")).await;
         assert!(reading.await.unwrap().is_err(), "another supervisor's positions are not these");
+    }
+
+    #[tokio::test]
+    async fn requests_carry_their_own_rid_and_each_resolves_with_its_response() {
+        let (sock, mut sup) = fake_supervisor("req");
+        let (engine, _rx) = start(sock, log(), "cdash-a".into());
+        let engine = Arc::new(engine);
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
+        let (a, b) = (Arc::clone(&engine), Arc::clone(&engine));
+        let set = tokio::spawn(async move { a.set("plan", &json!(true)).await });
+        let first: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        assert_eq!((first["t"].as_str(), first["op"].as_str(), first["what"].as_str(), &first["value"]), (Some("req"), Some("set"), Some("plan"), &json!(true)));
+        let menu = tokio::spawn(async move { b.menu().await });
+        let second: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        assert_ne!(first["rid"], second["rid"]);
+        sup.write_line(&json!({"t":"res","rid":second["rid"],"ok":true,"data":{"commands":[{"name":"compact"}]}}).to_string()).await;
+        sup.write_line(&json!({"t":"res","rid":first["rid"],"ok":false,"error":"nope"}).to_string()).await;
+        assert_eq!(menu.await.unwrap()["commands"][0]["name"], "compact");
+        assert_eq!(set.await.unwrap(), Err("nope".to_string()));
+        let answer = tokio::spawn(async move { engine.answer("41", &Answer { choice: Some("yes".into()), ..Default::default() }).await });
+        let third: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        assert_eq!((third["op"].as_str(), third["id"].as_str(), &third["answer"]), (Some("answer"), Some("41"), &json!({"choice":"yes"})));
+        sup.write_line(&json!({"t":"res","rid":third["rid"],"ok":true}).to_string()).await;
+        assert_eq!(answer.await.unwrap(), Ok(()));
+    }
+    #[tokio::test]
+    async fn asks_and_settings_lines_become_engine_messages() {
+        let (sock, mut sup) = fake_supervisor("asks");
+        let (_engine, mut rx) = start(sock, log(), "cdash-a".into());
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
+        sup.write_line(r#"{"t":"asks","asks":[{"id":"41","kind":"question"}]}"#).await;
+        sup.write_line(r#"{"t":"settings","settings":{"model":"m"}}"#).await;
+        assert!(matches!(rx.recv().await, Some(EngineMsg::Asks(a)) if a[0]["id"] == "41"));
+        assert!(matches!(rx.recv().await, Some(EngineMsg::Settings(s)) if s["model"] == "m"));
     }
 
     #[tokio::test(start_paused = true)]
