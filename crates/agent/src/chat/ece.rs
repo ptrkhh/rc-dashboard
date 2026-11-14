@@ -57,6 +57,7 @@ pub(crate) fn encrypt_with(
     let mut out = Vec::with_capacity(86 + plaintext.len() + 17);
     out.extend_from_slice(salt);
     out.extend_from_slice(&RS.to_be_bytes());
+    debug_assert_eq!(as_public.len(), 65);
     out.push(as_public.len() as u8);
     out.extend_from_slice(as_public);
     let mut record = plaintext.to_vec();
@@ -70,7 +71,9 @@ pub(crate) fn encrypt_with(
 
 /// Encrypt `plaintext` to a push subscription's `p256dh` and `auth`.
 pub fn encrypt(ua_public: &[u8], auth: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    if plaintext.len() > (RS as usize) - 17 {
+    // RFC 8291 §4: the whole body is at most 4096 bytes: 86 of header (salt,
+    // record size, key id), 1 delimiter and 16 tag, hence 4096 - 86 - 17.
+    if plaintext.len() > (RS as usize) - 86 - 17 {
         return Err("payload too large".into());
     }
     let rng = SystemRandom::new();
@@ -104,6 +107,11 @@ pub(crate) fn decrypt(ua_private: agreement::EphemeralPrivateKey, ua_public: &[u
 mod tests {
     use super::*;
     use ring::agreement::{EphemeralPrivateKey, ECDH_P256};
+
+    #[test]
+    fn a_payload_over_the_record_cap_is_refused() {
+        assert_eq!(encrypt(&[], &[], &[0u8; 3994]).unwrap_err(), "payload too large");
+    }
 
     #[test]
     fn rfc_8291_appendix_a() {

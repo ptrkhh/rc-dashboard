@@ -70,6 +70,8 @@ mod tests {
         ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, unb64(&v.public_b64()).unwrap())
             .verify(signed.as_bytes(), &unb64(sig).unwrap()).expect("verifies against the advertised key");
         assert!(!jwt.contains('@'));
-        assert!(v.authorization("https://fcm.googleapis.com/x", 1).unwrap().starts_with("vapid t="));
+        let auth = v.authorization("https://fcm.googleapis.com/x", 1).unwrap();
+        assert!(auth.starts_with("vapid t="));
+        assert!(auth.ends_with(&format!(", k={}", v.public_b64())));
     }
 }
