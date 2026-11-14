@@ -236,12 +236,17 @@ pub async fn switch_plan(ctx: &Arc<Ctx>, name: &str, pid: i32, on: bool) -> Resu
 /// A picker command pasted but not submitted, still in the input box.
 pub type Leftover = Mutex<Option<String>>;
 
+/// No dialog is open: the status file says the input box takes keys.
+pub async fn input_open(ctx: &Ctx, pid: i32) -> bool {
+    let status = session_file_for(&ctx.claude_dir, pid).await.and_then(|f| f.status);
+    matches!(status.as_deref(), Some("idle" | "shell" | "busy"))
+}
+
 /// Clears a picker command left in the input box, once no dialog is open
 /// (a turn's input box takes the clear). The flag stays until it worked.
 pub async fn clear_leftover(ctx: &Ctx, name: &str, pid: i32, leftover: &Leftover) {
     let Some(text) = leftover.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
-    let status = session_file_for(&ctx.claude_dir, pid).await.and_then(|f| f.status);
-    if !matches!(status.as_deref(), Some("idle" | "shell" | "busy")) {
+    if !input_open(ctx, pid).await {
         return;
     }
     match tmux_io::clear_input(&ctx.runner, name, &text).await {

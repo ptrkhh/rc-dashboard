@@ -160,15 +160,25 @@ impl Engine for ClaudeEngine {
                 if images.is_empty() {
                     return tmux_io::paste(runner, name, &body).await.map(|()| Sent::Unconfirmed);
                 }
+                let paths = |n: usize| images[..n].iter().map(|i| i.path.to_string_lossy()).collect::<Vec<_>>().join("\n");
                 // Each path alone becomes a chip; text on the same line would stay text.
-                for img in &images {
+                for (i, img) in images.iter().enumerate() {
+                    // A dialog that came up since the last image takes no more keys.
+                    if i > 0 && !picker::input_open(&self.ctx, self.pid).await {
+                        self.leave(paths(i)).await;
+                        return Err("image did not attach".into());
+                    }
                     if tmux_io::attach_image(runner, name, &img.path, self.chip_wait).await.is_err() {
-                        let typed: Vec<_> = images.iter().map(|i| i.path.to_string_lossy()).collect();
-                        self.clear_input(&typed.join("\n")).await;
+                        self.leave(paths(i + 1)).await;
                         return Err("image did not attach".into());
                     }
                 }
-                tmux_io::paste(runner, name, &format!(" {body}")).await.map(|()| Sent::Unconfirmed)
+                let text = format!(" {body}");
+                let sent = tmux_io::paste(runner, name, &text).await;
+                if sent.is_err() {
+                    self.leave(paths(images.len()) + &text).await;
+                }
+                sent.map(|()| Sent::Unconfirmed)
             }
             // The engine ran it itself: no prompt will ever show it.
             picker::Route::Set(what, v) => self.set(what, &v).await.map(|()| Sent::Done),
@@ -273,6 +283,13 @@ impl Engine for ClaudeEngine {
 }
 
 impl ClaudeEngine {
+    /// Text chat typed but did not submit: cleared now if no dialog is up,
+    /// else by the next send.
+    async fn leave(&self, typed: String) {
+        *self.shared.leftover.lock().unwrap_or_else(|e| e.into_inner()) = Some(typed);
+        picker::clear_leftover(&self.ctx, &self.name, self.pid, &self.shared.leftover).await;
+    }
+
     pub fn live(&self) -> LiveRef {
         Arc::clone(&self.live)
     }
@@ -872,10 +889,25 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_image_that_does_not_attach_clears_the_box_and_nothing_is_sent() {
         let (ctx, dir) = fixture_with("send-noimg", "");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
         chip_stub(&dir, None);
-        assert_eq!(engine(&ctx, Duration::from_millis(300)).send("x", false, "c1", &[att("/u/up/a.png", Kind::Image)]).await, Err("image did not attach".to_string()));
+        let engine = engine(&ctx, Duration::from_millis(300));
+        assert_eq!(engine.send("x", false, "c1", &[att("/u/up/a.png", Kind::Image)]).await, Err("image did not attach".to_string()));
         let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap();
         assert!(args.lines().last().unwrap().starts_with("send-keys -t =cdash-a: C-u") && !args.contains("Enter"));
+        assert_eq!(*engine.shared.leftover.lock().unwrap(), None, "cleared");
+    }
+    #[tokio::test]
+    async fn behind_a_dialog_no_more_images_are_pasted_and_nothing_is_cleared() {
+        let (ctx, dir) = fixture_with("send-dialog", "");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting"}"#);
+        chip_stub(&dir, Some("❯ [Image #1]"));
+        let engine = engine(&ctx, Duration::from_millis(300));
+        let files = [att("/u/up/a.png", Kind::Image), att("/u/up/b.png", Kind::Image)];
+        assert_eq!(engine.send("x", false, "c1", &files).await, Err("image did not attach".to_string()));
+        assert_eq!(std::fs::read_to_string(dir.join("pastes")).unwrap(), "/u/up/a.png\n--\n", "the second image is not pasted");
+        assert!(!std::fs::read_to_string(dir.join("tmux-args")).unwrap().contains("send-keys"), "no key into the dialog");
+        assert_eq!(engine.shared.leftover.lock().unwrap().as_deref(), Some("/u/up/a.png"), "the next send clears it");
     }
     #[tokio::test]
     async fn image_blocks_reach_the_hub_as_media_refs() {
@@ -902,7 +934,7 @@ pub(crate) mod tests {
         use base64::Engine as _;
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
         let svg = b64(b"<svg xmlns='http://www.w3.org/2000/svg'/>");
-        let huge = "A".repeat((crate::chat::media::MAX_UPLOAD as usize / 3 + 1) * 4);
+        let huge = b64(&[crate::chat::media::tests::PNG, &vec![0; crate::chat::media::MAX_UPLOAD as usize]].concat());
         let ev = json!({"type":"user","files":[
             {"kind":"image","mime":"image/svg+xml","data":svg},
             {"kind":"image","mime":"image/png","data":huge},
