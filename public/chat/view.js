@@ -439,7 +439,7 @@
       for (const t of ['keydown', 'pointerdown', 'touchstart'])
         document.addEventListener(t, () => { fw.last = Date.now(); focusCheck(); }, { capture: true, passive: true });
     }
-    fw.on = focusNow();
+    focusCheck(); // arms the idle timer and settles fw.on before fn subscribes
     fw.subs.add(fn);
     return () => fw.subs.delete(fn);
   }

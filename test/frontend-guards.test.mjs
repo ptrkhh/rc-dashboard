@@ -603,3 +603,18 @@ test('focus counts only a visible, focused page with input in the last two minut
   const src = f => readFileSync(new URL(f, import.meta.url), 'utf8');
   for (const f of ['../public/chat/view.js', '../public/app.js']) assert.match(src(f), /t: 'focus', on/, f);
 });
+
+test('an untouched page stops reporting focus after two idle minutes', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  globalThis.document = { hidden: false, hasFocus: () => true, addEventListener() {} };
+  globalThis.addEventListener = () => {};
+  t.after(() => { globalThis.document = undefined; delete globalThis.addEventListener; });
+  await import('../public/chat/store.js');
+  await import('../public/chat/view.js');
+  const seen = [];
+  globalThis.cdashChat.watchFocus(on => seen.push(on));
+  t.mock.timers.tick(119_000);
+  assert.deepEqual(seen, []);
+  t.mock.timers.tick(1_100);
+  assert.deepEqual(seen, [false]);
+});
