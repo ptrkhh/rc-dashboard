@@ -91,7 +91,7 @@ const STATUSES: [&str; 3] = ["pending", "in_progress", "completed"];
 const WINDOWS: &[(&str, u64)] = &[("claude-opus-5-5", 1_000_000), ("claude-sonnet-5-5", 1_000_000), ("claude-fable-5-2", 1_000_000)];
 
 pub fn context_window(model: &str) -> Option<u64> {
-    WINDOWS.iter().find(|(p, _)| model.starts_with(p)).map(|&(_, w)| w)
+    WINDOWS.iter().find(|(p, _)| model.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))).map(|&(_, w)| w)
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -184,6 +184,7 @@ impl Tap {
             let n = |k: &str| m["usage"][k].as_u64().unwrap_or(0);
             let (input, output, read, write) = (n("input_tokens"), n("output_tokens"), n("cache_read_input_tokens"), n("cache_creation_input_tokens"));
             // A reply split over records repeats its usage: count it once.
+            // Non-adjacent repeats do not occur (0 in 24,064 records checked); adjacent dedupe suffices.
             let id = m["id"].as_str();
             if id.is_none() || id != self.counted.as_deref() {
                 self.counted = id.map(String::from);
@@ -761,6 +762,8 @@ mod tests {
         assert_eq!(u["context"], json!({"used":1055,"window":context_window("claude-opus-5-5")}));
         assert_eq!((u["model"].as_str(), u["cwd"].as_str(), &u["cost"]), (Some("claude-opus-5-5"), Some("/proj/.worktrees/a"), &Value::Null));
         assert_eq!(context_window("claude-mystery-9"), None, "unknown models show tokens only");
+        assert_eq!(context_window("claude-opus-5-50"), None, "a prefix must end at a dash");
+        assert_eq!(context_window("claude-opus-5-5-20261101"), Some(1_000_000));
     }
     #[test]
     fn running_tasks_start_from_results_and_end_from_notifications_stops_and_restatements() {

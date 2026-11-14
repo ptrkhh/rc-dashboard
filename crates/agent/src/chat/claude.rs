@@ -1040,11 +1040,13 @@ pub(crate) mod tests {
     const ROOT: &str = "b2d9530c-cfa3-452a-8335-e1f1ef9c5d5a";
     #[tokio::test]
     async fn the_engine_reports_usage_once_ready_with_the_session_folder_as_fallback() {
-        let (ctx, _dir) = fixture_ctx("facts");
+        // The tag selects no transcript: this is the default fixture, whose records carry no `cwd`.
+        let (ctx, dir) = fixture_ctx("facts");
+        assert!(!std::fs::read_to_string(dir.join("projects/-proj/sid-1.jsonl")).unwrap().contains("\"cwd\""));
         let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
         let EngineMsg::Usage(u) = next_of(&mut rx, |m| matches!(m, EngineMsg::Usage(_))).await else { unreachable!() };
-        assert_eq!(u["cwd"], "/proj", "no record carries a cwd: the session file's");
+        assert_eq!(u["cwd"], "/proj", "no transcript record carries a cwd: the session file's");
     }
 
     #[tokio::test]
