@@ -198,8 +198,6 @@ fn push_failed(e: std::io::Error) -> ApiError {
     ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("Could not read cdash-push.json: {e}") }
 }
 
-/// One `data:` line per note. Ends when the server stops, so `Bound::stop`
-/// never waits on an open stream. A lagged receiver skips ahead.
 /// Resolves when `serve`'s stop signal fires; never without one (a router
 /// served on its own, as tests do).
 pub(crate) async fn stopped(stop: Option<axum::Extension<tokio::sync::watch::Receiver<bool>>>) {
@@ -211,6 +209,8 @@ pub(crate) async fn stopped(stop: Option<axum::Extension<tokio::sync::watch::Rec
     }
 }
 
+/// One `data:` line per note. Ends when the server stops, so `Bound::stop`
+/// never waits on an open stream. A lagged receiver skips ahead.
 pub async fn get_notify(
     State(ctx): State<Arc<Ctx>>,
     stop: Option<axum::Extension<tokio::sync::watch::Receiver<bool>>>,

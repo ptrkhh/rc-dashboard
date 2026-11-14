@@ -184,6 +184,13 @@ mod tests {
         assert!(!loopback(&"192.168.1.20:9".parse().unwrap()));
     }
     #[tokio::test]
+    async fn a_pane_without_a_hook_token_refuses_every_token() {
+        let (addr, _ctx, _dir) = hook_server("no-token", "4242||").await;
+        let ok = ask_request("p1").to_string();
+        assert_eq!(post(addr, "pane=cdash-a", Some(""), ok.clone()).await.0, 401);
+        assert_eq!(post(addr, "pane=cdash-a", Some("tok-1"), ok).await.0, 401);
+    }
+    #[tokio::test]
     async fn other_tools_subagents_and_requests_without_a_dialog_are_answered_empty() {
         let (addr, _ctx, dir) = hook_server("empty", "4242||tok-1").await;
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"permission prompt"}"#);

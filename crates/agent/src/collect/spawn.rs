@@ -129,11 +129,46 @@ pub fn hook_settings(hook: Option<(u16, &str)>) -> String {
     const BASE: &str = r#"{"tui":"fullscreen","env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":""}"#;
     match hook {
         None => format!("{BASE}}}"),
-        // `name` is a `tmux_name`: safe in JSON and in a query string.
-        Some((port, name)) => format!(
-            r#"{BASE},"hooks":{{"PermissionRequest":[{{"matcher":"AskUserQuestion|ExitPlanMode","hooks":[{{"type":"http","url":"http://127.0.0.1:{port}/hook/claude?pane={name}","headers":{{"Authorization":"Bearer $CDASH_HOOK_TOKEN"}},"allowedEnvVars":["CDASH_HOOK_TOKEN"],"timeout":604800}}]}}]}}}}"#
-        ),
+        Some((port, name)) => {
+            // A pane name is what keeps the JSON and the URL below well formed.
+            debug_assert!(assert_kill_name(name).is_ok(), "not a pane name");
+            format!(
+                r#"{BASE},"hooks":{{"PermissionRequest":[{{"matcher":"AskUserQuestion|ExitPlanMode","hooks":[{{"type":"http","url":"http://127.0.0.1:{port}/hook/claude?pane={name}","headers":{{"Authorization":"Bearer $CDASH_HOOK_TOKEN"}},"allowedEnvVars":["CDASH_HOOK_TOKEN"],"timeout":604800}}]}}]}}}}"#
+            )
+        }
     }
+}
+
+/// `(major, minor)` from `tmux -V`: `tmux 3.4`, `tmux 2.9a`, `tmux next-3.5`.
+// ponytail: other spellings (`tmux master`, distro tags) read as unknown, so those launch without the hook.
+fn tmux_version(out: &str) -> Option<(u32, u32)> {
+    let v = out.trim().strip_prefix("tmux ")?;
+    let v = v.strip_prefix("next-").unwrap_or(v);
+    let (major, rest) = v.split_once('.')?;
+    let minor: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The hook port for a launch: none without the listener, or when tmux is
+/// older than 3.0 and has no `new-session -e`. `tmux -V` runs once; a failed
+/// run is not cached and that launch goes without the hook.
+async fn launch_hook_port(ctx: &Ctx) -> Option<u16> {
+    let port = ctx.hook_port?;
+    let env = ctx
+        .tmux_env
+        .get_or_try_init(|| async {
+            let out = ctx.runner.run_checked("tmux", &["-V"], "tmux -V").await?;
+            let ok = tmux_version(&out).is_some_and(|v| v >= (3, 0));
+            if !ok {
+                ctx.host.log.push(format!(
+                    "hook off: {:?} has no new-session -e (needs tmux 3.0); Claude sessions launch without the hook",
+                    out.trim()
+                ));
+            }
+            Ok::<_, String>(ok)
+        })
+        .await;
+    env.is_ok_and(|ok| *ok).then_some(port)
 }
 
 /// 32 random hex characters: the token Claude's hook sends for one launch.
@@ -165,7 +200,7 @@ async fn spawn_claude(
     // runs a multi-argument command with execvp, so `$CDASH_HOOK_TOKEN` in the
     // settings stays literal for Claude to fill in) and the `@cdash_hook`
     // option, never through `claude`'s own arguments.
-    let hook = match ctx.hook_port {
+    let hook = match launch_hook_port(ctx).await {
         Some(port) => Some((port, hook_token()?)),
         None => None,
     };
@@ -380,24 +415,27 @@ mod tests {
 
     /// A stub `tmux` whose exit status the test chooses, so both sides of the
     /// checked-subprocess branch are reachable without a real tmux server.
-    fn stub_tmux(dir: &Path, exit: i32) -> String {
+    fn stub_tmux(dir: &Path, exit: i32, version: &str) -> String {
         crate::chat::tmux_io::tests::install_stub(
             dir,
             "tmux",
-            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/tmux-args'\necho 4242\nexit {exit}\n", dir.display()),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/tmux-args'\nif [ \"$1\" = -V ]; then echo '{version}'; else echo 4242; fi\nexit {exit}\n",
+                dir.display()
+            ),
         )
     }
 
     async fn ctx_with_tmux(claude_dir: PathBuf, exit: i32) -> Arc<Ctx> {
-        tmux_ctx(claude_dir, exit, None)
+        tmux_ctx(claude_dir, exit, None, "tmux 3.4")
     }
 
     async fn ctx_with_hook(claude_dir: PathBuf, port: u16) -> Arc<Ctx> {
-        tmux_ctx(claude_dir, 0, Some(port))
+        tmux_ctx(claude_dir, 0, Some(port), "tmux 3.4")
     }
 
-    fn tmux_ctx(claude_dir: PathBuf, exit: i32, hook_port: Option<u16>) -> Arc<Ctx> {
-        let path = stub_tmux(&claude_dir, exit);
+    fn tmux_ctx(claude_dir: PathBuf, exit: i32, hook_port: Option<u16>, version: &str) -> Arc<Ctx> {
+        let path = stub_tmux(&claude_dir, exit, version);
         let log = Arc::new(LogBuffer::new());
         let host = crate::host::init::Host {
             runner: Runner::new(path.clone(), Arc::clone(&log)),
@@ -742,7 +780,7 @@ mod tests {
         let ctx = ctx_with_hook(d.clone(), 23999).await;
         let name = launch_session(&ctx, d.to_str().unwrap(), "haiku", "low", None).await.unwrap();
         let args = std::fs::read_to_string(d.join("tmux-args")).unwrap();
-        let launch = args.lines().next().unwrap();
+        let launch = args.lines().find(|l| l.starts_with("new-session")).unwrap();
         let token = launch.split("-e CDASH_HOOK_TOKEN=").nth(1).unwrap().split(' ').next().unwrap();
         assert!(token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(launch.starts_with(&format!("new-session -d -s {name} -c {} -e CDASH_HOOK_TOKEN={token} claude --settings ", d.display())));
@@ -750,6 +788,30 @@ mod tests {
         assert!(launch.ends_with(&format!(" ; set-option -t {name} @cdash_hook {token}")));
         assert!(launch.contains("--remote-control "));
         assert_eq!(launch.matches(token).count(), 2, "only in -e and the option");
+    }
+
+    #[test]
+    fn tmux_versions_are_read_from_tmux_v() {
+        assert_eq!(tmux_version("tmux 3.4\n"), Some((3, 4)));
+        assert_eq!(tmux_version("tmux 2.9a"), Some((2, 9)));
+        assert_eq!(tmux_version("tmux next-3.5"), Some((3, 5)));
+        for junk in ["4242", "", "tmux", "tmux master", "tmux 3", "screen 4.9"] {
+            assert_eq!(tmux_version(junk), None, "{junk:?}");
+        }
+    }
+    #[tokio::test]
+    async fn on_a_tmux_older_than_3_0_claude_launches_without_the_hook_and_says_so_once() {
+        let d = tempdir("hook-old-tmux");
+        let ctx = tmux_ctx(d.clone(), 0, Some(23999), "tmux 2.9a");
+        launch_session(&ctx, d.to_str().unwrap(), "haiku", "low", None).await.unwrap();
+        launch_session(&ctx, d.to_str().unwrap(), "haiku", "low", None).await.unwrap();
+        let args = std::fs::read_to_string(d.join("tmux-args")).unwrap();
+        assert_eq!(args.lines().filter(|l| *l == "-V").count(), 1, "checked once");
+        for launch in args.lines().filter(|l| l.starts_with("new-session")) {
+            assert!(launch.contains(&format!("--settings {} ", hook_settings(None))), "{launch}");
+            assert!(!launch.contains("CDASH_HOOK_TOKEN") && !launch.contains("@cdash_hook") && launch.contains("--remote-control "));
+        }
+        assert_eq!(ctx.host.log.lines().iter().filter(|l| l.contains("hook off:")).count(), 1);
     }
 
     #[tokio::test]
