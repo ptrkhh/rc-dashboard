@@ -12,7 +12,7 @@ function inputID() {
   return `msg_${time}${Array.from(randomBytes(14), byte => chars[byte % chars.length]).join('')}`;
 }
 
-export async function submitPrompt(client, state, remoteId, text, save) {
+export async function submitPrompt(client, state, remoteId, text, save, files = []) {
   if (typeof remoteId !== 'string' || !remoteId || typeof text !== 'string' || !state.sid) throw new Error('Invalid OpenCode prompt association');
   state.remote_inputs ||= {};
   let entry = Object.hasOwn(state.remote_inputs, remoteId) ? state.remote_inputs[remoteId] : undefined;
@@ -24,7 +24,7 @@ export async function submitPrompt(client, state, remoteId, text, save) {
   if (entry.sessionID !== state.sid || entry.text !== text) throw new Error('OpenCode prompt association conflict');
   const path = `/api/session/${encodeURIComponent(state.sid)}`;
   try {
-    const result = await client.request(`${path}/prompt`, { method: 'POST', body: { id: entry.id, text, delivery: 'steer' } });
+    const result = await client.request(`${path}/prompt`, { method: 'POST', body: { id: entry.id, text, delivery: 'steer', ...(files.length ? { files } : {}) } });
     if (result?.data?.id !== entry.id || result.data.sessionID !== state.sid || result.data.type !== 'user') throw new Error('OpenCode returned an unmatched prompt');
   } catch (error) {
     if (error.status !== 409) throw error;
@@ -67,6 +67,26 @@ function updateModel(state, selected) {
   if (state.model !== model) state.model_label = null;
   state.model = model;
   state.variant = selected.variant || null;
+}
+
+// A user row as chat shows it: text without its `Attached:` lines, and files as cache refs
+// (images) or chips. Base64 never leaves this function.
+async function chatPrompt(m, rowFiles) {
+  const { MAX_MEDIA, splitAttached, stashMedia } = await import(new URL('./chat-feed.mjs', import.meta.url)); // lazy: the worker is also copied alone
+  const { text, files: attached } = splitAttached(m.message.content.map(b => b.text).join(''));
+  const files = [];
+  for (const f of Array.isArray(rowFiles) ? rowFiles : []) {
+    const data = typeof f?.data === 'string' ? f.data : '';
+    const name = typeof f?.name === 'string' && f.name ? f.name : 'file';
+    let entry = { kind: 'file', name, size: Math.floor(data.length / 4 * 3) - (data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0) };
+    if (typeof f?.mime === 'string' && f.mime.startsWith('image/') && data.length / 4 * 3 <= MAX_MEDIA) { // history is untrusted: never decode a huge one
+      // a failed stash must not reach the event chain: it would end the session
+      const s = await stashMedia(process.env.CDASH_MEDIA_DIR, Buffer.from(data, 'base64')).catch(() => null);
+      if (s) entry = { kind: 'image', ref: s.ref, mime: s.mime };
+    }
+    files.push(entry);
+  }
+  return { ...m, message: { ...m.message, content: text ? [{ type: 'text', text }] : [] }, ...(files.length || attached.length ? { files: [...files, ...attached] } : {}) };
 }
 
 export class RemoteBridge {
@@ -461,13 +481,17 @@ async function supervise(statePath, name) {
     const commands = () => list('/api/command');
     feed = new ChatFeed({
       ops,
-      send: async (text, { cid }) => {
+      send: async (text, { cid, files = [] }) => {
         const [, name, rest = ''] = /^\/([A-Za-z0-9_:-]+)(?:\s+([\s\S]*))?$/.exec(text) || []; // `/usr/bin/x ...` is a prompt
+        // ponytail: attachments on a command are ignored; refuse them if owners hit it
         if (name && (await commands().catch(() => [])).some(c => c.name === name)) {
           await client.request(`${sessionPath}/command`, { method: 'POST', body: { name, text: rest.trim() } });
           return { done: true }; // the server expands the template, so no prompt row matches this cid
         }
-        return submitPrompt(client, chatState, 'dash:' + cid, text, async () => {});
+        const { withAttached } = await import(new URL('./chat-feed.mjs', import.meta.url));
+        const asPart = f => f.kind === 'image' || f.mime === 'application/pdf';
+        const parts = files.filter(asPart).map(f => ({ uri: pathToFileURL(f.path).href, name: f.name }));
+        return submitPrompt(client, chatState, 'dash:' + cid, withAttached(text, files.filter(f => !asPart(f)).map(f => f.path)), async () => {}, parts);
       },
       stop: () => client.request(sessionPath + '/interrupt', { method: 'POST', body: {} }),
     });
@@ -477,10 +501,18 @@ async function supervise(statePath, name) {
     let lastExecution = '';
     const sink = {
       sid: 'cdash-chat',
-      event: async m => feed.accept(m.type === 'result' && lastExecution === 'session.execution.interrupted' ? { ...m, subtype: 'interrupted' } : m),
+      event: async m => {
+        if (m.type === 'user' && m.message?.content?.[0]?.type !== 'tool_result') m = await chatPrompt(m, rowFiles.get(m.message?.id));
+        return feed.accept(m.type === 'result' && lastExecution === 'session.execution.interrupted' ? { ...m, subtype: 'interrupted' } : m);
+      },
       state: async status => feed.setState({ working: status === 'running', waiting: status === 'requires_action' }),
     };
+    const rowFiles = new Map(); // user row id -> its files, only while emitHistory runs
     class ChatBridge extends RemoteBridge {
+      async emitHistory(row, onlyTools) {
+        if (row.type === 'user' && row.files) rowFiles.set(row.id, row.files);
+        try { await super.emitHistory(row, onlyTools); } finally { rowFiles.delete(row.id); }
+      }
       async nativeEvent(event) {
         const data = event.data || {};
         if (event.type?.startsWith('session.execution.')) lastExecution = event.type;

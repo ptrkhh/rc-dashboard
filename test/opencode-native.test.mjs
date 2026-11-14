@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 
 test('project model query uses a private metadata lease and strips Claude credentials', { timeout: 30000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-native-'));
@@ -167,7 +168,7 @@ else {
 
 // A supervisor over a fake OpenCode server that also serves the chat feed's
 // reads (messages, forms, permissions) and records prompts and interrupts.
-async function fixture(t, { flakyMessages = false } = {}) {
+async function fixture(t, { flakyMessages = false, withFiles = '', mediaDir = null } = {}) {
   const { readFileSync, existsSync } = await import('node:fs');
   const { rename } = await import('node:fs/promises');
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-chat-'));
@@ -189,7 +190,9 @@ else {
  if(path==='/api/session'&&req.method==='POST')return send(res,{data:{id:'ses_fixture'}});
  if(path==='/api/session/ses_fixture/message'&&process.env.CDASH_TEST_FLAKY&&!fs.existsSync(process.env.CDASH_TEST_FLAKY)){fs.writeFileSync(process.env.CDASH_TEST_FLAKY,'1');return send(res,{data:'broken'});}
  if(path==='/api/session/ses_fixture/message'&&fs.existsSync(process.env.CDASH_TEST_FAILMSG)){fs.unlinkSync(process.env.CDASH_TEST_FAILMSG);return send(res,{data:'broken'});}
- if(path==='/api/session/ses_fixture/message')return send(res,{data:[{id:'msg_u',type:'user',text:'hello'},{id:'msg_a',type:'assistant',time:{completed:1},content:[{type:'text',text:'hi there'}]}],cursor:{}});
+ const rowFiles=process.env.CDASH_TEST_FILES==='bad'?[{data:'AAAA',mime:'image/png',name:'x.png'},{mime:'image/png'},'junk',null,{data:5,mime:'application/pdf'}]:[{data:'${PNG.toString('base64')}',mime:'image/png',name:'a.png',source:{type:'inline'}},{data:'${PDF.toString('base64')}',mime:'application/pdf',name:'r.pdf',source:{type:'uri',uri:'file:///x/r.pdf'}}];
+ const extra=process.env.CDASH_TEST_FILES?[{id:'msg_f',type:'user',text:'see\\nAttached: /h/.cache/cdash/uploads/cdash-fixture/0123456789abcdef/n.txt',files:rowFiles}]:[];
+ if(path==='/api/session/ses_fixture/message')return send(res,{data:[{id:'msg_u',type:'user',text:'hello'},{id:'msg_a',type:'assistant',time:{completed:1},content:[{type:'text',text:'hi there'}]},...extra],cursor:{}});
  if(path.includes('/form/')&&path.endsWith('/reply')){res.writeHead(path.includes('/frm_done/')?409:204);return res.end();}
  if(path==='/api/command')return send(res,{data:[{name:'review',description:'Review changes'}]});
  if(path==='/api/agent')return send(res,{data:[{id:'build',name:'build',mode:'primary',hidden:false},{id:'plan',name:'plan',mode:'primary',hidden:false},{id:'explore',name:'explore',mode:'subagent',hidden:false},{id:'title',name:'title',mode:'primary',hidden:true}]});
@@ -205,7 +208,7 @@ else {
 `, { mode: 0o700 });
   await writeFile(join(dir, 'claude'), `#!${process.execPath}\nprocess.exit(1);`, { mode: 0o700 });
   const child = spawn(process.execPath, [resolve('crates/agent/src/collect/opencode-remote.mjs'), '--state', state, '--name', 'cdash-fixture'], {
-    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_MEDIA_DIR: mediaDir ?? join(dir, 'media'), ...(withFiles && { CDASH_TEST_FILES: withFiles === true ? '1' : withFiles }), CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   let output = '';
   child.stdout.on('data', b => { output += b; });
@@ -355,4 +358,49 @@ test('a card for a form settled while the bridge restarts is dropped by the new 
   await f.emit({ type: 'session.execution.succeeded', data: { sessionID: f.native().sid } });
   await until(() => asksNow(c).length === 0);                    // GET form lists nothing: settled in the TUI meanwhile
   c.close();
+});
+
+const PNG = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('row')]), PDF = Buffer.from('%PDF-1.7 tiny');
+const sha = b => createHash('sha256').update(b).digest('hex');
+test('chat sends OpenCode images and PDFs as file parts and other files as paths', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const file = (path, kind, mime) => ({ path, kind, mime, name: path.split('/').pop(), size: 8 });
+  c.write({ t: 'send', cid: 'c1', text: 'look', steer: false, files: [file('/u/up/a b.png', 'image', 'image/png'),
+    file('/u/up/r.pdf', 'file', 'application/pdf'), file('/u/up/n.txt', 'file', 'application/octet-stream')] });
+  await until(() => f.posted('/prompt'));
+  assert.equal(f.posted('/prompt').text, 'look\nAttached: /u/up/n.txt');
+  assert.deepEqual(f.posted('/prompt').files, [{ uri: 'file:///u/up/a%20b.png', name: 'a b.png' }, { uri: 'file:///u/up/r.pdf', name: 'r.pdf' }]);
+  c.close();
+});
+test('a user row with files reaches chat as refs and chips, without its base64', { timeout: 20000 }, async t => {
+  const f = await fixture(t, { withFiles: true });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ev' && l.ev.message?.id === 'msg_f'));
+  const ev = c.lines.find(l => l.t === 'ev' && l.ev.message?.id === 'msg_f').ev;
+  assert.equal(ev.message.content[0].text, 'see');
+  assert.deepEqual(ev.files, [{ kind: 'image', ref: sha(PNG), mime: 'image/png' }, { kind: 'file', name: 'r.pdf', size: PDF.length }, { kind: 'file', name: 'n.txt' }]);
+  assert.ok(!JSON.stringify(c.lines).includes(PNG.toString('base64')));
+  c.close();
+});
+test('an unwritable media folder or a malformed data part gives chips, and the session lives', { timeout: 20000 }, async t => {
+  const { mkdtemp: mk } = await import('node:fs/promises');
+  const blocker = join(await mk(join(tmpdir(), 'cdash-oc-blk-')), 'media');
+  await writeFile(blocker, 'a file where the folder should be');
+  t.after(() => rm(join(blocker, '..'), { recursive: true, force: true }));
+  for (const [withFiles, mediaDir, expected] of [
+    [true, blocker, [{ kind: 'file', name: 'a.png', size: PNG.length }, { kind: 'file', name: 'r.pdf', size: PDF.length }, { kind: 'file', name: 'n.txt' }]],
+    ['bad', null, [{ kind: 'file', name: 'x.png', size: 3 }, { kind: 'file', name: 'file', size: 0 }, { kind: 'file', name: 'file', size: 0 }, { kind: 'file', name: 'file', size: 0 }, { kind: 'file', name: 'file', size: 0 }, { kind: 'file', name: 'n.txt' }]],
+  ]) {
+    const f = await fixture(t, { withFiles, mediaDir });
+    await f.wait(() => f.native()?.chat_sock);
+    const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+    await until(() => c.lines.some(l => l.t === 'ev' && l.ev.message?.id === 'msg_f'));
+    assert.deepEqual(c.lines.find(l => l.t === 'ev' && l.ev.message?.id === 'msg_f').ev.files, expected);
+    await until(() => c.lines.some(l => l.t === 'ready'));
+    c.close();
+  }
 });
