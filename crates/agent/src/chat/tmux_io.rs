@@ -39,7 +39,17 @@ async fn write_private(file: &std::path::Path, text: &str) -> std::io::Result<()
 }
 
 pub async fn escape(runner: &Runner, name: &str) -> Result<(), String> {
-    runner.run_checked("tmux", &["send-keys", "-t", &target(name), "Escape"], "tmux send-keys").await.map(drop)
+    key(runner, name, "Escape").await
+}
+
+/// Press one tmux key (`Enter`, `Escape`, `BTab`).
+pub async fn key(runner: &Runner, name: &str, key: &str) -> Result<(), String> {
+    runner.run_checked("tmux", &["send-keys", "-t", &target(name), key], "tmux send-keys").await.map(drop)
+}
+
+/// The pane's visible text.
+pub async fn capture(runner: &Runner, name: &str) -> Result<String, String> {
+    runner.run_checked("tmux", &["capture-pane", "-p", "-t", &target(name)], "tmux capture-pane").await
 }
 
 /// Empty the input box after Claude handed a prompt back into it. Ctrl+U

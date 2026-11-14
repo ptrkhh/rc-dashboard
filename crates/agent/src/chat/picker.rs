@@ -2,7 +2,9 @@
 //! `claude -p` `initialize` per project folder, and typed commands are routed
 //! to the pickers, pasted, or refused with a pointer.
 
+use super::tmux_io;
 use crate::collect::ctx::Ctx;
+use crate::collect::lookup::session_file_for;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -154,10 +156,111 @@ async fn run_initialize(ctx: &Arc<Ctx>, cwd: &Path) -> Result<Value, String> {
     if answer.is_object() { Ok(answer) } else { Err("no initialize response".into()) }
 }
 
+/// Claude's confirmation title for each picker command.
+// ponytail: provisional texts until Task 13 records them on a real session.
+pub const CONFIRMS: [(&str, &str); 2] = [("model", "Switch model?"), ("effort", "Change effort level?")];
+
+/// Footer starts and the permission mode each shows, in shift+tab order from bypass.
+const FOOTERS: [(&str, &str); 5] = [
+    ("⏵⏵ bypass permissions on", "bypassPermissions"),
+    ("⏵⏵ auto mode on", "auto"),
+    ("⏸ manual mode on", "default"),
+    ("⏵⏵ accept edits on", "acceptEdits"),
+    ("⏸ plan mode on", "plan"),
+];
+const PRESSES_MAX: usize = 5;
+const SETTLE_WAIT: Duration = Duration::from_secs(2);
+
+/// The permission mode the bottom-most footer line shows.
+pub fn footer_mode(screen: &str) -> Option<&'static str> {
+    screen.lines().rev().find_map(|l| {
+        let l = l.trim_start();
+        FOOTERS.iter().find(|(start, _)| l.starts_with(start)).map(|(_, mode)| *mode)
+    })
+}
+
+/// The pane shows the dialog titled `title` with the cursor on Yes below it.
+pub fn confirm_ready(screen: &str, title: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(at) = lines.iter().rposition(|l| l.contains(title)) else { return false };
+    lines[at + 1..].iter().any(|l| l.trim_start().starts_with('❯') && l.contains("Yes"))
+}
+
+/// Refuses unless the session is idle (a background shell counts).
+async fn idle(ctx: &Ctx, pid: i32) -> Result<(), String> {
+    let file = session_file_for(&ctx.claude_dir, pid).await;
+    match file.and_then(|f| f.status).as_deref() {
+        Some("idle" | "shell") => Ok(()),
+        Some("waiting") => Err("Answer the open question first".into()),
+        _ => Err("Stop the turn or wait for it to finish".into()),
+    }
+}
+
+async fn read_footer(ctx: &Ctx, name: &str) -> Option<&'static str> {
+    footer_mode(&tmux_io::capture(&ctx.runner, name).await.ok()?)
+}
+
+/// Turns plan mode on or off by pressing shift+tab until the footer shows
+/// plan (on) or bypassPermissions (off), checking it after every press.
+pub async fn switch_plan(ctx: &Arc<Ctx>, name: &str, pid: i32, on: bool) -> Result<(), String> {
+    const UNKNOWN: &str = "Plan mode is unknown here; use Terminal";
+    const STUCK: &str = "Plan mode did not switch; use Terminal";
+    let target = if on { "plan" } else { "bypassPermissions" };
+    idle(ctx, pid).await?;
+    let mut mode = read_footer(ctx, name).await.ok_or(UNKNOWN)?;
+    for _ in 0..PRESSES_MAX {
+        if mode == target {
+            return Ok(());
+        }
+        idle(ctx, pid).await?;
+        tmux_io::key(&ctx.runner, name, "BTab").await?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut now = read_footer(ctx, name).await;
+        while now.is_none_or(|m| m == mode) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            now = read_footer(ctx, name).await;
+        }
+        mode = match now {
+            None => return Err(UNKNOWN.into()),
+            Some(m) if m == mode => return Err(STUCK.into()),
+            Some(m) => m,
+        };
+    }
+    if mode == target { Ok(()) } else { Err(STUCK.into()) }
+}
+
+/// Types `/<cmd> <value>` and answers only the confirmation that command
+/// raises, after reading it on screen. Any other dialog is closed.
+pub async fn type_setting(ctx: &Arc<Ctx>, name: &str, pid: i32, cmd: &str, value: &str) -> Result<(), String> {
+    let title = CONFIRMS.iter().find(|(c, _)| *c == cmd).map(|(_, t)| *t);
+    idle(ctx, pid).await?;
+    tmux_io::paste(&ctx.runner, name, &format!("/{cmd} {value}")).await?;
+    let deadline = Instant::now() + SETTLE_WAIT;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let Some(f) = session_file_for(&ctx.claude_dir, pid).await else { continue };
+        if f.status.as_deref() != Some("waiting") {
+            continue;
+        }
+        if let (Some("dialog open"), Some(title)) = (f.waiting_for.as_deref(), title) {
+            // The status turns `waiting` about 10 ms before the dialog is drawn.
+            for _ in 0..3 {
+                if confirm_ready(&tmux_io::capture(&ctx.runner, name).await.unwrap_or_default(), title) {
+                    return tmux_io::key(&ctx.runner, name, "Enter").await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        tmux_io::escape(&ctx.runner, name).await?;
+        return Err("Claude opened an unexpected dialog; closed it".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::claude::tests::ctx_with_path;
+    use crate::chat::claude::tests::{ctx_with_path, write_session};
     use crate::chat::tmux_io::tests::{install_stub, tempfile_path};
 
     #[test]
@@ -245,5 +348,110 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("the reload never replaced the copy");
+    }
+
+    #[test]
+    fn the_footer_parser_reads_the_five_modes() {
+        for (line, mode) in [("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent", "bypassPermissions"),
+                             ("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent", "auto"),
+                             ("⏸ manual mode on · ← 1 agent", "default"),
+                             ("⏵⏵ accept edits on (shift+tab to cycle) · ← 1 agent", "acceptEdits"),
+                             ("⏸ plan mode on (shift+tab to cycle) · ← 1 agent", "plan")] {
+            assert_eq!(footer_mode(&format!("● reply\n\n  {line}\n")), Some(mode), "{line}");
+        }
+        assert_eq!(footer_mode("⏵⏵ bypass permissions on · 1 shell · ← 1 agent"), Some("bypassPermissions"));
+        assert_eq!(footer_mode("● said ⏸ plan mode on\n  ⏵⏵ auto mode on"), Some("auto"), "the bottom line wins");
+        assert_eq!(footer_mode("no footer here"), None);
+    }
+    #[test]
+    fn a_confirmation_counts_only_with_its_title_and_the_cursor_on_yes() {
+        assert!(confirm_ready(" Switch model?\n ❯ 1. Yes\n   2. No\n", "Switch model?"));
+        assert!(!confirm_ready(" Switch model?\n   1. Yes\n ❯ 2. No\n", "Switch model?"));
+        assert!(!confirm_ready(" Background work is running\n ❯ 1. Exit and stop tasks\n", "Switch model?"));
+    }
+
+    /// `<dir>/tmux-args` lines that press a key.
+    fn sent_keys(dir: &Path) -> Vec<String> {
+        let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap_or_default();
+        args.lines().filter(|l| l.starts_with("send-keys")).map(String::from).collect()
+    }
+
+    fn presses(dir: &Path) -> usize {
+        sent_keys(dir).iter().filter(|l| l.ends_with(" BTab")).count()
+    }
+
+    /// An idle session in `<dir>/sessions` and a `tmux` stub running `body`
+    /// after logging its arguments to `<dir>/tmux-args`; `$D` is `dir`.
+    fn stub_ctx(tag: &str, body: &str) -> (Arc<Ctx>, PathBuf) {
+        let dir = tempfile_path(tag);
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
+        let script = format!("#!/bin/sh\nD='{}'\nprintf '%s\\n' \"$*\" >> \"$D/tmux-args\"\n{body}", dir.display());
+        let bin = install_stub(&dir, "tmux", &script);
+        (ctx_with_path(dir.clone(), format!("{bin}:/usr/bin:/bin")), dir)
+    }
+
+    /// A pane whose footer cycles through `<dir>/footers` one line per BTab.
+    fn cycle_ctx(tag: &str) -> (Arc<Ctx>, PathBuf) {
+        let body = r#"i=0; [ -f "$D/mode" ] && read i < "$D/mode"
+case "$*" in
+  send-keys*BTab) echo $(( (i + 1) % 5 )) > "$D/mode" ;;
+  capture-pane*) printf '● reply\n\n'; sed -n "$((i + 1))p" "$D/footers" ;;
+  display-message*) echo '4242||' ;;
+esac
+"#;
+        let (ctx, dir) = stub_ctx(&format!("cycle-{tag}"), body);
+        let footers = ["⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent", "⏵⏵ auto mode on (shift+tab to cycle)", "⏸ manual mode on",
+                       "⏵⏵ accept edits on (shift+tab to cycle)", "⏸ plan mode on (shift+tab to cycle)"];
+        std::fs::write(dir.join("footers"), footers.map(|f| format!("{f}\n")).concat()).unwrap();
+        (ctx, dir)
+    }
+
+    /// A pane showing `screen` whose first Enter opens a dialog (`waiting`,
+    /// `dialog open`); later Enters and Escape close it.
+    fn confirm_ctx(tag: &str, screen: &str) -> (Arc<Ctx>, PathBuf) {
+        let body = r#"put() { cp "$D/$1.json" "$D/sessions/.t" && mv -f "$D/sessions/.t" "$D/sessions/4242.json"; }
+case "$*" in
+  send-keys*Enter) if [ -e "$D/entered" ]; then put idle; else : > "$D/entered"; put waiting; fi ;;
+  send-keys*Escape) put idle ;;
+  capture-pane*) cat "$D/screen" ;;
+esac
+"#;
+        let (ctx, dir) = stub_ctx(&format!("confirm-{tag}"), body);
+        std::fs::write(dir.join("screen"), screen).unwrap();
+        std::fs::write(dir.join("idle.json"), r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#).unwrap();
+        std::fs::write(dir.join("waiting.json"), r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"dialog open"}"#).unwrap();
+        (ctx, dir)
+    }
+
+    #[tokio::test]
+    async fn the_plan_switch_presses_shift_tab_until_the_footer_agrees_and_never_while_busy() {
+        let (ctx, dir) = cycle_ctx("plan"); // status idle; the footer starts at bypass
+        switch_plan(&ctx, "cdash-a", 4242, true).await.unwrap();
+        assert_eq!(presses(&dir), 4, "bypass, auto, manual, accept edits, plan");
+        switch_plan(&ctx, "cdash-a", 4242, true).await.unwrap();
+        assert_eq!(presses(&dir), 4, "already on: no key");
+        switch_plan(&ctx, "cdash-a", 4242, false).await.unwrap();
+        assert_eq!(presses(&dir), 5);
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy"}"#);
+        assert_eq!(switch_plan(&ctx, "cdash-a", 4242, true).await, Err("Stop the turn or wait for it to finish".into()));
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"input needed"}"#);
+        assert_eq!(switch_plan(&ctx, "cdash-a", 4242, true).await, Err("Answer the open question first".into()));
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"shell"}"#);
+        switch_plan(&ctx, "cdash-a", 4242, true).await.unwrap();
+        assert_eq!(presses(&dir), 9, "shell is idle with a background shell");
+        std::fs::write(dir.join("footers"), "no footer\n".repeat(5)).unwrap();
+        assert!(switch_plan(&ctx, "cdash-a", 4242, false).await.is_err());
+        assert_eq!(presses(&dir), 9, "an unknown footer is never pressed through");
+    }
+    #[tokio::test]
+    async fn model_and_effort_are_typed_and_only_their_own_confirmation_is_accepted() {
+        let (ctx, dir) = confirm_ctx("yes", " Switch model?\n ❯ 1. Yes\n   2. No\n");
+        type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await.unwrap();
+        let keys = sent_keys(&dir);
+        assert_eq!(keys, ["send-keys -t =cdash-a: Enter", "send-keys -t =cdash-a: Enter"], "Enter after the paste, Enter on Yes");
+        let (ctx, dir) = confirm_ctx("other", " Background work is running\n ❯ 1. Exit and stop tasks\n");
+        assert!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await.is_err());
+        assert_eq!(sent_keys(&dir), ["send-keys -t =cdash-a: Enter", "send-keys -t =cdash-a: Escape"]);
     }
 }

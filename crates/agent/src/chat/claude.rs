@@ -152,12 +152,41 @@ impl Engine for ClaudeEngine {
     }
 
     async fn menu(&self) -> Value {
-        let cwd = session_file_for(&self.ctx.claude_dir, self.pid).await.and_then(|f| f.cwd);
-        let init = match cwd {
-            Some(cwd) => picker::initialize(&self.ctx, std::path::Path::new(&cwd)).await.ok(),
-            None => None,
-        };
-        init.map_or_else(|| picker::menu_from(&Value::Null), |i| picker::menu_from(&i))
+        if let Ok(screen) = tmux_io::capture(&self.ctx.runner, &self.name).await {
+            if let Some(mode) = picker::footer_mode(&screen) {
+                lock(&self.live).plan = Some(mode == "plan");
+                self.shared.wake.notify_one();
+            }
+        }
+        self.listed().await
+    }
+
+    /// Only values from the session's own lists reach the pane.
+    async fn set(&self, what: &str, value: &Value) -> Result<(), String> {
+        let (ctx, name, pid) = (&self.ctx, self.name.as_str(), self.pid);
+        match what {
+            "plan" => {
+                let on = value.as_bool().ok_or("plan takes true or false")?;
+                picker::switch_plan(ctx, name, pid, on).await?;
+                lock(&self.live).plan = Some(on);
+            }
+            "model" => {
+                const NOT_LISTED: &str = "not a model this session offers";
+                let alias = value.as_str().ok_or(NOT_LISTED)?;
+                let models = self.listed().await["models"].take();
+                let entry = models.as_array().and_then(|m| m.iter().find(|e| e["value"] == alias)).ok_or(NOT_LISTED)?;
+                picker::type_setting(ctx, name, pid, "model", alias).await?;
+                lock(&self.live).model = entry["model"].as_str().map(String::from);
+            }
+            "effort" => {
+                let effort = value.as_str().filter(|e| picker::EFFORTS.contains(e)).ok_or("not an effort level")?;
+                picker::type_setting(ctx, name, pid, "effort", effort).await?;
+                lock(&self.live).effort = Some(effort.to_string());
+            }
+            _ => return Err("not supported".into()),
+        }
+        self.shared.wake.notify_one();
+        Ok(())
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -221,6 +250,16 @@ impl Engine for ClaudeEngine {
 impl ClaudeEngine {
     pub fn live(&self) -> LiveRef {
         Arc::clone(&self.live)
+    }
+
+    /// The menu built from the cached `initialize` of the session's folder.
+    async fn listed(&self) -> Value {
+        let cwd = session_file_for(&self.ctx.claude_dir, self.pid).await.and_then(|f| f.cwd);
+        let init = match cwd {
+            Some(cwd) => picker::initialize(&self.ctx, std::path::Path::new(&cwd)).await.ok(),
+            None => None,
+        };
+        init.map_or_else(|| picker::menu_from(&Value::Null), |i| picker::menu_from(&i))
     }
 }
 
@@ -472,11 +511,27 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn without_a_command_list_the_menu_still_offers_the_effort_levels() {
-        let (ctx, dir) = fixture_ctx("menu");
+        let (ctx, dir) = fixture_with("menu", "⏸ plan mode on (shift+tab to cycle)");
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/no-such-dir-menu","status":"idle"}"#);
         let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
         assert_eq!(engine.menu().await, json!({"commands":[],"models":[],"efforts":["low","medium","high","xhigh","max","auto"],"agents":[]}));
+        assert_eq!(engine.live().lock().unwrap().plan, Some(true), "the menu reads the footer");
+    }
+
+    #[tokio::test]
+    async fn set_takes_only_listed_values_and_refuses_before_typing() {
+        let (ctx, dir) = fixture_ctx("set");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj-set","status":"busy"}"#); // a cwd no other test caches
+        picker::seed(std::path::Path::new("/proj-set"), serde_json::from_str(include_str!("testdata/initialize.json")).unwrap());
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        assert_eq!(engine.set("model", &json!("gpt-9")).await, Err("not a model this session offers".into()));
+        assert_eq!(engine.set("effort", &json!("ultracode")).await, Err("not an effort level".into()));
+        assert_eq!(engine.set("plan", &json!("yes")).await, Err("plan takes true or false".into()));
+        assert_eq!(engine.set("agent", &json!("build")).await, Err("not supported".into()));
+        assert_eq!(engine.set("model", &json!("haiku")).await, Err("Stop the turn or wait for it to finish".into()));
+        assert!(!std::fs::read_to_string(dir.join("tmux-args")).unwrap_or_default().contains("send-keys"));
     }
 
     async fn next_msg(rx: &mut mpsc::Receiver<EngineMsg>) -> EngineMsg {
