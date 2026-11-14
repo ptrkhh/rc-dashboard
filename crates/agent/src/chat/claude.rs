@@ -87,9 +87,18 @@ pub struct ClaudeEngine {
     name: String,
     /// The transcript of the conversation the loop follows.
     transcript: Arc<Mutex<Option<PathBuf>>>,
-    /// Clients attached to the hub; the loop reads only the status file while none are.
-    watchers: Arc<AtomicUsize>,
-    wake: Arc<Notify>,
+    shared: Arc<Shared>,
+}
+
+/// What the engine and its loop share.
+#[derive(Default)]
+struct Shared {
+    /// Clients attached to the hub; the loop parks while none are.
+    watchers: AtomicUsize,
+    wake: Notify,
+    /// Transcript polls the loop made.
+    #[cfg(test)]
+    polls: AtomicUsize,
 }
 
 impl Engine for ClaudeEngine {
@@ -133,24 +142,23 @@ impl Engine for ClaudeEngine {
     }
 
     async fn watchers(&self, n: usize) {
-        self.watchers.store(n, Ordering::Relaxed);
-        self.wake.notify_one();
+        self.shared.watchers.store(n, Ordering::Relaxed);
+        self.shared.wake.notify_one();
     }
 }
 
 pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Receiver<EngineMsg>) {
     let (tx, rx) = mpsc::channel(256);
     let transcript = Arc::new(Mutex::new(None));
-    let (watchers, wake) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+    let shared = Arc::new(Shared::default());
     let engine = ClaudeEngine {
         runner: Arc::clone(&ctx.runner),
         log: Arc::clone(&ctx.host.log),
         name: name.clone(),
         transcript: Arc::clone(&transcript),
-        watchers: Arc::clone(&watchers),
-        wake: Arc::clone(&wake),
+        shared: Arc::clone(&shared),
     };
-    tokio::spawn(run(ctx, name, pid, tx, transcript, watchers, wake));
+    tokio::spawn(run(ctx, name, pid, tx, transcript, shared));
     (engine, rx)
 }
 
@@ -168,8 +176,7 @@ async fn run(
     pid: i32,
     tx: mpsc::Sender<EngineMsg>,
     transcript: Arc<Mutex<Option<PathBuf>>>,
-    watchers: Arc<AtomicUsize>,
-    wake: Arc<Notify>,
+    shared: Arc<Shared>,
 ) {
     let mut conv: Option<Conv> = None;
     let mut last: Option<(bool, bool, Option<String>)> = None;
@@ -180,7 +187,7 @@ async fn run(
     let target = format!("={name}");
     loop {
         // A client attaching wakes a slow wait at once.
-        let _ = tokio::time::timeout(if slow { SLOW_TICK } else { TICK }, wake.notified()).await;
+        let _ = tokio::time::timeout(if slow { SLOW_TICK } else { TICK }, shared.wake.notified()).await;
         let file = session_file_for(&ctx.claude_dir, pid).await;
         let status = file.as_ref().and_then(|f| f.status.clone());
         if !matches!(status.as_deref(), Some("idle" | "shell")) {
@@ -206,7 +213,7 @@ async fn run(
             // poll until its end is read (or `TURN_END_GRACE` passes), so a
             // turn end still notifies at once; a transcript that changed length
             // is read now, so a turn shorter than one slow wait is not missed.
-            slow = watchers.load(Ordering::Relaxed) == 0
+            slow = shared.watchers.load(Ordering::Relaxed) == 0
                 && c.ready
                 && idle_since.is_some_and(|t| !c.tap.turn_open() || t.elapsed() >= TURN_END_GRACE)
                 // No transcript yet (no prompt so far) counts as unchanged.
@@ -214,6 +221,8 @@ async fn run(
             let lines = if slow {
                 Vec::new()
             } else {
+                #[cfg(test)]
+                shared.polls.fetch_add(1, Ordering::Relaxed);
                 match c.tail.poll().await {
                     Ok(l) => l,
                     Err(e) => {
@@ -372,6 +381,13 @@ pub(crate) mod tests {
         next_of(rx, |m| matches!(m, EngineMsg::Ev(_))).await
     }
 
+    /// Transcript polls the loop makes over `ms`: none parked, one per 150 ms otherwise.
+    async fn polls_in(engine: &ClaudeEngine, ms: u64) -> usize {
+        let before = engine.shared.polls.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        engine.shared.polls.load(Ordering::Relaxed) - before
+    }
+
     #[tokio::test]
     async fn an_idle_session_nobody_watches_is_read_through_its_status_file_only() {
         let (ctx, dir) = fixture_ctx("idle");
@@ -379,6 +395,8 @@ pub(crate) mod tests {
         let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
         next_status(&mut rx).await; // idle
+        tokio::time::sleep(Duration::from_millis(500)).await; // the pass after Ready parks
+        assert_eq!(polls_in(&engine, 2000).await, 0, "parked: the transcript is not polled");
         let wait = |ms| Duration::from_millis(ms);
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy"}"#);
         assert!(matches!(tokio::time::timeout(wait(1500), next_status(&mut rx)).await, Ok(EngineMsg::Status { working: true, .. })), "busy is seen within a slow wait");
@@ -388,17 +406,19 @@ pub(crate) mod tests {
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
         next_ev(&mut rx).await; // its result: slow again
         engine.watchers(1).await;
+        assert!(polls_in(&engine, 2000).await > 10, "someone watches: polled as today");
         append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(13..14));
-        assert!(tokio::time::timeout(wait(300), next_ev(&mut rx)).await.is_ok(), "someone watches: polled as today");
+        assert!(tokio::time::timeout(wait(1000), next_ev(&mut rx)).await.is_ok(), "and what is appended is read");
     }
 
     #[tokio::test]
     async fn a_turn_shorter_than_a_slow_wait_is_read_from_the_transcript_growing() {
         let (ctx, dir) = fixture_ctx("idle-grow");
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
-        let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
-        tokio::time::sleep(Duration::from_millis(1200)).await; // parked
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(polls_in(&engine, 2000).await, 0, "parked");
         append(&dir.join("projects/-proj/sid-1.jsonl"), &format!("{}{}", fixture_lines(13..14), fixture_lines(9..10)));
         let wait = |ms| Duration::from_millis(ms);
         assert!(tokio::time::timeout(wait(1500), next_ev(&mut rx)).await.is_ok(), "the prompt, with no status change");
@@ -411,12 +431,11 @@ pub(crate) mod tests {
         let (ctx, dir) = fixture_ctx("idle-open");
         write_transcript(&dir, "sid-1", &fixture_lines(1..14)); // ends on a prompt, as `/model` would
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
-        let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
-        tokio::time::sleep(TURN_END_GRACE + Duration::from_millis(300)).await;
-        append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(14..15));
-        let read = tokio::time::timeout(Duration::from_millis(600), next_ev(&mut rx)).await;
-        assert!(read.is_err(), "past the grace the transcript is left alone");
+        assert!(polls_in(&engine, 1000).await >= 4, "inside the grace the open turn is polled fast");
+        tokio::time::sleep(TURN_END_GRACE).await;
+        assert_eq!(polls_in(&engine, 2000).await, 0, "past the grace it parks");
     }
 
     #[tokio::test]
