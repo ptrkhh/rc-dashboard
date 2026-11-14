@@ -7,6 +7,8 @@ pub mod ece;
 pub mod hub;
 pub mod native;
 pub mod notify;
+#[cfg(test)]
+mod perf;
 pub mod push;
 pub mod queue;
 pub mod tap;
