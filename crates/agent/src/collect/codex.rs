@@ -435,7 +435,7 @@ pub async fn history(ctx: &Ctx) -> Vec<Resumable> {
 mod tests {
     use super::*;
     use crate::host::{cmd::Runner, init::Host, log::LogBuffer, sample::Sampler};
-    use std::os::unix::fs::PermissionsExt;
+    use crate::chat::tmux_io::tests::install_stub;
 
     const SID: &str = "01234567-1234-1234-1234-0123456789ab";
     const CATALOG: &str = r#"[{"value":"codex:gpt-b","model":"gpt-b","label":"GPT B","efforts":["low","high"],"defaultEffort":"low"}]"#;
@@ -472,9 +472,7 @@ mod tests {
             scripts.push(("codex", "#!/bin/sh\necho codex-cli 0.162.1\n".to_string()));
         }
         for (name, body) in scripts {
-            let f = dir.join("bin").join(name);
-            std::fs::write(&f, body).unwrap();
-            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install_stub(&dir, name, &body);
         }
         let log = Arc::new(LogBuffer::new());
         let path = dir.join("bin").to_string_lossy().into_owned();
@@ -605,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn an_old_codex_version_is_refused_before_creating_a_session() {
         let (dir, ctx) = codex_ctx("old-cli");
-        std::fs::write(dir.join("bin/codex"), "#!/bin/sh\necho codex-cli 0.161.0\n").unwrap();
+        install_stub(&dir, "codex", "#!/bin/sh\necho codex-cli 0.161.0\n");
         let error = launch(&ctx, dir.to_str().unwrap(), Some("gpt-b"), "low", None).await.unwrap_err();
         assert!(matches!(error, Refused::BadRequest(ref m) if m.contains("0.162.1")));
         assert!(!dir.join("tmux-args").exists());

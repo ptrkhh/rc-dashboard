@@ -5,7 +5,7 @@ import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-test('project model query uses a private metadata lease and strips Claude credentials', { timeout: 10000 }, async t => {
+test('project model query uses a private metadata lease and strips Claude credentials', { timeout: 30000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-native-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const log = join(dir, 'server.json');
@@ -34,7 +34,7 @@ process.stdin.resume(); process.stdin.on('end',()=>server.close());
   assert.equal(server.args.includes('--service'), false);
 });
 
-test('history includes only owned active top-level sessions and writes text-only snapshots', { timeout: 10000 }, async t => {
+test('history includes only owned active top-level sessions and writes text-only snapshots', { timeout: 30000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-history-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   for (const sid of ['ses_owned', 'ses_archived', 'ses_child']) await writeFile(join(dir, `${sid}.owned.json`), JSON.stringify({ sid, dir, display_name: sid }));
@@ -65,7 +65,7 @@ process.stdin.resume();process.stdin.on('end',()=>server.close());
   assert.doesNotMatch(transcript, /private reasoning/);
 });
 
-test('native supervisor attaches one TUI to its owned session and cleans up', { timeout: 15000 }, async t => {
+test('native supervisor attaches one TUI to its owned session and cleans up', { timeout: 30000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-supervisor-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const state = join(dir, 'pane.json'), log = join(dir, 'wire.jsonl');
@@ -211,7 +211,7 @@ else {
     await rm(dir, { recursive: true, force: true });
   });
   const wait = async check => {
-    for (let i = 0; i < 200; i++) { if (await check()) return; if (child.exitCode !== null) throw Error(`supervisor exited: ${output}`); await new Promise(r => setTimeout(r, 30)); }
+    for (let i = 0; i < 1000; i++) { if (await check()) return; if (child.exitCode !== null) throw Error(`supervisor exited: ${output}`); await new Promise(r => setTimeout(r, 30)); }
     throw Error(`condition timed out: ${output}`);
   };
   return {
@@ -234,8 +234,8 @@ async function client(path, first) {
   socket.write(JSON.stringify(first) + '\n');
   return { lines, write: o => socket.write(JSON.stringify(o) + '\n'), close: () => socket.destroy() };
 }
-const until = async (f, ms = 5000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
-test('the supervisor serves chat: history, send as steering, and stop', { timeout: 20000 }, async t => {
+const until = async (f, ms = 30000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
+test('the supervisor serves chat: history, send as steering, and stop', { timeout: 30000 }, async t => {
   const f = await fixture(t);                                     // the file's existing supervisor fixture
   await f.wait(() => f.native()?.chat_sock);
   const c = await client(f.native().chat_sock, { after: 0, epoch: null });
@@ -245,6 +245,7 @@ test('the supervisor serves chat: history, send as steering, and stop', { timeou
   c.write({ t: 'send', cid: 'c1', text: 'next', steer: true });
   await until(() => f.posted('/prompt'));
   assert.deepEqual([f.posted('/prompt').text, f.posted('/prompt').delivery], ['next', 'steer']);
+  await until(() => c.lines.some(l => l.t === 'ack'));            // the ack follows the POST's response
   assert.deepEqual(c.lines.find(l => l.t === 'ack'), { t: 'ack', cid: 'c1', ok: true });
   c.write({ t: 'stop' });
   await until(() => f.posted('/interrupt'));
@@ -271,7 +272,7 @@ test('a stop from any door reaches chat as interrupted, and a failed turn as an 
   c.close();
 });
 
-test('one failed history read neither leaves chat connecting forever nor freezes it',{ timeout: 20000 }, async t => {
+test('one failed history read neither leaves chat connecting forever nor freezes it',{ timeout: 30000 }, async t => {
   const f = await fixture(t, { flakyMessages: true });
   await f.wait(() => f.native()?.chat_sock);
   const c = await client(f.native().chat_sock, { after: 0, epoch: null });

@@ -457,6 +457,7 @@ pub async fn resume(
 mod tests {
     use super::*;
     use crate::host::{cmd::Runner, init::Host, log::LogBuffer, sample::Sampler};
+    use crate::chat::tmux_io::tests::install_stub;
     use std::os::unix::fs::PermissionsExt;
 
     fn fixture(tag: &str, installed: bool) -> (std::path::PathBuf, Arc<Ctx>) {
@@ -474,9 +475,7 @@ mod tests {
             programs.push(("opencode", "#!/bin/sh\necho opencode v2.1.4\n".to_string()));
         }
         for (name, body) in programs {
-            let file = dir.join("bin").join(name);
-            std::fs::write(&file, body).unwrap();
-            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install_stub(&dir, name, &body);
         }
         let log = Arc::new(LogBuffer::new());
         let path = dir.join("bin").to_string_lossy().into_owned();
@@ -569,11 +568,7 @@ mod tests {
     async fn unsupported_opencode_version_is_rejected_before_tmux() {
         let (dir, ctx) = fixture("version", true);
         for version in ["opencode v1.9.0", "opencode v2.1.3", "opencode v3.0.0"] {
-            std::fs::write(
-                dir.join("bin/opencode"),
-                format!("#!/bin/sh\necho {version}\n"),
-            )
-            .unwrap();
+            install_stub(&dir, "opencode", &format!("#!/bin/sh\necho {version}\n"));
             assert!(
                 launch(&ctx, dir.to_str().unwrap(), "nvidia/model", None, None)
                     .await

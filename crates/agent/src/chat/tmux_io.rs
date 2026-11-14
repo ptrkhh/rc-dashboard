@@ -81,22 +81,25 @@ pub(crate) mod tests {
     /// A stub `tmux` that appends its arguments to `<dir>/tmux-args`, prints
     /// `answer` and exits with `exit`. Returns the directory holding it.
     pub(crate) fn stub_tmux(dir: &std::path::Path, answer: &str, exit: i32) -> String {
+        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/tmux-args'\necho '{answer}'\nexit {exit}\n", dir.display());
+        install_stub(dir, "tmux", &script)
+    }
+
+    /// Install an executable `name` running `script` into `<dir>/bin` and
+    /// return that directory. The file is written by a child and renamed into
+    /// place: a write fd held in this process can leak into another test's
+    /// fork and make exec fail with ETXTBSY, and a rename never disturbs a
+    /// stub that is running (so re-stubbing in place is safe too).
+    pub(crate) fn install_stub(dir: &std::path::Path, name: &str, script: &str) -> String {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let src = dir.join("tmux.src");
-        std::fs::write(
-            &src,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/tmux-args'\necho '{answer}'\nexit {exit}\n", dir.display()),
-        )
-        .unwrap();
-        // Written by a child and renamed into place: a write fd held in this
-        // process can leak into another test's fork and make exec fail with
-        // ETXTBSY, and a rename never disturbs a stub that is running.
+        let src = dir.join(format!("{name}.src"));
+        std::fs::write(&src, script).unwrap();
         #[allow(clippy::disallowed_types)] // test-only fixture setup
         let ok = std::process::Command::new("sh")
             .args(["-c", "cp \"$1\" \"$2.new\" && chmod 755 \"$2.new\" && mv -f \"$2.new\" \"$2\"", "sh"])
             .arg(&src)
-            .arg(bin.join("tmux"))
+            .arg(bin.join(name))
             .status()
             .unwrap()
             .success();
@@ -145,7 +148,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    pub(crate) async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
         for _ in 0..300 {
             if f() {
                 return;

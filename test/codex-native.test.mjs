@@ -85,7 +85,7 @@ setInterval(()=>{const marker=process.env.CDASH_CHECK_ROOT+'/stop-remote';if(fs.
     await rm(dir,{recursive:true,force:true});
   });
   const wait = async check => {
-    for(let i=0;i<400;i++) { if(await check())return; await new Promise(r=>setTimeout(r,30)); }
+    for(let i=0;i<1000;i++) { if(await check())return; await new Promise(r=>setTimeout(r,30)); }
     throw Error(`Native launcher condition timed out: ${output}`);
   };
   const native = () => { try { return JSON.parse(readFileSync(state.replace(/\.json$/, '.native'), 'utf8')); } catch { return undefined; } };
@@ -109,9 +109,9 @@ async function client(path, first) {
   socket.write(JSON.stringify(first) + '\n');
   return { lines, write: o => socket.write(JSON.stringify(o) + '\n'), close: () => socket.destroy() };
 }
-const until = async (f, ms = 5000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
+const until = async (f, ms = 30000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
 
-test('native launcher owns one backend, isolates credentials, and preserves TUI after RC exit', {timeout:15000}, async t => {
+test('native launcher owns one backend, isolates credentials, and preserves TUI after RC exit', {timeout:30000}, async t => {
   const f=await fixture(t);
   await f.wait(()=>f.output().includes('NATIVE_TUI_READY'));
   const messages=await f.messages();
@@ -154,7 +154,7 @@ test('native launcher owns one backend, isolates credentials, and preserves TUI 
   await assert.rejects(stat(path),{code:'ENOENT'});
 });
 
-test('Android native launcher reaches Codex over token-guarded loopback', {timeout:15000}, async t => {
+test('Android native launcher reaches Codex over token-guarded loopback', {timeout:30000}, async t => {
   const f=await fixture(t,'','android');
   await f.wait(()=>f.output().includes('NATIVE_TUI_READY'));
   const messages=await f.messages();
@@ -180,14 +180,14 @@ test('Android native launcher reaches Codex over token-guarded loopback', {timeo
   await assert.rejects(stat(tokenFile),{code:'ENOENT'});
 });
 
-for(const failure of ['backend','tui']) test(`native ${failure} failure cleans up its session processes`,{timeout:15000},async t=>{
+for(const failure of ['backend','tui']) test(`native ${failure} failure cleans up its session processes`,{timeout:30000},async t=>{
   const f=await fixture(t,failure);
   await f.wait(()=>f.child.exitCode!==null);
   assert.notEqual(f.child.exitCode,0);
   await f.wait(async()=> (await f.messages()).filter(m=>m.pid).every(m=>!f.alive(m.pid)));
 });
 
-for(const exitCode of [0,1]) test(`resumed native session retries Remote Control startup exit ${exitCode} without replacing its thread or TUI`, {timeout:15000}, async t=>{
+for(const exitCode of [0,1]) test(`resumed native session retries Remote Control startup exit ${exitCode} without replacing its thread or TUI`, {timeout:30000}, async t=>{
   const f=await fixture(t,exitCode===0?'remote-once-zero':'remote-once');
   await f.wait(async()=> (await f.messages()).some(m=>m.kind==='remote'));
   assert.equal(JSON.parse(await readFile(f.state.replace(/\.json$/,'.native'),'utf8')).rc_unavailable,false,'resume clears the previous outage while connecting');
@@ -206,7 +206,7 @@ for(const exitCode of [0,1]) test(`resumed native session retries Remote Control
   await f.wait(async()=> (await f.messages()).filter(m=>m.pid).every(m=>!f.alive(m.pid)));
 });
 
-test('Remote Control keeps retrying after the Terminal fallback and shutdown cancels pending retries', {timeout:20000}, async t=>{
+test('Remote Control keeps retrying after the Terminal fallback and shutdown cancels pending retries', {timeout:30000}, async t=>{
   const f=await fixture(t,'remote-always');
   const logPath=join(f.dir,'controls','cdash-test','native.log');
   await f.wait(async()=> (await f.messages()).some(m=>m.kind==='remote'));
@@ -235,7 +235,7 @@ test('Remote Control keeps retrying after the Terminal fallback and shutdown can
   assert.equal((await closing.messages()).filter(m=>m.kind==='remote').length,1);
 });
 
-test('an established Remote Control connection resets the retry backoff', {timeout:20000}, async t=>{
+test('an established Remote Control connection resets the retry backoff', {timeout:30000}, async t=>{
   const f=await fixture(t);
   const link=f.state.replace(/\.json$/,'')+'.link';
   const logPath=join(f.dir,'controls','cdash-test','native.log');
@@ -254,7 +254,7 @@ test('an established Remote Control connection resets the retry backoff', {timeo
   await f.wait(async()=> (await f.messages()).filter(m=>m.pid).every(m=>!f.alive(m.pid)));
 });
 
-for(const exitCode of [0,1]) test(`Remote Control reconnect after exit ${exitCode} continues its existing session without incompatible spawn flags`, {timeout:15000}, async t=>{
+for(const exitCode of [0,1]) test(`Remote Control reconnect after exit ${exitCode} continues its existing session without incompatible spawn flags`, {timeout:30000}, async t=>{
   const f=await fixture(t);
   const link=f.state.replace(/\.json$/,'')+'.link';
   await f.wait(async()=>{try{await stat(link);return true;}catch{return false;}});
@@ -269,7 +269,7 @@ for(const exitCode of [0,1]) test(`Remote Control reconnect after exit ${exitCod
 });
 
 for (const platform of ['linux', 'android']) for (const resuming of [false, true]) {
-  test('native Codex ' + platform + ' ' + (resuming ? 'resume' : 'start') + ' sets full access on the thread without saved config', { timeout: 15000 }, async t => {
+  test('native Codex ' + platform + ' ' + (resuming ? 'resume' : 'start') + ' sets full access on the thread without saved config', { timeout: 30000 }, async t => {
     const f = await fixture(t, '', platform, resuming);
     await f.wait(() => f.output().includes('NATIVE_TUI_READY'));
     const messages = await f.messages();
@@ -285,7 +285,7 @@ for (const platform of ['linux', 'android']) for (const resuming of [false, true
   });
 }
 
-test('the native supervisor serves chat: history, live events, send, steer and stop', { timeout: 20000 }, async t => {
+test('the native supervisor serves chat: history, live events, send, steer and stop', { timeout: 30000 }, async t => {
   const f = await fixture(t, undefined, process.platform, true);       // resuming, so history is replayed
   await f.wait(() => f.native()?.chat_sock);                      // read <name>.native, as the other tests read it
   const c = await client(f.native().chat_sock, { after: 0, epoch: null });

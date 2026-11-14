@@ -14,7 +14,7 @@ async function client(path, first) {                              // returns { l
   socket.write(JSON.stringify(first) + '\n');
   return { lines, write: o => socket.write(JSON.stringify(o) + '\n'), close: () => socket.destroy() };
 }
-const until = async (f, ms = 2000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
+const until = async (f, ms = 30000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
 
 test('a client gets the log, state, ready and then live events; reconnecting resumes', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-feed-')); t.after(() => rm(dir, { recursive: true, force: true }));

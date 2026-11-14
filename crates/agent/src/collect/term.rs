@@ -312,6 +312,7 @@ pub async fn bridge(ctx: Arc<Ctx>, name: String, cols: u16, rows: u16, mut ws: W
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::tmux_io::tests::eventually;
 
     #[test]
     fn origin_allows_what_only_the_dashboard_itself_can_send() {
@@ -536,16 +537,6 @@ mod tests {
         })
         .await
         .expect("no close frame within 30 s")
-    }
-
-    async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-        for _ in 0..300 {
-            if f() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("never happened: {what}");
     }
 
     #[tokio::test]

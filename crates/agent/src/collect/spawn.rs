@@ -351,20 +351,11 @@ mod tests {
     /// A stub `tmux` whose exit status the test chooses, so both sides of the
     /// checked-subprocess branch are reachable without a real tmux server.
     fn stub_tmux(dir: &Path, exit: i32) -> String {
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let p = bin.join("tmux");
-        std::fs::write(
-            &p,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/tmux-args'\necho 4242\nexit {exit}\n",
-                dir.display()
-            ),
+        crate::chat::tmux_io::tests::install_stub(
+            dir,
+            "tmux",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/tmux-args'\necho 4242\nexit {exit}\n", dir.display()),
         )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bin.to_string_lossy().into_owned()
     }
 
     async fn ctx_with_tmux(claude_dir: PathBuf, exit: i32) -> Arc<Ctx> {

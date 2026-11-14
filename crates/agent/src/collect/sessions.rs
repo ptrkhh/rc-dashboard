@@ -369,10 +369,8 @@ mod tests {
     fn ctx_for(claude_dir: PathBuf) -> Arc<Ctx> {
         let log = Arc::new(LogBuffer::new());
         // Summary jobs must never reach real provider subscriptions from unit tests.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(claude_dir.join("node"), "#!/bin/sh\necho '{\"error\":\"test\"}'\n").unwrap();
-        std::fs::set_permissions(claude_dir.join("node"), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let path = format!("{}:{}", claude_dir.display(), std::env::var("PATH").unwrap_or_default());
+        let bin = crate::chat::tmux_io::tests::install_stub(&claude_dir, "node", "#!/bin/sh\necho '{\"error\":\"test\"}'\n");
+        let path = format!("{bin}:{}", std::env::var("PATH").unwrap_or_default());
         let host = crate::host::init::Host {
             runner: crate::host::cmd::Runner::new(path.clone(), Arc::clone(&log)),
             log,
@@ -614,16 +612,10 @@ mod tests {
     /// `collect_sessions` can be exercised without a real server. Without this
     /// the whole pane loop — the majority of the function — has no test at all.
     fn fake_tmux(dir: &Path, pane_line: &str) -> String {
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n  list-panes) echo '{pane_line}' ;;\n  *) echo '' ;;\nesac\n"
         );
-        let p = bin.join("tmux");
-        std::fs::write(&p, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bin.to_string_lossy().into_owned()
+        crate::chat::tmux_io::tests::install_stub(dir, "tmux", &script)
     }
 
     fn ctx_with_path(claude_dir: PathBuf, path: String) -> Arc<Ctx> {
