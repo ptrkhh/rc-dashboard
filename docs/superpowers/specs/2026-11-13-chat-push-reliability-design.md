@@ -332,6 +332,8 @@ transcript. Fix only what crosses its threshold.
 | View runs `JSON.stringify` on every row each frame | frame time with 2,000 rows, Chrome with 4× CPU throttling | over 8 ms per frame | **fix**: median 17.5 ms, p95 20.5 ms at 4x CPU throttling (limit 8 ms); at 1x median 9.6 ms, p95 15.3 ms. Method: `test/perf/chat-frame.html` in headless Chrome (Playwright `chrome-headless-shell`) over the DevTools protocol with `Emulation.setCPUThrottlingRate 4`, 2,000 rows (2,667 `ev` frames), 200 `state` frames 50 ms apart, `render` callback timed |
 
 After Task 26 (row signatures instead of `JSON.stringify`), same harness, 4x throttling, two runs: median 12.2 and 11.8 ms, p95 15.3 and 14.8 ms (was 17.5 / 20.5). Still over the 8 ms limit: the remaining cost is `rows()` rebuilding all 2,000 rows from the events on every frame.
+
+After memoizing `rows()` (reused while the events, streams and own messages hold still), same harness, two runs: median 2.3 and 2.4 ms, p95 3.5 and 3.8 ms. Under the 8 ms limit.
 | `hub_for` holds the global lock across tmux calls | added latency of opening chat while the notifier creates hubs for 10 sessions | p95 over 100 ms | **no fix**: p95 40-50 ms (limit 100 ms; max 42-119 ms). Method: `perf_hub_for_latency`, private tmux server, 11 `sleep 600` sessions, 50 `hub_for` calls 10 ms apart while `ensure_hubs` creates the rest, 2 runs |
 
 The fixes, if needed:

@@ -108,3 +108,19 @@ test('every row carries a signature that changes when what the view shows change
   assert.equal(after[0], before[0], 'an unchanged row keeps its signature');
   for (const i of [1, 2, 3]) assert.notEqual(after[i], before[i], i);
 });
+
+test('rows are reused until something they show changes', () => {
+  let s = feed([hello(), ev(1, prompt('u1', 'hi')), { t: 'state', working: false, waiting: false, ended: false, held: [] }]);
+  const a = S.rows(s);
+  assert.equal(S.rows(s), a, 'same array with no change');
+  s = S.apply(s, { t: 'state', working: true, waiting: true, ended: false, held: [] });
+  assert.equal(S.rows(s), a, 'a working/waiting-only state reuses the rows');
+  s = S.apply(s, ev(2, prompt('u2', 'again')));
+  const b = S.rows(s);
+  assert.notEqual(b, a);
+  assert.equal(b.length, 2);
+  S.addMine(s, 'c1', 'mine');
+  assert.equal(S.rows(s).length, 3, 'a new own message recomputes');
+  s = S.apply(s, { t: 'delta', id: 'm9', text: 'x' });
+  assert.equal(S.rows(s).length, 4, 'a delta recomputes');
+});

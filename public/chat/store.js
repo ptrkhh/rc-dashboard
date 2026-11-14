@@ -8,6 +8,7 @@
     events: new Map(),   // seq -> event
     streams: new Map(),  // message id -> text so far (deltas, never stored server-side)
     mine: [],            // {cid, text, status, error, seq}; seq set once an event showed it
+    rev: 0,              // bumped by whatever rows() reads; rows() is reused while it holds still
     forgetHeld: false,   // after a reset, the next state frame says which held ones survived
   });
 
@@ -48,6 +49,7 @@
   }
 
   function apply(s, f) {
+    if (f?.t !== 'state') s.rev++;  // a state frame bumps it below, only when it changes `mine`
     switch (f?.t) {
       case 'hello':
         if (f.reset || f.epoch !== s.epoch) { clearConversation(s); s.first = f.first; }
@@ -78,8 +80,10 @@
           // Held rows the agent no longer lists: the session ended, the agent lost its queue, or they left it elsewhere.
           const ids = new Set(s.held.map(h => h.id));
           const gone = m => m.status === 'held' && !ids.has(m.heldId);
-          for (const m of s.mine) if (gone(m) && (s.ended || s.forgetHeld)) { m.status = 'refused'; m.error = s.ended ? 'session ended' : 'not sent'; }
+          for (const m of s.mine) if (gone(m) && (s.ended || s.forgetHeld)) { m.status = 'refused'; m.error = s.ended ? 'session ended' : 'not sent'; s.rev++; }
+          const n = s.mine.length;
           s.mine = s.mine.filter(m => m.status !== 'held' || ids.has(m.heldId));
+          if (s.mine.length !== n) s.rev++;
           s.forgetHeld = false;
         }
         break;
@@ -99,6 +103,7 @@
 
   function addMine(s, cid, text) {
     s.mine.push({ cid, text, status: 'sending', seq: null });
+    s.rev++;
     return s;
   }
 
@@ -119,6 +124,11 @@
     : name + ' ×' + calls.length;
 
   function rows(s) {
+    if (s.memo?.rev !== s.rev) s.memo = { rev: s.rev, rows: build(s) };
+    return s.memo.rows;
+  }
+
+  function build(s) {
     const seqs = [...s.events.keys()].sort((a, b) => a - b);
     const gone = new Set();
     for (const q of seqs) { const e = s.events.get(q); if (e.type === 'cdash' && e.subtype === 'retract') gone.add(e.uuid); }
