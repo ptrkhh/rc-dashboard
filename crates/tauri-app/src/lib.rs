@@ -339,11 +339,12 @@ async fn notify_set(app: tauri::AppHandle, on: bool) -> Result<(), String> {
             notify::register_aumid(&app, false)?;
             return Ok(());
         }
-        #[cfg(windows)]
-        notify::register_aumid(&app, true)?;
         if app.notification().request_permission().map_err(|e| e.to_string())? == PermissionState::Denied {
             return Err("notifications are blocked for this app".into());
         }
+        // After the permission check, so a refusal never leaves the key behind.
+        #[cfg(windows)]
+        notify::register_aumid(&app, true)?;
         state.start(app.clone());
         Ok(())
     }
@@ -405,8 +406,20 @@ fn profile_delete<R: tauri::Runtime>(
     store.save().map_err(|e| format!("cannot persist profiles: {e}"))
 }
 
+/// Nothing in the page reloads on a profile switch, so a running notification
+/// watcher is restarted to read the new agent's stream.
 #[tauri::command]
-fn profile_activate<R: tauri::Runtime>(
+fn profile_activate(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    activate_profile(app.clone(), name)?;
+    #[cfg(desktop)]
+    {
+        use tauri::Manager;
+        app.state::<notify::NotifyState>().restart(app.clone());
+    }
+    Ok(())
+}
+
+fn activate_profile<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     name: String,
 ) -> Result<(), String> {
@@ -1065,8 +1078,8 @@ mod tests {
 
         profile_save(handle.clone(), input("local")).unwrap();
         profile_save(handle.clone(), input("remote")).unwrap();
-        profile_activate(handle.clone(), "remote".into()).unwrap();
-        assert!(profile_activate(handle.clone(), "ghost".into()).is_err());
+        activate_profile(handle.clone(), "remote".into()).unwrap();
+        assert!(activate_profile(handle.clone(), "ghost".into()).is_err());
 
         let listed = profiles_list(handle.clone()).unwrap();
         assert_eq!(listed.len(), 2);

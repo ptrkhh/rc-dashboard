@@ -39,8 +39,8 @@ tauri-plugin-notification = "2.6"
 tokio = { version = "1", features = ["time"] }
 
 # "test" only unifies into dev/test builds; release binaries never see it.
-# tokio is here and not above because nothing outside #[tokio::test] uses it —
-# tauri brings its own runtime and reqwest brings its own tokio features.
+# The test-only tokio features (runtime, macros) live here; the desktop
+# dependency above adds `time` for the notification watcher.
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

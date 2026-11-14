@@ -145,6 +145,13 @@ impl NotifyState {
         }
     }
 
+    /// Restarts the watcher if one is running (the active profile changed).
+    pub fn restart(&self, app: AppHandle) {
+        if self.inner().watcher.is_some() {
+            self.start(app);
+        }
+    }
+
     pub fn start(&self, app: AppHandle) {
         let mut g = self.inner();
         if let Some(h) = g.watcher.take() {
