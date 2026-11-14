@@ -33,7 +33,9 @@ pub fn cache_root() -> PathBuf {
     std::env::temp_dir().join(format!("cdash-test-{}", std::process::id())).join("cdash")
 }
 
+/// `session` must be one plain path component (pane names are `cdash-[A-Za-z0-9_-]+`).
 pub fn uploads_dir(session: &str) -> PathBuf {
+    assert!(!session.is_empty() && session != ".." && session != "." && !session.contains(['/', '\\', '\0']), "bad session name");
     cache_root().join("uploads").join(session)
 }
 pub fn media_dir() -> PathBuf {
@@ -42,7 +44,7 @@ pub fn media_dir() -> PathBuf {
 
 /// Create `dir`, then set 0700 on it and on every folder up to the cache root.
 pub(crate) fn private_dirs(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700).create(dir)?;
     let root = cache_root();
     for d in dir.ancestors().take_while(|d| d.starts_with(&root)) {
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
@@ -84,13 +86,15 @@ pub fn sanitize_name(raw: &str) -> String {
         return clean.into();
     }
     match clean.rfind('.').filter(|i| (2..=17).contains(&(clean.len() - i))) {
-        Some(i) => format!("{}{}", &clean[..i.min(100 - (clean.len() - i))], &clean[i..]),
-        None => clean[..100].into(),
+        Some(i) => format!("{}{}", clean[..i.min(100 - (clean.len() - i))].trim_end(), &clean[i..]),
+        None => clean[..100].trim_end().into(),
     }
 }
 
-/// `name` with its extension replaced by `ext`, at most 100 bytes.
-pub fn image_name(name: &str, ext: &str) -> String {
+/// `name` with its extension replaced by `ext`, at most 100 bytes. `name` must
+/// come from `sanitize_name` (ASCII, so the byte cut is safe).
+#[allow(dead_code)] // first caller arrives with the upload frames (Task 3)
+pub(crate) fn image_name(name: &str, ext: &str) -> String {
     let stem = name.rfind('.').map_or(name, |i| &name[..i]);
     format!("{}.{ext}", &stem[..stem.len().min(99 - ext.len())])
 }
@@ -100,9 +104,13 @@ pub fn stash(bytes: &[u8], mime: &str) -> std::io::Result<String> {
     let ext = image_ext(mime).filter(|_| sniff(bytes) == Some(mime)).ok_or_else(|| Error::new(ErrorKind::InvalidData, "not an image"))?;
     let r = format!("{:x}", Sha256::digest(bytes));
     let target = media_dir().join(format!("{r}.{ext}"));
-    if target.exists() {
-        std::fs::File::options().write(true).open(&target)?.set_modified(SystemTime::now())?;
-        return Ok(r);
+    match std::fs::File::options().write(true).open(&target) {
+        Ok(f) => {
+            f.set_modified(SystemTime::now())?;
+            return Ok(r);
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     private_dirs(&media_dir())?;
     static N: AtomicU64 = AtomicU64::new(0);
@@ -120,25 +128,33 @@ pub fn stash(bytes: &[u8], mime: &str) -> std::io::Result<String> {
 }
 
 fn older(p: &Path, max_age: Duration) -> bool {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|e| e > max_age)
+    std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|e| e > max_age)
 }
 
 pub(crate) fn sweep_in(root: &Path, max_age: Duration) {
-    let dirs = |p: &Path| std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| e.path()).collect::<Vec<_>>();
-    for session in dirs(&root.join("uploads")) {
-        let ids = dirs(&session);
+    // `file_type` does not follow links: only real folders are entered, and a link is removed itself, never its target.
+    let entries = |p: &Path| {
+        std::fs::read_dir(p).into_iter().flatten().flatten().filter_map(|e| Some((e.path(), e.file_type().ok()?))).collect::<Vec<_>>()
+    };
+    for (session, ft) in entries(&root.join("uploads")) {
+        if !ft.is_dir() {
+            continue;
+        }
+        let ids = entries(&session);
         if ids.is_empty() {
             if older(&session, max_age) {
                 let _ = std::fs::remove_dir(&session);
             }
             continue;
         }
-        for id in ids.into_iter().filter(|id| older(id, max_age)) {
+        for (id, _) in ids.into_iter().filter(|(id, ft)| ft.is_dir() && older(id, max_age)) {
             let _ = std::fs::remove_dir_all(id);
         }
     }
-    for f in dirs(&root.join("media")).into_iter().filter(|f| older(f, max_age)) {
-        let _ = std::fs::remove_file(f);
+    for (f, ft) in entries(&root.join("media")) {
+        if !ft.is_dir() && older(&f, max_age) {
+            let _ = std::fs::remove_file(f);
+        }
     }
 }
 
@@ -223,6 +239,7 @@ pub(crate) mod tests {
         for (bytes, mime) in [(&b"plain text"[..], "image/png"), (&png[..], "image/jpeg"), (&b"%PDF-1.7"[..], "application/pdf")] {
             assert_eq!(stash(bytes, mime).unwrap_err().kind(), std::io::ErrorKind::InvalidData, "{mime}");
         }
+        let _ = std::fs::remove_dir_all(cache_root().parent().unwrap());
     }
     #[test]
     fn the_sweep_removes_what_has_not_been_touched_for_the_limit() {
@@ -238,6 +255,7 @@ pub(crate) mod tests {
         assert!(!root.join("uploads/cdash-b").exists() && root.join("uploads/cdash-c").exists(), "only old empty session folders go");
         assert!(!old_media.exists() && new_media.exists());
         sweep_in(&root.join("missing"), MAX_AGE); // nothing there, no panic
+        let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn trailing_attached_lines_for_uploads_become_file_entries_and_nothing_else_does() {
@@ -250,5 +268,51 @@ pub(crate) mod tests {
         for kept in ["Attached: /etc/passwd".to_string(), "Attached: rel/cdash/uploads/x".into(), format!("Attached: {pdf}\nthen more")] {
             assert_eq!(split_attached(&kept), (kept.clone(), vec![]), "{kept}");
         }
+    }
+
+    #[test]
+    fn the_sweep_never_follows_a_link_out_of_the_cache() {
+        let base = std::env::temp_dir().join(format!("cdash-sweep-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, outside) = (base.join("root"), base.join("outside"));
+        std::fs::create_dir_all(outside.join("id")).unwrap();
+        std::fs::create_dir_all(root.join("uploads")).unwrap();
+        std::fs::create_dir_all(root.join("media")).unwrap();
+        let victim = outside.join("id/x.txt");
+        std::fs::write(&victim, "x").unwrap();
+        let secret = outside.join("secret.png");
+        std::fs::write(&secret, "x").unwrap();
+        let old = MAX_AGE + Duration::from_secs(3600);
+        for p in [&victim, &outside.join("id"), &secret] { age(p, old); }
+        std::os::unix::fs::symlink(&outside, root.join("uploads/link")).unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("media/s.png")).unwrap();
+        sweep_in(&root, Duration::ZERO);
+        assert!(victim.exists() && secret.exists(), "targets survive");
+        assert!(root.join("uploads/link").exists(), "a linked session folder is skipped");
+        assert!(std::fs::symlink_metadata(root.join("media/s.png")).is_err(), "the link itself goes");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    #[test]
+    fn the_sweep_keeps_an_old_session_folder_with_fresh_ids_and_skips_stray_files() {
+        let root = std::env::temp_dir().join(format!("cdash-sweep-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fresh = root.join("uploads/cdash-a/fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let stray = root.join("uploads/cdash-a/stray.txt");
+        std::fs::write(&stray, "x").unwrap();
+        let old = MAX_AGE + Duration::from_secs(3600);
+        age(&root.join("uploads/cdash-a"), old);
+        age(&stray, old);
+        sweep_in(&root, MAX_AGE);
+        assert!(fresh.exists() && stray.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    #[should_panic(expected = "bad session name")]
+    fn a_session_name_with_a_slash_is_refused() { uploads_dir("../x"); }
+    #[test]
+    fn a_trimmed_long_name_never_ends_in_a_space() {
+        let n = sanitize_name(&format!("{} {}.pdf", "a".repeat(95), "b".repeat(20)));
+        assert!(n.len() <= 100 && n.ends_with(".pdf") && !n.contains(" .pdf"), "{n:?}");
     }
 }
