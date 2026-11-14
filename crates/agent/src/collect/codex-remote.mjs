@@ -32,6 +32,9 @@ function killGroup(child) {
   setTimeout(() => kill('SIGKILL'), 250);
 }
 
+// True for the main conversation's notifications (or when no thread is pinned yet).
+const mainThread = (m, sid) => !sid || !m.params?.threadId || m.params.threadId === sid;
+
 class Codex {
   pending = new Map();
   id = 0;
@@ -65,8 +68,8 @@ class Codex {
       } else {
         // Track turn state before uploads: a slow HTTP reply must not leave a
         // stale turn ID steering the next prompt into an already completed turn.
-        if (m.method === 'turn/started') { this.turnEpoch++; this.turnId = m.params.turn.id; }
-        if (m.method === 'turn/completed') { this.turnEpoch++; if (this.turnId === m.params.turn.id) this.turnId = undefined; }
+        if (m.method === 'turn/started' && mainThread(m, this.thread)) { this.turnEpoch++; this.turnId = m.params.turn.id; }
+        if (m.method === 'turn/completed' && mainThread(m, this.thread)) { this.turnEpoch++; if (this.turnId === m.params.turn.id) this.turnId = undefined; }
         notifications = notifications.then(() => onEvent(m));
         notifications.catch(onError);
       }
@@ -531,6 +534,9 @@ async function nativeLauncher(statePath, state, script) {
   };
   control = new Codex(async m => {
     const p = m.params || {};
+    if (m.id != null && m.method) feed.setState({ waiting: true }); // a server request: an approval or a question
+    if (m.method === 'serverRequest/resolved') feed.setState({ waiting: false });
+    if (!mainThread(m, state.sid)) return; // a subagent's turns and items are not this conversation; its questions (above) still are
     if (state.sid) {
       const chat = chatMessages(m, state.sid);
       if (replayed) replayed.push(...chat); else for (const msg of chat) feed.accept(msg);
@@ -538,8 +544,6 @@ async function nativeLauncher(statePath, state, script) {
     if (m.method === 'item/agentMessage/delta') feed.delta(p.itemId, p.delta);
     if (m.method === 'turn/started') feed.setState({ working: true });
     if (m.method === 'turn/completed') feed.setState({ working: false, waiting: false });
-    if (m.id != null && m.method) feed.setState({ waiting: true }); // a server request: an approval or a question
-    if (m.method === 'serverRequest/resolved') feed.setState({ waiting: false });
     if (m.method === 'thread/settings/updated') {
       state.model = p.threadSettings.model;
       state.effort = p.threadSettings.effort;
@@ -561,6 +565,7 @@ async function nativeLauncher(statePath, state, script) {
     ...(state.model ? { model: state.model } : {}), config: { model_reasoning_effort: state.effort },
   });
   state.sid = result.thread.id;
+  control.thread = state.sid;
   state.model = result.model;
   state.effort = result.reasoningEffort;
   state.working = Boolean(control.turnId);

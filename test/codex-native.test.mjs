@@ -316,3 +316,24 @@ test('the native supervisor serves chat: history, live events, send, steer and s
   c.close();
   assert.ok(!String(f.output()).includes('"t":"'), 'no feed frame leaked onto the TUI');
 });
+
+test('a subagent thread never reaches the conversation, the working state or the turn id', { timeout: 30000 }, async t => {
+  const f = await fixture(t, undefined, process.platform, true);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const main = '01234567-1234-1234-1234-0123456789ab', child = '89abcdef-0000-4000-8000-000000000000';
+  await f.inject({ method: 'turn/started', params: { threadId: main, turn: { id: 't2' } } });
+  await f.inject({ method: 'turn/started', params: { threadId: child, turn: { id: 'c1' } } });
+  await f.inject({ method: 'item/completed', params: { threadId: child, turnId: 'c1', item: { id: 'ci', type: 'agentMessage', text: 'child says', phase: 'final' } } });
+  await f.inject({ method: 'turn/completed', params: { threadId: child, turn: { id: 'c1', status: 'completed' } } });
+  await f.inject({ id: 77, method: 'item/tool/requestUserInput', params: { threadId: child, turnId: 'c1', itemId: 'q', questions: [] } });
+  await until(() => c.lines.some(l => l.t === 'state' && l.waiting === true));   // a subagent's question still needs an answer
+  assert.ok(!c.lines.some(l => l.t === 'ev' && JSON.stringify(l.ev).includes('child says')));
+  assert.ok(!c.lines.some(l => l.t === 'ev' && l.ev.type === 'result'), "the child's turn end is not the main turn's");
+  assert.equal(c.lines.findLast(l => l.t === 'state').working, true);
+  c.write({ t: 'send', cid: 'c1', text: 'steer me', steer: true });
+  await until(() => f.rpc('turn/steer'));
+  assert.equal(f.rpc('turn/steer').params.expectedTurnId, 't2');
+  c.close();
+});
