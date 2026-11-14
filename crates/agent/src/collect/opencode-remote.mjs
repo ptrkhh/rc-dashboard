@@ -417,6 +417,7 @@ async function supervise(statePath, name) {
     chatDir = await mkdtemp(join(tmpdir(), 'cdash-opencode-'));
     const chatState = { sid: state.sid, model: state.model, variant: state.variant, remote_inputs: {} };
     const sessionPath = '/api/session/' + encodeURIComponent(state.sid);
+    let bridge; // the running ChatBridge
     const forms = new Map(); // form id -> form shown as a card, shared by every ChatBridge
     const publishSettings = () => feed.setSettings({ model: chatState.model, effort: null, plan: null, agent: chatState.agent ?? null, variant: chatState.variant ?? null });
     const dropForm = id => { forms.delete(id); feed.dropAsk(id); };
@@ -429,7 +430,7 @@ async function supervise(statePath, name) {
         const form = forms.get(id);
         if (!form) throw new Error('already answered');
         try { await client.request(`${sessionPath}/form/${encodeURIComponent(id)}/reply`, { method: 'POST', body: { answer: formAnswer(form, answer?.answers) } }); }
-        catch (error) { if (error.status === 409 || error.status === 404) { dropForm(id); throw new Error('already answered'); } throw error; }
+        catch (error) { if (error.status === 409 || error.status === 404) { dropForm(id); bridge?.forms.delete(id); bridge?.syncPermissions().catch(() => {}); throw new Error('already answered'); } throw error; }
         dropForm(id);
       },
       set: async ({ what, value }) => {
@@ -462,7 +463,7 @@ async function supervise(statePath, name) {
       ops,
       send: async (text, { cid }) => {
         const [, name, rest = ''] = /^\/([A-Za-z0-9_:-]+)(?:\s+([\s\S]*))?$/.exec(text) || []; // `/usr/bin/x ...` is a prompt
-        if (name && (await commands()).some(c => c.name === name)) {
+        if (name && (await commands().catch(() => [])).some(c => c.name === name)) {
           await client.request(`${sessionPath}/command`, { method: 'POST', body: { name, text: rest.trim() } });
           return { done: true }; // the server expands the template, so no prompt row matches this cid
         }
@@ -507,7 +508,7 @@ async function supervise(statePath, name) {
       async syncForms() {
         const mine = (await list(`${this.path}/form`)).filter(form => form.sessionID === this.state.sid);
         const ids = new Set(mine.map(form => form.id));
-        for (const id of this.forms) if (!ids.has(id)) { this.forms.delete(id); dropForm(id); }
+        for (const id of new Set([...this.forms, ...forms.keys()])) if (!ids.has(id)) { this.forms.delete(id); dropForm(id); } // the shared Map outlives a replaced bridge
         for (const form of mine) await this.addForm(form);
       }
     }
@@ -530,7 +531,7 @@ async function supervise(statePath, name) {
         feed.ready();
         if (!closing) setTimeout(startChat, 2000).unref();
       };
-      new ChatBridge(client, sink, chatState, async () => {}).connect(own.signal, restart)
+      (bridge = new ChatBridge(client, sink, chatState, async () => {})).connect(own.signal, restart)
         .then(() => feed.ready(), error => restart(error));
     };
     startChat();

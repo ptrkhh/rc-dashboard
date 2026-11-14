@@ -188,6 +188,7 @@ else {
  if(path==='/api/session/active')return send(res,{data:{}});
  if(path==='/api/session'&&req.method==='POST')return send(res,{data:{id:'ses_fixture'}});
  if(path==='/api/session/ses_fixture/message'&&process.env.CDASH_TEST_FLAKY&&!fs.existsSync(process.env.CDASH_TEST_FLAKY)){fs.writeFileSync(process.env.CDASH_TEST_FLAKY,'1');return send(res,{data:'broken'});}
+ if(path==='/api/session/ses_fixture/message'&&fs.existsSync(process.env.CDASH_TEST_FAILMSG)){fs.unlinkSync(process.env.CDASH_TEST_FAILMSG);return send(res,{data:'broken'});}
  if(path==='/api/session/ses_fixture/message')return send(res,{data:[{id:'msg_u',type:'user',text:'hello'},{id:'msg_a',type:'assistant',time:{completed:1},content:[{type:'text',text:'hi there'}]}],cursor:{}});
  if(path.includes('/form/')&&path.endsWith('/reply')){res.writeHead(path.includes('/frm_done/')?409:204);return res.end();}
  if(path==='/api/command')return send(res,{data:[{name:'review',description:'Review changes'}]});
@@ -204,7 +205,7 @@ else {
 `, { mode: 0o700 });
   await writeFile(join(dir, 'claude'), `#!${process.execPath}\nprocess.exit(1);`, { mode: 0o700 });
   const child = spawn(process.execPath, [resolve('crates/agent/src/collect/opencode-remote.mjs'), '--state', state, '--name', 'cdash-fixture'], {
-    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   let output = '';
   child.stdout.on('data', b => { output += b; });
@@ -341,5 +342,17 @@ test('pickers and the menu use the session API, and listed slash commands run as
   await until(() => f.posted('/prompt')?.text === '/unknown x');
   await f.emit({ type: 'session.agent.selected', data: { sessionID: f.native().sid, agent: 'plan' } });
   await until(() => c.lines.some(l => l.t === 'settings' && l.settings.agent === 'plan'));
+  c.close();
+});
+test('a card for a form settled while the bridge restarts is dropped by the new bridge', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  await f.emit({ type: 'form.created', data: { form: form('frm_1') } });
+  await until(() => asksNow(c).length === 1);
+  await writeFile(join(f.dir, 'fail-msg'), '1');                // the next history read fails: the bridge stops and is replaced
+  await f.emit({ type: 'session.execution.succeeded', data: { sessionID: f.native().sid } });
+  await until(() => asksNow(c).length === 0);                    // GET form lists nothing: settled in the TUI meanwhile
   c.close();
 });
