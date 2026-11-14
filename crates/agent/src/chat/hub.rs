@@ -62,6 +62,10 @@ pub trait Engine: Send + Sync + 'static {
     fn history(&self, _from: u64, _to: u64) -> impl Future<Output = Result<Vec<Value>, String>> + Send {
         async { Err("not supported".to_string()) }
     }
+    /// How many clients are attached now; the hub reports each change.
+    fn watchers(&self, _n: usize) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 pub struct Subscription {
@@ -127,6 +131,7 @@ impl Hub {
             live: false,
             waiting_since: None,
             asked: false,
+            watchers: 0,
         };
         tokio::spawn(actor.run(events, rx));
         Hub { cmds }
@@ -227,6 +232,8 @@ struct Actor<E> {
     live: bool,
     waiting_since: Option<Instant>,
     asked: bool,
+    /// Attached clients the engine was last told about.
+    watchers: usize,
 }
 
 impl<E: Engine> Actor<E> {
@@ -540,6 +547,11 @@ impl<E: Engine> Actor<E> {
     }
 
     async fn tick(&mut self) {
+        let n = self.out.receiver_count();
+        if n != self.watchers {
+            self.watchers = n;
+            self.engine.watchers(n).await;
+        }
         let now = Instant::now();
         if let (true, false, true, Some(since)) = (self.live, self.asked, self.waiting, self.waiting_since) {
             if now.duration_since(since) >= ASK_AFTER && self.waiting_for.as_deref() != Some("dialog open") {
@@ -1104,5 +1116,24 @@ mod tests {
         settle().await;
         let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 101, limit: Some(50) }).await.unwrap()).unwrap();
         assert_eq!(page["more"], false, "asking again would loop on the same short page");
+    }
+
+    #[tokio::test]
+    async fn the_engine_hears_how_many_clients_are_attached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Watched(Arc<AtomicUsize>);
+        impl Engine for Watched {
+            async fn send(&self, _: &str, _: bool, _: &str) -> Result<bool, String> { Ok(false) }
+            async fn stop(&self) -> Result<(), String> { Ok(()) }
+            async fn watchers(&self, n: usize) { self.0.store(n, Ordering::Relaxed); }
+        }
+        let n = Arc::new(AtomicUsize::new(9));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(EngineMsg::Ready).await.unwrap();
+        let hub = Hub::spawn("claude", Watched(n.clone()), rx, Arc::new(crate::host::log::LogBuffer::new()), "cdash-a".into());
+        let (a, b) = (hub.subscribe(None, None).await.unwrap(), hub.subscribe(None, None).await.unwrap());
+        crate::chat::tmux_io::tests::eventually("two attached", || n.load(Ordering::Relaxed) == 2).await;
+        drop((a, b));
+        crate::chat::tmux_io::tests::eventually("none attached", || n.load(Ordering::Relaxed) == 0).await;
     }
 }

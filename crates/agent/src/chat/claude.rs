@@ -11,16 +11,25 @@ use crate::host::log::LogBuffer;
 use crate::parse::paths::project_dir_name;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::time::Instant;
 
 /// Most bytes one poll reads, so a multi-megabyte record cannot stall a tick.
 const READ_MAX: u64 = 4 * 1024 * 1024;
 const TICK: Duration = Duration::from_millis(150);
-/// `has-session` every 13th tick, about every two seconds.
-const ALIVE_EVERY: u64 = 13;
+/// How often an idle session nobody watches has its status file read.
+const SLOW_TICK: Duration = Duration::from_secs(1);
+/// How often `has-session` checks the pane is still there.
+const ALIVE_EVERY: Duration = Duration::from_secs(2);
+/// How long after the status file says idle a turn the tap still holds open
+/// keeps the fast poll. The turn end lands about 0.2 s after `idle`; a local
+/// command such as `/model` opens a turn that never ends.
+// ponytail: a turn end written later than this is read only at the next status change or attach, so its note comes late.
+const TURN_END_GRACE: Duration = Duration::from_millis(2500);
 
 /// Complete lines appended to a file since the last poll.
 pub struct Tail {
@@ -77,6 +86,9 @@ pub struct ClaudeEngine {
     name: String,
     /// The transcript of the conversation the loop follows.
     transcript: Arc<Mutex<Option<PathBuf>>>,
+    /// Clients attached to the hub; the loop reads only the status file while none are.
+    watchers: Arc<AtomicUsize>,
+    wake: Arc<Notify>,
 }
 
 impl Engine for ClaudeEngine {
@@ -118,18 +130,26 @@ impl Engine for ClaudeEngine {
             }
         }
     }
+
+    async fn watchers(&self, n: usize) {
+        self.watchers.store(n, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
 }
 
 pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Receiver<EngineMsg>) {
     let (tx, rx) = mpsc::channel(256);
     let transcript = Arc::new(Mutex::new(None));
+    let (watchers, wake) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
     let engine = ClaudeEngine {
         runner: Arc::clone(&ctx.runner),
         log: Arc::clone(&ctx.host.log),
         name: name.clone(),
         transcript: Arc::clone(&transcript),
+        watchers: Arc::clone(&watchers),
+        wake: Arc::clone(&wake),
     };
-    tokio::spawn(run(ctx, name, pid, tx, transcript));
+    tokio::spawn(run(ctx, name, pid, tx, transcript, watchers, wake));
     (engine, rx)
 }
 
@@ -141,18 +161,32 @@ struct Conv {
     ready: bool,
 }
 
-// ponytail: polls for the pane's whole life once a chat was opened; park the loop when no client is attached if it ever shows in a profile.
-async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>, transcript: Arc<Mutex<Option<PathBuf>>>) {
-    let mut tick = tokio::time::interval(TICK);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+async fn run(
+    ctx: Arc<Ctx>,
+    name: String,
+    pid: i32,
+    tx: mpsc::Sender<EngineMsg>,
+    transcript: Arc<Mutex<Option<PathBuf>>>,
+    watchers: Arc<AtomicUsize>,
+    wake: Arc<Notify>,
+) {
     let mut conv: Option<Conv> = None;
     let mut last: Option<(bool, bool, Option<String>)> = None;
     let mut blind_sent = false;
+    let mut slow = false;
+    let mut idle_since: Option<Instant> = None;
+    let mut alive_at = Instant::now();
     let target = format!("={name}");
-    for n in 1u64.. {
-        tick.tick().await;
+    loop {
+        // A client attaching wakes a slow wait at once.
+        let _ = tokio::time::timeout(if slow { SLOW_TICK } else { TICK }, wake.notified()).await;
         let file = session_file_for(&ctx.claude_dir, pid).await;
         let status = file.as_ref().and_then(|f| f.status.clone());
+        if !matches!(status.as_deref(), Some("idle" | "shell")) {
+            idle_since = None;
+        } else if idle_since.is_none() {
+            idle_since = Some(Instant::now());
+        }
         if let Some((sid, cwd)) = file.as_ref().and_then(|f| Some((f.session_id.clone()?, f.cwd.clone()?))) {
             if conv.as_ref().is_none_or(|c| c.sid != sid) {
                 // `/clear` or `/resume` gave the pane a new conversation.
@@ -166,11 +200,21 @@ async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>,
             }
         }
         if let Some(c) = conv.as_mut() {
-            let lines = match c.tail.poll().await {
-                Ok(l) => l,
-                Err(e) => {
-                    ctx.host.log.push(format!("chat read failed {name}: {e}"));
-                    Vec::new()
+            // Nobody watches and the session is idle: only the status file is
+            // read. An open turn keeps the fast poll until its end is read (or
+            // `TURN_END_GRACE` passes), so a turn end still notifies at once.
+            slow = watchers.load(Ordering::Relaxed) == 0
+                && c.ready
+                && idle_since.is_some_and(|t| !c.tap.turn_open() || t.elapsed() >= TURN_END_GRACE);
+            let lines = if slow {
+                Vec::new()
+            } else {
+                match c.tail.poll().await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        ctx.host.log.push(format!("chat read failed {name}: {e}"));
+                        Vec::new()
+                    }
                 }
             };
             let idle_read = lines.is_empty();
@@ -210,11 +254,12 @@ async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>,
                 }
             }
         }
-        if n % ALIVE_EVERY == 0
-            && ctx.runner.run_checked("tmux", &["has-session", "-t", &target], "tmux has-session").await.is_err()
-        {
-            let _ = tx.send(EngineMsg::Ended).await;
-            return;
+        if alive_at.elapsed() >= ALIVE_EVERY {
+            alive_at = Instant::now();
+            if ctx.runner.run_checked("tmux", &["has-session", "-t", &target], "tmux has-session").await.is_err() {
+                let _ = tx.send(EngineMsg::Ended).await;
+                return;
+            }
         }
     }
 }
@@ -316,6 +361,42 @@ pub(crate) mod tests {
 
     async fn next_status(rx: &mut mpsc::Receiver<EngineMsg>) -> EngineMsg {
         next_of(rx, |m| matches!(m, EngineMsg::Status { .. })).await
+    }
+
+    async fn next_ev(rx: &mut mpsc::Receiver<EngineMsg>) -> EngineMsg {
+        next_of(rx, |m| matches!(m, EngineMsg::Ev(_))).await
+    }
+
+    #[tokio::test]
+    async fn an_idle_session_nobody_watches_is_read_through_its_status_file_only() {
+        let (ctx, dir) = fixture_ctx("idle");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        let wait = |ms| Duration::from_millis(ms);
+        append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(13..14));
+        assert!(tokio::time::timeout(wait(600), next_ev(&mut rx)).await.is_err(), "slow mode skips the transcript");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy"}"#);
+        assert!(tokio::time::timeout(wait(1500), next_ev(&mut rx)).await.is_ok(), "busy: the prompt is read");
+        append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(9..10)); // the turn ends
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
+        next_ev(&mut rx).await; // its result: slow again
+        engine.watchers(1).await;
+        append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(13..14));
+        assert!(tokio::time::timeout(wait(300), next_ev(&mut rx)).await.is_ok(), "someone watches: polled as today");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_never_ends_stops_the_fast_poll_soon_after_idle() {
+        let (ctx, dir) = fixture_ctx("idle-open");
+        write_transcript(&dir, "sid-1", &fixture_lines(1..14)); // ends on a prompt, as `/model` would
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
+        let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        tokio::time::sleep(TURN_END_GRACE + Duration::from_millis(300)).await;
+        append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(14..15));
+        let read = tokio::time::timeout(Duration::from_millis(600), next_ev(&mut rx)).await;
+        assert!(read.is_err(), "past the grace the transcript is left alone");
     }
 
     #[tokio::test]
