@@ -7,6 +7,7 @@ pub mod claude;
 pub mod ece;
 pub mod hook;
 pub mod hub;
+pub mod media;
 pub mod native;
 pub mod notify;
 pub mod picker;

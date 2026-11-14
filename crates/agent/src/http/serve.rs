@@ -368,6 +368,8 @@ pub async fn serve(cfg: Config) -> std::io::Result<Bound> {
     let app = router(Arc::clone(&ctx), Arc::clone(&cfg.auth), cfg.password.clone(), cf)
         .layer(axum::Extension(stop_rx.clone()));
     crate::chat::notify::spawn(Arc::clone(&ctx), stop_rx.clone());
+    // ponytail: one sweeper per serve() call; an embedder that restarts the server in-process starts a second one, which is harmless.
+    tokio::spawn(crate::chat::media::sweep_daily());
     let hook = hook_listener.map(|l| {
         let app = crate::chat::hook::router(Arc::clone(&ctx)).layer(axum::Extension(stop_rx.clone()));
         let mut stop_rx = stop_rx.clone();
