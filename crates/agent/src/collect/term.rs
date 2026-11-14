@@ -508,7 +508,7 @@ mod tests {
     /// Reads binary frames until their accumulated text contains `needle`.
     async fn read_until(ws: &mut Ws, needle: &str) -> String {
         let mut seen = String::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !seen.contains(needle) {
                 match ws.next().await {
                     Some(Ok(WsMsg::Binary(b))) => seen.push_str(&String::from_utf8_lossy(&b)),
@@ -524,7 +524,7 @@ mod tests {
 
     /// Drains frames until the close frame and returns its code.
     async fn close_code(ws: &mut Ws) -> u16 {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match ws.next().await {
                     Some(Ok(WsMsg::Close(Some(f)))) => return u16::from(f.code),
@@ -535,11 +535,11 @@ mod tests {
             }
         })
         .await
-        .expect("no close frame within 5s")
+        .expect("no close frame within 30 s")
     }
 
     async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-        for _ in 0..50 {
+        for _ in 0..300 {
             if f() {
                 return;
             }

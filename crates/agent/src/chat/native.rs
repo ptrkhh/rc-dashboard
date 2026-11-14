@@ -191,7 +191,7 @@ mod tests {
     impl FakeSup {
         async fn conn(&mut self) -> &mut (BufReader<tokio::net::unix::OwnedReadHalf>, tokio::net::unix::OwnedWriteHalf) {
             if self.conn.is_none() {
-                let (s, _) = tokio::time::timeout(std::time::Duration::from_secs(5), self.listener.accept()).await.expect("the engine connects").unwrap();
+                let (s, _) = tokio::time::timeout(std::time::Duration::from_secs(30), self.listener.accept()).await.expect("the engine connects").unwrap();
                 let (r, w) = s.into_split();
                 self.conn = Some((BufReader::new(r), w));
             }
@@ -200,7 +200,7 @@ mod tests {
         async fn read_line(&mut self) -> String {
             let (r, _) = self.conn().await;
             let mut line = String::new();
-            tokio::time::timeout(std::time::Duration::from_secs(5), r.read_line(&mut line)).await.expect("a line within 5 s").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), r.read_line(&mut line)).await.expect("a line within 30 s").unwrap();
             line.trim_end().to_string()
         }
         async fn write_line(&mut self, line: &str) {

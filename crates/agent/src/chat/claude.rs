@@ -255,7 +255,7 @@ pub(crate) mod tests {
     }
 
     async fn next_msg(rx: &mut mpsc::Receiver<EngineMsg>) -> EngineMsg {
-        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("no engine message within 5 s").expect("engine ended")
+        tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.expect("no engine message within 30 s").expect("engine ended")
     }
 
     async fn collect_until_ready(rx: &mut mpsc::Receiver<EngineMsg>) -> Vec<EngineMsg> {

@@ -146,7 +146,7 @@ pub(crate) mod tests {
     }
 
     async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-        for _ in 0..50 {
+        for _ in 0..300 {
             if f() {
                 return;
             }

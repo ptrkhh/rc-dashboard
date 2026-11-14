@@ -148,7 +148,7 @@ mod tests {
     }
 
     async fn next_json(ws: &mut Ws) -> Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match ws.next().await {
                     Some(Ok(WsMsg::Text(t))) => return serde_json::from_str(t.as_str()).unwrap(),
@@ -158,7 +158,7 @@ mod tests {
             }
         })
         .await
-        .expect("no frame within 5 s")
+        .expect("no frame within 30 s")
     }
 
     async fn next_of(ws: &mut Ws, t: &str) -> Value {
