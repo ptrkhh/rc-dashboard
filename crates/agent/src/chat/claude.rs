@@ -155,7 +155,7 @@ async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>)
             }
             if c.ready {
                 let working = match status.as_deref() {
-                    Some(s) => s == "busy" || s == "shell",
+                    Some(s) => s == "busy",
                     None => c.tap.turn_open(),
                 };
                 let now = (working, status.as_deref() == Some("waiting"));
@@ -328,6 +328,16 @@ pub(crate) mod tests {
         assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: true, .. }));
         make_tmux_fail(&dir);                                      // rewrite the stub so has-session exits 1
         assert!(matches!(next_of(&mut rx, |m| matches!(m, EngineMsg::Ended)).await, EngineMsg::Ended));
+    }
+
+    #[tokio::test]
+    async fn a_background_shell_counts_as_idle() {
+        let (ctx, dir) = fixture_ctx("shell");
+        let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: true, .. }));
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"shell"}"#);
+        assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: false, waiting: false, .. }), "\"· 1 shell\": idle with background work");
     }
 
     #[tokio::test]
