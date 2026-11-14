@@ -7,6 +7,7 @@ use super::media::{split_attached, MAX_FILES};
 use super::CAP;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// Only the fields the rules read; serde skips the rest, so a multi-megabyte
 /// `api-request-blob` costs a scan, not an allocation.
@@ -37,13 +38,15 @@ struct Rec {
     duration: Option<Value>,
     #[serde(rename = "isApiErrorMessage", default)]
     api_error: Option<bool>,
+    timestamp: Option<String>,
 }
 
-/// The last prompt rule 7 emitted, for spotting a handed-back prompt.
-struct Typed {
-    queued: bool,
+/// A main-chain record: its parent, and the uuid of the last event emitted at
+/// or before it, which is where a branch from it cuts the log back to.
+struct Node {
+    #[allow(dead_code)] // Task 5 walks it for the rewind selector's list.
     parent: Option<String>,
-    uuid: Option<String>,
+    anchor: Option<String>,
 }
 
 #[derive(Default)]
@@ -51,9 +54,12 @@ pub struct Tap {
     open: bool,
     seen: usize,
     understood: bool,
-    last: Option<Typed>,
     /// The last main-chain assistant record was an API error message.
     api_error: bool,
+    // ponytail: one map entry per record for the conversation's life (~150 bytes each); forget entries before the last compaction if memory ever shows it.
+    nodes: HashMap<String, Node>,
+    last_main: Option<String>,
+    anchor: Option<String>,
 }
 
 impl Tap {
@@ -70,10 +76,13 @@ impl Tap {
 
     pub fn feed(&mut self, line: &str) -> Vec<Value> {
         let Ok(r) = serde_json::from_str::<Rec>(line) else { return Vec::new() };
-        if [r.sidechain, r.meta, r.compact, r.transcript_only].contains(&Some(true)) {
+        if r.sidechain == Some(true) {
             return Vec::new();
         }
-        let out = match r.kind.as_str() {
+        // On the main chain but never shown: bookkeeping only.
+        let hidden = [r.meta, r.compact, r.transcript_only].contains(&Some(true));
+        let mut out = match r.kind.as_str() {
+            _ if hidden => Vec::new(),
             "queue-operation" => match (r.operation.as_deref(), r.content.as_ref().and_then(parts)) {
                 (Some("enqueue"), Some((text, _))) if !injected(&text) => vec![json!({"type":"cdash","subtype":"queued","text":clean(&text).0})],
                 _ => Vec::new(),
@@ -102,9 +111,26 @@ impl Tap {
             },
             _ => Vec::new(),
         };
-        if r.kind == "user" || r.kind == "assistant" {
+        if !hidden && (r.kind == "user" || r.kind == "assistant") {
             self.seen += 1;
             self.understood |= !out.is_empty();
+        }
+        for ev in out.iter_mut().filter(|e| !is_cut(e)) {
+            if !ev["uuid"].is_string() {
+                if let Some(u) = &r.uuid {
+                    ev["uuid"] = json!(u);
+                }
+            }
+            if let Some(t) = &r.timestamp {
+                ev["ts"] = json!(t);
+            }
+        }
+        if let Some(u) = out.iter().rev().filter(|e| !is_cut(e)).find_map(|e| e["uuid"].as_str()) {
+            self.anchor = Some(u.to_string());
+        }
+        if let Some(u) = &r.uuid {
+            self.nodes.insert(u.clone(), Node { parent: r.parent.clone(), anchor: self.anchor.clone() });
+            self.last_main = Some(u.clone());
         }
         for ev in &out {
             match ev["type"].as_str() {
@@ -116,9 +142,9 @@ impl Tap {
         out
     }
 
-    /// Rule 7 and 8: a `user` record with string content.
-    fn typed(&mut self, r: &Rec, text: &str, mut files: Vec<Value>) -> Vec<Value> {
-        let text = &strip_image_tokens(text);
+    /// Rule 7: a `user` record with string content, or Part 3's image prompt.
+    fn typed(&mut self, r: &Rec, raw: &str, mut files: Vec<Value>) -> Vec<Value> {
+        let text = &strip_image_tokens(raw);
         let t = text.trim_start();
         if let Some(cmd) = between(t, "<bash-input>", "</bash-input>") {
             return vec![json!({"type":"cdash","subtype":"shell","uuid":r.uuid,"command":cmd.trim()})];
@@ -140,17 +166,18 @@ impl Tap {
         let (prompt, attached) = split_attached(&prompt);
         files.extend(attached);
         self.api_error = false;
-        let queued = r.source.as_deref() == Some("queued");
+        let src = if r.source.as_deref() == Some("queued") { "queued" } else { "typed" };
         let mut out = Vec::new();
-        if let Some(prev) = &self.last {
-            // Claude hands a prompt stopped before any reply back to the input
-            // box and writes the next one with the same parent.
-            if !queued && !prev.queued && prev.parent.is_some() && prev.parent == r.parent {
-                out.push(json!({"type":"cdash","subtype":"retract","uuid":prev.uuid}));
-            }
+        // A prompt that does not continue from the record before it branches
+        // from an older one (a rewind, or a prompt handed back unanswered).
+        if let Some(node) = r.parent.as_ref().filter(|p| self.last_main.as_ref() != Some(*p)).and_then(|p| self.nodes.get(p)) {
+            out.push(json!({"type":"cdash","subtype":"cut","after":node.anchor}));
         }
-        self.last = Some(Typed { queued, parent: r.parent.clone(), uuid: r.uuid.clone() });
-        out.push(prompt_event(r.uuid.as_deref(), prompt.trim(), if queued { "queued" } else { "typed" }, files));
+        let mut ev = prompt_event(r.uuid.as_deref(), prompt.trim(), src, files);
+        if raw != ev["message"]["content"] {
+            ev["raw"] = json!(raw);
+        }
+        out.push(ev);
         out
     }
 }
@@ -179,6 +206,10 @@ fn unwrap_pastes(text: &str) -> String {
     }
     out.push_str(rest);
     if changed { out.trim().to_string() } else { out }
+}
+
+fn is_cut(ev: &Value) -> bool {
+    ev["type"] == "cdash" && ev["subtype"] == "cut"
 }
 
 /// Text tools inject for the model's benefit; never shown as a user message.
@@ -359,7 +390,7 @@ mod tests {
             "cdash:shell", "cdash:shell_output",
             "prompt:typed:slow job", "assistant:tool_use", "cdash:queued", "prompt:queued:also update README",
             "tool_result:toolu_2", "result:interrupted", "assistant:text", "result:success",
-            "prompt:typed:handed back", "cdash:retract", "prompt:typed:second try",
+            "prompt:typed:handed back", "cdash:cut", "prompt:typed:second try",
             "assistant:tool_use", "cdash:queued", "tool_result:toolu_3", "prompt:steer:use -j4",
             "prompt:typed:What color is this image?",
         ]);
@@ -373,7 +404,8 @@ mod tests {
         assert_eq!(evs[5]["command"], "echo hi");
         assert_eq!((evs[6]["stdout"].as_str(), evs[6]["stderr"].as_str()), (Some("hi"), Some("")));
         assert_eq!(evs[9]["text"], "also update README");
-        assert_eq!(evs[16]["uuid"], "u4", "the handed-back prompt is the one withdrawn");
+        assert_eq!(evs[16]["after"], "s3", "a handed-back prompt is cut back to its turn's end");
+        assert_eq!((evs[4]["uuid"].as_str(), evs[12]["uuid"].as_str()), (Some("s2"), Some("i1")), "results carry their record's uuid");
         assert_eq!(evs[21]["uuid"], "q1", "an absorbed message takes the attachment's id");
         assert_eq!(evs[1]["message"]["id"], "msg_1");
         assert_eq!(evs.last().unwrap()["files"], json!([{"kind":"image","mime":"image/png","data":"iVBORw0KGgo="}]));
@@ -448,5 +480,39 @@ mod tests {
         let img: Value = serde_json::from_str(IMG).unwrap();
         let many = &tap.feed(&rec("m1", Value::Array(vec![img; 12])))[0];
         assert_eq!(many["files"].as_array().map(Vec::len), Some(crate::chat::media::MAX_FILES));
+    }
+
+    fn id8(v: &Value) -> String { v.as_str().unwrap_or("none").chars().take(8).collect() }
+    fn short(e: &Value) -> String {
+        match (e["type"].as_str().unwrap(), e["subtype"].as_str()) {
+            ("cdash", Some("cut")) => format!("cut:{}", id8(&e["after"])),
+            ("user", _) if e["src"].is_string() => format!("prompt:{}", id8(&e["uuid"])),
+            ("result", _) => format!("result:{}", id8(&e["uuid"])),
+            ("assistant", _) => format!("assistant:{}", e["message"]["content"][0]["type"].as_str().unwrap()),
+            (t, s) => format!("{t}:{}", s.unwrap_or("-")),
+        }
+    }
+    fn feed_all(text: &str) -> Vec<Value> { let mut tap = Tap::default(); text.lines().flat_map(|l| tap.feed(l)).collect() }
+    #[test]
+    fn a_prompt_parented_to_an_older_turn_end_cuts_back_to_it() {
+        let evs = feed_all(include_str!("testdata/rewind.jsonl"));
+        assert_eq!(evs.iter().map(short).collect::<Vec<_>>(), [
+            "prompt:96de607e", "assistant:text", "result:37929adb", "prompt:dd5d85d6", "assistant:text", "result:8a67cba9",
+            "prompt:ea31531f", "assistant:text", "result:44ede06f", "cut:37929adb", "prompt:6fd3884f", "assistant:text", "result:db5a7c16",
+        ]);
+        assert_eq!(evs[9]["after"], "37929adb-63f0-4e64-b002-3f3c2f2a84b4");
+        assert_eq!(evs[10]["ts"], "2026-11-13T04:34:10.043Z");
+        assert_eq!(evs[0]["raw"], "[Image #1] What color is this image? Answer in one word.", "raw keeps the image token");
+        assert!(evs[3].get("raw").is_none(), "no raw when it equals the text");
+    }
+    #[test]
+    fn compaction_and_unknown_parents_never_cut() {
+        let evs = feed_all(include_str!("testdata/compact.jsonl"));
+        assert_eq!(evs.iter().map(short).collect::<Vec<_>>(), ["result:1f2a686a", "prompt:a7e885f8"]);
+        let mut tap = Tap::default();
+        for l in include_str!("testdata/rewind.jsonl").lines().take(5) { tap.feed(l); }
+        let a = tap.feed(r#"{"type":"user","uuid":"o1","parentUuid":"never-seen","promptSource":"typed","message":{"role":"user","content":"x"}}"#);
+        let b = tap.feed(r#"{"type":"user","uuid":"o2","parentUuid":null,"promptSource":"typed","message":{"role":"user","content":"y"}}"#);
+        assert!(a.iter().chain(&b).all(|e| e["subtype"] != "cut"));
     }
 }
