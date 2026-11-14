@@ -380,6 +380,7 @@ async fn run(
     let mut conv: Option<Conv> = None;
     let mut last: Option<(bool, bool, Option<String>)> = None;
     let (mut last_asks, mut last_settings) = (None, None);
+    let (mut last_usage, mut last_tasks): (Option<Value>, Option<Vec<Value>>) = (None, None);
     let mut blind_sent = false;
     let mut warmed = false;
     let mut slow = false;
@@ -410,6 +411,7 @@ async fn run(
                 if conv.is_some() && tx.send(EngineMsg::Reset).await.is_err() {
                     return;
                 }
+                (last_usage, last_tasks) = (None, None);
                 let path = ctx.claude_dir.join("projects").join(project_dir_name(&cwd)).join(format!("{sid}.jsonl"));
                 *transcript.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
                 conv = Some(Conv { sid, tail: Tail::new(path), tap: Tap::default(), ready: false });
@@ -491,6 +493,27 @@ async fn run(
                 if last_settings.as_ref() != Some(&settings) {
                     last_settings = Some(settings.clone());
                     if tx.send(EngineMsg::Settings(settings)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            if c.ready {
+                let mut usage = c.tap.usage();
+                if usage["cwd"].is_null() {
+                    usage["cwd"] = json!(file.as_ref().and_then(|f| f.cwd.clone()));
+                }
+                if last_usage.as_ref() != Some(&usage) {
+                    last_usage = Some(usage.clone());
+                    if tx.send(EngineMsg::Usage(usage)).await.is_err() {
+                        return;
+                    }
+                }
+                let tasks = c.tap.tasks();
+                // An empty list is never sent first: the hub starts with none.
+                let first_empty = last_tasks.is_none() && tasks.is_empty();
+                if last_tasks.as_ref() != Some(&tasks) {
+                    last_tasks = Some(tasks.clone());
+                    if !first_empty && tx.send(EngineMsg::Tasks(tasks)).await.is_err() {
                         return;
                     }
                 }
@@ -1015,6 +1038,15 @@ pub(crate) mod tests {
     }
     /// The fixture's first record, which shows no event.
     const ROOT: &str = "b2d9530c-cfa3-452a-8335-e1f1ef9c5d5a";
+    #[tokio::test]
+    async fn the_engine_reports_usage_once_ready_with_the_session_folder_as_fallback() {
+        let (ctx, _dir) = fixture_ctx("facts");
+        let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        let EngineMsg::Usage(u) = next_of(&mut rx, |m| matches!(m, EngineMsg::Usage(_))).await else { unreachable!() };
+        assert_eq!(u["cwd"], "/proj", "no record carries a cwd: the session file's");
+    }
+
     #[tokio::test]
     async fn a_root_cut_in_memory_leaves_the_replay_only_what_follows_it() {
         let turn: String = include_str!("testdata/rewind.jsonl").lines().take(5).map(|l| format!("{l}\n")).collect();

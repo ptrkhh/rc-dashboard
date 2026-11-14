@@ -39,6 +39,9 @@ struct Rec {
     #[serde(rename = "isApiErrorMessage", default)]
     api_error: Option<bool>,
     timestamp: Option<String>,
+    cwd: Option<String>,
+    #[serde(rename = "toolUseResult")]
+    tool_use_result: Option<Value>,
 }
 
 /// A main-chain record: its parent, and the uuid of the last event emitted at
@@ -60,9 +63,210 @@ pub struct Tap {
     nodes: HashMap<String, Node>,
     last_main: Option<String>,
     anchor: Option<String>,
+    /// Tool calls whose results tell us something: id to (name, input).
+    calls: HashMap<String, (String, Value)>,
+    todo: Vec<Item>,
+    tasks: Vec<Value>,
+    cwd: Option<String>,
+    model: Option<String>,
+    /// input, output, cache_read, cache_write; the message id last counted.
+    tokens: Option<[u64; 4]>,
+    counted: Option<String>,
+    used: Option<u64>,
+}
+
+struct Item {
+    id: Option<String>,
+    text: String,
+    status: String,
+}
+
+// Transcript content is untrusted: each list a session keeps is bounded.
+const MAX_CALLS: usize = 64;
+const MAX_TASKS: usize = 50;
+const MAX_TODOS: usize = 100;
+const STATUSES: [&str; 3] = ["pending", "in_progress", "completed"];
+
+// ponytail: one entry per model family, each read from a status-line sample; unknown models show tokens only.
+const WINDOWS: &[(&str, u64)] = &[("claude-opus-5-5", 1_000_000), ("claude-sonnet-5-5", 1_000_000), ("claude-fable-5-2", 1_000_000)];
+
+pub fn context_window(model: &str) -> Option<u64> {
+    WINDOWS.iter().find(|(p, _)| model.starts_with(p)).map(|&(_, w)| w)
+}
+
+fn clip(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// A task id arrives as a string or a number.
+fn id_of(v: &Value) -> Option<String> {
+    v.as_str().map(|s| clip(s, 80)).or_else(|| v.as_u64().map(|n| n.to_string()))
 }
 
 impl Tap {
+    pub fn usage(&self) -> Value {
+        let model = self.model.as_deref();
+        let context = self.used.map(|used| json!({"used":used,"window":model.and_then(context_window)}));
+        let tokens = self.tokens.map(|[input, output, cache_read, cache_write]| json!({"input":input,"output":output,"cache_read":cache_read,"cache_write":cache_write}));
+        json!({"cwd":self.cwd,"model":model,"context":context,"tokens":tokens,"cost":null})
+    }
+
+    pub fn tasks(&self) -> Vec<Value> {
+        self.tasks.clone()
+    }
+
+    fn todo_event(&self) -> Value {
+        let items: Vec<Value> = self.todo.iter().map(|i| json!({"text":i.text,"status":i.status})).collect();
+        json!({"type":"cdash","subtype":"todo","items":items})
+    }
+
+    fn start_task(&mut self, id: String, kind: &str, title: &str, started: Option<&String>) {
+        if self.tasks.iter().any(|t| t["id"] == id.as_str()) {
+            return;
+        }
+        if self.tasks.len() >= MAX_TASKS {
+            self.tasks.remove(0);
+        }
+        self.tasks.push(json!({"id":id,"kind":kind,"title":clip(title, 80),"started":started}));
+    }
+
+    fn end_task(&mut self, id: &str) {
+        self.tasks.retain(|t| t["id"] != id);
+    }
+
+    /// `<task-notification>` text, wherever it was recorded: a finished task ends.
+    fn notified(&mut self, text: &str) {
+        for chunk in text.split("<task-notification>").skip(1) {
+            let done = between(chunk, "<status>", "</status>").is_some_and(|s| ["completed", "failed", "killed", "stopped"].contains(&s.trim()));
+            if let (true, Some(id)) = (done, between(chunk, "<task-id>", "</task-id>")) {
+                self.end_task(id.trim());
+            }
+        }
+    }
+
+    /// What a record tells us beyond its events: usage, the checklist, running tasks.
+    fn facts(&mut self, r: &Rec) -> Vec<Value> {
+        let mut out = Vec::new();
+        match r.kind.as_str() {
+            "assistant" => self.assistant_facts(r, &mut out),
+            "user" => match r.message.as_ref().map(|m| &m["content"]) {
+                Some(Value::Array(blocks)) => blocks.iter().filter(|b| b["type"] == "tool_result").for_each(|b| self.result_facts(r, b, &mut out)),
+                Some(Value::String(text)) => self.notified(text),
+                _ => {}
+            },
+            "queue-operation" if r.operation.as_deref() == Some("enqueue") => {
+                if let Some(t) = r.content.as_ref().and_then(Value::as_str) {
+                    self.notified(t);
+                }
+            }
+            "attachment" => {
+                let a = r.attachment.as_ref().unwrap_or(&Value::Null);
+                match a["type"].as_str() {
+                    Some("queued_command") => self.notified(a["prompt"].as_str().unwrap_or("")),
+                    Some("task_status") if a["status"] == "running" => {
+                        if let Some(id) = id_of(&a["taskId"]) {
+                            let kind = if a["taskType"] == "local_bash" { "shell" } else { "agent" };
+                            let title = a["description"].as_str().or(a["shell"]["command"].as_str()).unwrap_or("");
+                            self.start_task(id, kind, title, r.timestamp.as_ref());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn assistant_facts(&mut self, r: &Rec, out: &mut Vec<Value>) {
+        let Some(m) = &r.message else { return };
+        if m["model"] != "<synthetic>" && m["usage"].is_object() {
+            let n = |k: &str| m["usage"][k].as_u64().unwrap_or(0);
+            let (input, output, read, write) = (n("input_tokens"), n("output_tokens"), n("cache_read_input_tokens"), n("cache_creation_input_tokens"));
+            // A reply split over records repeats its usage: count it once.
+            let id = m["id"].as_str();
+            if id.is_none() || id != self.counted.as_deref() {
+                self.counted = id.map(String::from);
+                let t = self.tokens.get_or_insert([0; 4]);
+                for (slot, v) in t.iter_mut().zip([input, output, read, write]) {
+                    *slot = slot.saturating_add(v);
+                }
+            }
+            self.used = Some(input.saturating_add(read).saturating_add(write));
+            self.model = m["model"].as_str().map(|s| clip(s, 80));
+        }
+        for b in m["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_use") {
+            let (Some(id), Some(name)) = (b["id"].as_str(), b["name"].as_str()) else { continue };
+            if name == "TodoWrite" {
+                self.todo = b["input"]["todos"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(MAX_TODOS)
+                    .map(|t| Item {
+                        id: None,
+                        text: clip(t["content"].as_str().unwrap_or(""), 200),
+                        status: t["status"].as_str().filter(|s| STATUSES.contains(s)).unwrap_or("pending").to_string(),
+                    })
+                    .collect();
+                out.push(self.todo_event());
+            } else if ["Bash", "Agent", "TaskCreate", "TaskUpdate", "TaskStop"].contains(&name) {
+                if self.calls.len() >= MAX_CALLS {
+                    self.calls.clear(); // results that never came
+                }
+                self.calls.insert(id.to_string(), (name.to_string(), b["input"].clone()));
+            }
+        }
+    }
+
+    fn result_facts(&mut self, r: &Rec, b: &Value, out: &mut Vec<Value>) {
+        let Some((name, input)) = b["tool_use_id"].as_str().and_then(|id| self.calls.remove(id)) else { return };
+        let res = r.tool_use_result.as_ref().unwrap_or(&Value::Null);
+        let ok = b["is_error"].as_bool() != Some(true);
+        match name.as_str() {
+            "Bash" => {
+                if let Some(id) = id_of(&res["backgroundTaskId"]) {
+                    let title = input["description"].as_str().or(input["command"].as_str()).unwrap_or("");
+                    self.start_task(id, "shell", title, r.timestamp.as_ref());
+                }
+            }
+            "Agent" if res["isAsync"] == true => {
+                if let Some(id) = id_of(&res["agentId"]) {
+                    self.start_task(id, "agent", input["description"].as_str().unwrap_or(""), r.timestamp.as_ref());
+                }
+            }
+            "TaskCreate" if ok => {
+                if let (Some(id), true) = (id_of(&res["task"]["id"]), self.todo.len() < MAX_TODOS) {
+                    let text = clip(input["subject"].as_str().unwrap_or(""), 200);
+                    self.todo.push(Item { id: Some(id), text, status: "pending".into() });
+                    out.push(self.todo_event());
+                }
+            }
+            "TaskUpdate" if ok => {
+                let Some(id) = id_of(&input["taskId"]) else { return };
+                let Some(at) = self.todo.iter().position(|i| i.id.as_deref() == Some(&id)) else { return };
+                if input["status"] == "deleted" {
+                    self.todo.remove(at);
+                } else {
+                    let i = &mut self.todo[at];
+                    if let Some(s) = input["status"].as_str().filter(|s| STATUSES.contains(s)) {
+                        i.status = s.to_string();
+                    }
+                    if let Some(subject) = input["subject"].as_str() {
+                        i.text = clip(subject, 200);
+                    }
+                }
+                out.push(self.todo_event());
+            }
+            "TaskStop" => {
+                if let Some(id) = id_of(&res["task_id"]) {
+                    self.end_task(&id);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// True from a prompt until the next `result` event.
     pub fn turn_open(&self) -> bool {
         self.open
@@ -81,6 +285,10 @@ impl Tap {
         }
         // On the main chain but never shown: bookkeeping only.
         let hidden = [r.meta, r.compact, r.transcript_only].contains(&Some(true));
+        if r.cwd.is_some() {
+            self.cwd.clone_from(&r.cwd);
+        }
+        let facts = if hidden { Vec::new() } else { self.facts(&r) };
         let mut out = match r.kind.as_str() {
             _ if hidden => Vec::new(),
             "queue-operation" => match (r.operation.as_deref(), r.content.as_ref().and_then(parts)) {
@@ -111,6 +319,7 @@ impl Tap {
             },
             _ => Vec::new(),
         };
+        out.extend(facts);
         if !hidden && (r.kind == "user" || r.kind == "assistant") {
             self.seen += 1;
             self.understood |= !out.is_empty();
@@ -288,7 +497,7 @@ fn steer(r: &Rec) -> Option<Value> {
     Some(prompt_event(r.uuid.as_deref(), &text, "steer", files))
 }
 
-/// Rule 5: one event per `text` or `tool_use` block; thinking is status only.
+/// Rule 5: one event per `text`, `tool_use` or readable `thinking` block.
 fn assistant(r: &Rec) -> Vec<Value> {
     let Some(m) = &r.message else { return Vec::new() };
     let Some(blocks) = m["content"].as_array() else { return Vec::new() };
@@ -297,6 +506,7 @@ fn assistant(r: &Rec) -> Vec<Value> {
         .filter_map(|b| {
             let block = match b["type"].as_str()? {
                 "text" => json!({"type":"text","text":b["text"].as_str()?}),
+                "thinking" => json!({"type":"thinking","thinking":Some(b["thinking"].as_str()?).filter(|t| !t.is_empty())?}),
                 "tool_use" => {
                     let input = &b["input"];
                     let input = if input.to_string().len() > CAP { json!({"truncated":true}) } else { input.clone() };
@@ -526,5 +736,62 @@ mod tests {
         let info = r#"{"type":"system","subtype":"informational","uuid":"i1","parentUuid":"m1"}"#;
         let back = r#"{"type":"user","uuid":"u3","parentUuid":"m1","promptSource":"typed","message":{"role":"user","content":"back"}}"#;
         assert_eq!(cuts(&[end, meta, info, back]), [json!("s1")], "a hidden record is on the chain, so branching from it cuts");
+    }
+
+    const FACTS: &str = include_str!("testdata/facts.jsonl");
+    #[test]
+    fn readable_thinking_shows_and_signature_only_thinking_does_not() {
+        assert_eq!(feed_all(FACTS)[0]["message"]["content"][0], json!({"type":"thinking","thinking":"Check the tests first."}));
+        assert!(!feed_all(include_str!("testdata/rewind.jsonl")).iter().any(|e| e["message"]["content"][0]["type"] == "thinking"));
+    }
+    #[test]
+    fn the_checklist_follows_todowrite_and_the_task_tools() {
+        let lists: Vec<Vec<String>> = feed_all(FACTS).iter().filter(|e| e["subtype"] == "todo")
+            .map(|e| e["items"].as_array().unwrap().iter().map(|i| format!("{}:{}", i["text"].as_str().unwrap(), i["status"].as_str().unwrap())).collect())
+            .collect();
+        let three = ["Read:completed", "Fix:in_progress", "Test:pending"];
+        assert_eq!(lists, [three.to_vec(), [&three[..], &["Ship it:pending"]].concat(), [&three[..], &["Ship it:completed"]].concat()]);
+    }
+    #[test]
+    fn usage_counts_each_reply_once_and_context_is_the_latest_reply() {
+        let mut tap = Tap::default();
+        for l in FACTS.lines() { tap.feed(l); }
+        let u = tap.usage();
+        assert_eq!(u["tokens"], json!({"input":8,"output":30,"cache_read":1900,"cache_write":150}));
+        assert_eq!(u["context"], json!({"used":1055,"window":context_window("claude-opus-5-5")}));
+        assert_eq!((u["model"].as_str(), u["cwd"].as_str(), &u["cost"]), (Some("claude-opus-5-5"), Some("/proj/.worktrees/a"), &Value::Null));
+        assert_eq!(context_window("claude-mystery-9"), None, "unknown models show tokens only");
+    }
+    #[test]
+    fn running_tasks_start_from_results_and_end_from_notifications_stops_and_restatements() {
+        let mut tap = Tap::default();
+        let mut seen = Vec::new();
+        for l in FACTS.lines() { tap.feed(l); seen.push(tap.tasks().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect::<Vec<_>>()); }
+        assert_eq!(seen[3], ["bo29v19cm"]);
+        assert_eq!(seen[5], ["bo29v19cm", "a6cc68d2a048556bd"]);
+        assert_eq!(seen[6], ["a6cc68d2a048556bd"], "the enqueued notification ends the shell");
+        assert!(seen[8].is_empty(), "TaskStop ends the agent");
+        assert_eq!(seen[9], ["bw2ckxil8"], "restated after compaction");
+        assert!(seen[14].is_empty(), "a queued_command notification ends it");
+        let mut first = Tap::default();
+        for l in FACTS.lines().take(4) { first.feed(l); }
+        assert_eq!(first.tasks()[0], json!({"id":"bo29v19cm","kind":"shell","title":"Sleep a minute","started":"2026-11-13T10:00:05.000Z"}));
+    }
+    #[test]
+    fn what_a_session_keeps_is_bounded_and_odd_records_change_nothing() {
+        let mut tap = Tap::default();
+        for i in 0..200 {
+            let call = json!({"type":"assistant","uuid":format!("a{i}"),"message":{"id":format!("m{i}"),"model":"<synthetic>","content":[{"type":"tool_use","id":format!("t{i}"),"name":"Bash","input":{"command":"x".repeat(500)}}]}});
+            let res = json!({"type":"user","uuid":format!("r{i}"),"toolUseResult":{"backgroundTaskId":format!("b{i}")},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":format!("t{i}"),"content":"ok"}]}});
+            tap.feed(&call.to_string());
+            tap.feed(&res.to_string());
+        }
+        assert_eq!(tap.tasks().len(), MAX_TASKS);
+        assert_eq!(tap.tasks()[0]["title"].as_str().unwrap().chars().count(), 80);
+        assert!(tap.calls.len() <= MAX_CALLS);
+        assert_eq!(tap.usage()["tokens"], Value::Null, "synthetic replies count for nothing");
+        let odd = [r#"{"type":"user","toolUseResult":7,"message":{"content":[{"type":"tool_result","tool_use_id":5}]}}"#, r#"{"type":"attachment","attachment":{"type":"task_status","status":"running","taskId":[]}}"#, r#"{"type":"queue-operation","operation":"enqueue","content":"<task-notification><status>killed"}"#];
+        for l in odd { tap.feed(l); }
+        assert_eq!(tap.tasks().len(), MAX_TASKS);
     }
 }
