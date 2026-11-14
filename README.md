@@ -209,6 +209,16 @@ External sessions without a Claude link show instructions instead of a waiting s
 
 A Claude Code card whose Remote Control link has not arrived 30 seconds after launch says the link is unavailable instead of waiting; Chat and Terminal still work.
 
+## Notifications
+
+Each device has its own switch, **Notifications on this device**, in the dashboard; a device that leaves it off sees no change.
+
+- A browser needs HTTPS or 127.0.0.1. On any other page the switch is disabled and says `needs HTTPS or 127.0.0.1`.
+- The Windows app registers its app ID (`HKCU\Software\Classes\AppUserModelId\dev.cdash.app`, no admin rights) while notifications are on, and removes it when they are off.
+- The Android app keeps a background service running with a quiet permanent notification (`Watching for replies`) and asks to be exempt from battery optimisation so replies still reach you.
+- A notification appears when a session finishes a turn, stops with an error, or needs your answer. The title is the project folder.
+- Push services see only an encrypted payload holding a session name, a project folder name, a kind and a time. No message text, tool names or file names.
+
 ## Technical reference
 
 <details>

@@ -119,3 +119,9 @@ Chat reads them in `crates/agent/src/chat/tap.rs` and `claude.rs`.
 - **Key table (read from the installed program, not tested).** `ctrl+l` is
   `chat:clearInput`; `ctrl+x enter` is `chat:queueSubmit`; `ctrl+enter` and
   `ctrl+x ctrl+s` are `chat:sendNow`.
+- **Status file details (observed on 2.1.323).** `status: "shell"` is idle
+  with background work still running. `waitingFor: "dialog open"` is also
+  set for the `/exit` confirmation and the rewind selector. About 0.1 s
+  after Esc the status file shows `idle`.
+- **API error turns (observed on 2.1.323).** Turns whose last message has
+  `isApiErrorMessage` still end with a `turn_duration` record.
