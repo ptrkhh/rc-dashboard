@@ -419,13 +419,18 @@ pub(crate) mod tests {
     async fn stop_releases_the_port_for_rebinding() {
         let b = serve(cfg_for(tempdir("stop"))).await.unwrap();
         let addr = b.addr;
-        let mut cfg = cfg_for(tempdir("rebind"));
-        cfg.port = addr.port();
         b.stop().await;
         // The old listener must be gone, not just the accept loop parked.
-        tokio::net::TcpListener::bind(addr)
-            .await
-            .expect("port must be rebindable after stop");
+        // Rebinding the port would race parallel tests, which draw ephemeral
+        // ports too; a refused connect cannot be taken from us. A connect that
+        // succeeds (a self-connect, or a neighbour's listener) is retried.
+        for _ in 0..300 {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        panic!("{addr} still accepts connections after stop");
     }
 
     /// `reqwest` used to be absent from this crate, which is why these helpers
