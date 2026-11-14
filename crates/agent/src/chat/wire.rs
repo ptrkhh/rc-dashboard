@@ -8,7 +8,9 @@ use serde_json::Value;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum ClientFrame {
-    Send { cid: String, text: String },
+    Send { cid: String, text: String, #[serde(default)] files: Vec<String> },
+    /// Announces a binary upload; `ws.rs` handles it, the hub ignores it.
+    Upload { #[serde(rename = "ref")] reference: String, name: String, size: u64 },
     Stop,
     Held { op: HeldOp, id: String },
     Page { before: u64, limit: Option<usize> },
@@ -67,7 +69,10 @@ mod tests {
     #[test]
     fn client_frames_parse_and_unknown_ones_do_not() {
         let f = |s| serde_json::from_str::<ClientFrame>(s);
-        assert!(matches!(f(r#"{"t":"send","cid":"c1","text":"hi"}"#), Ok(ClientFrame::Send { .. })));
+        assert!(matches!(f(r#"{"t":"send","cid":"c1","text":"hi"}"#), Ok(ClientFrame::Send { files, .. }) if files.is_empty()));
+        assert!(matches!(f(r#"{"t":"send","cid":"c1","text":"","files":["0123456789abcdef"]}"#), Ok(ClientFrame::Send { files, .. }) if files == ["0123456789abcdef"]));
+        assert!(matches!(f(r#"{"t":"upload","ref":"r1","name":"a.png","size":5}"#), Ok(ClientFrame::Upload { size: 5, .. })));
+        assert!(f(r#"{"t":"upload","ref":"r1","name":"a.png","size":-1}"#).is_err());
         assert!(matches!(f(r#"{"t":"stop"}"#), Ok(ClientFrame::Stop)));
         assert!(matches!(f(r#"{"t":"held","op":"now","id":"h1"}"#), Ok(ClientFrame::Held { op: HeldOp::Now, .. })));
         assert!(matches!(f(r#"{"t":"page","before":40}"#), Ok(ClientFrame::Page { before: 40, limit: None })));

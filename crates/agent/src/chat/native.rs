@@ -2,7 +2,7 @@
 //! The supervisor (`chat-feed.mjs`) numbers events and replays from a
 //! position, so this side only remembers the last position and epoch it saw.
 
-use super::hub::{Answer, Engine, EngineMsg, Sent};
+use super::hub::{Answer, Attachment, Engine, EngineMsg, Sent};
 use crate::host::log::LogBuffer;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -86,7 +86,7 @@ impl NativeEngine {
 }
 
 impl Engine for NativeEngine {
-    async fn send(&self, text: &str, steer: bool, cid: &str) -> Result<Sent, String> {
+    async fn send(&self, text: &str, steer: bool, cid: &str, _files: &[Attachment]) -> Result<Sent, String> {
         let (tx, rx) = oneshot::channel();
         self.shared.acks.lock().unwrap_or_else(|e| e.into_inner()).insert(cid.to_string(), tx);
         let line = serde_json::to_string(&SendFrame { t: "send", cid, text, steer }).map_err(|e| e.to_string())?;
@@ -328,17 +328,17 @@ mod tests {
         let (engine, _rx) = start(sock, log(), "cdash-a".into());
         sup.read_line().await;
         sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
-        let sending = tokio::spawn(async move { (engine.send("hi", true, "c1").await, engine) });
+        let sending = tokio::spawn(async move { (engine.send("hi", true, "c1", &[]).await, engine) });
         assert_eq!(sup.read_line().await, r#"{"t":"send","cid":"c1","text":"hi","steer":true}"#);
         sup.write_line(r#"{"t":"ack","cid":"c1","ok":true}"#).await;
         let (sent, engine) = sending.await.unwrap();
         assert_eq!(sent, Ok(Sent::Confirmed), "the supervisor confirmed it");
-        let doing = tokio::spawn(async move { (engine.send("/compact", false, "c3").await, engine) });
+        let doing = tokio::spawn(async move { (engine.send("/compact", false, "c3", &[]).await, engine) });
         sup.read_line().await;
         sup.write_line(r#"{"t":"ack","cid":"c3","ok":true,"done":true}"#).await;
         let (done, engine) = doing.await.unwrap();
         assert_eq!(done, Ok(Sent::Done), "the supervisor ran it itself");
-        let failing = tokio::spawn(async move { (engine.send("no", false, "c2").await, engine) });
+        let failing = tokio::spawn(async move { (engine.send("no", false, "c2", &[]).await, engine) });
         sup.read_line().await;
         sup.write_line(r#"{"t":"ack","cid":"c2","ok":false,"error":"no turn"}"#).await;
         let (failed, engine) = failing.await.unwrap();

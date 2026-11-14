@@ -2,7 +2,7 @@
 //! file, and types through tmux.
 
 use super::asks::Cards;
-use super::hub::{Answer, Engine, EngineMsg, Sent};
+use super::hub::{Answer, Attachment, Engine, EngineMsg, Sent};
 use super::picker;
 use super::tap::Tap;
 use super::tmux_io;
@@ -143,7 +143,7 @@ struct Shared {
 }
 
 impl Engine for ClaudeEngine {
-    async fn send(&self, text: &str, _steer: bool, _cid: &str) -> Result<Sent, String> {
+    async fn send(&self, text: &str, _steer: bool, _cid: &str, _files: &[Attachment]) -> Result<Sent, String> {
         match picker::route(text) {
             // A paste cannot be confirmed by the TUI; the transcript confirms it.
             picker::Route::Paste => {
@@ -556,7 +556,7 @@ pub(crate) mod tests {
         collect_until_ready(&mut rx).await;
         assert_eq!(engine.set("model", &json!("haiku")).await, Err("Answer the open question first".into()));
         write_session(&dir, idle); // the dialog was answered in Terminal
-        engine.send("hello", false, "c1").await.unwrap();
+        engine.send("hello", false, "c1", &[]).await.unwrap();
         let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap();
         let keys: Vec<&str> = args.lines().filter(|l| l.starts_with("send-keys") || l.starts_with("paste-buffer")).collect();
         assert_eq!(keys.len(), 4, "{keys:?}");

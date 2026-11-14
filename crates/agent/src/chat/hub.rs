@@ -3,6 +3,7 @@
 
 pub use super::wire::{ClientFrame, HeldOp};
 use super::asks::check_answer;
+use super::media::{self, MAX_FILES};
 use super::native::ACK_WAIT;
 use super::notify::{NoteKind, Sink};
 use super::queue::Queue;
@@ -11,8 +12,9 @@ use super::Frame;
 use crate::host::log::LogBuffer;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -76,9 +78,26 @@ pub struct Answer {
     pub answers: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Image,
+    File,
+}
+
+/// A file the browser uploaded, stored under the cache.
+#[derive(Debug, Clone, Serialize)]
+pub struct Attachment {
+    pub path: PathBuf,
+    pub kind: Kind,
+    pub mime: String,
+    pub name: String,
+    pub size: u64,
+}
+
 /// The input side of a session.
 pub trait Engine: Send + Sync + 'static {
-    fn send(&self, text: &str, steer: bool, cid: &str) -> impl Future<Output = Result<Sent, String>> + Send;
+    fn send(&self, text: &str, steer: bool, cid: &str, files: &[Attachment]) -> impl Future<Output = Result<Sent, String>> + Send;
     fn stop(&self) -> impl Future<Output = Result<(), String>> + Send;
     /// Empty an input box a stopped prompt was handed back into.
     fn clear_input(&self, _text: &str) -> impl Future<Output = ()> + Send {
@@ -117,6 +136,7 @@ pub struct Subscription {
 enum Cmd {
     Subscribe { after: Option<u64>, epoch: Option<String>, reply: oneshot::Sender<Subscription> },
     Client { frame: ClientFrame, reply: oneshot::Sender<Option<Frame>> },
+    Upload { id: String, a: Attachment },
 }
 
 #[derive(Clone)]
@@ -160,6 +180,7 @@ impl Hub {
             extra: Vec::new(),
             pending: Vec::new(),
             queue: Queue::default(),
+            uploads: HashMap::new(),
             working: false,
             waiting: false,
             waiting_for: None,
@@ -198,12 +219,18 @@ impl Hub {
         rx.await.ok().flatten()
     }
 
+    /// Registers a finished upload. It goes through the command channel, so a
+    /// `send` that follows on the same socket always finds it.
+    pub async fn add_upload(&self, id: String, a: Attachment) {
+        let _ = self.cmds.send(Cmd::Upload { id, a }).await;
+    }
+
     pub fn is_closed(&self) -> bool {
         self.cmds.is_closed()
     }
 }
 
-fn new_epoch() -> String {
+pub(crate) fn new_epoch() -> String {
     let mut b = [0u8; 8];
     getrandom::fill(&mut b).expect("the OS CSPRNG must be available");
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -261,6 +288,8 @@ struct Actor<E> {
     extra: Vec<(usize, Value)>,
     pending: Vec<Pending>,
     queue: Queue,
+    /// Finished uploads by id, for the sends that name them.
+    uploads: HashMap<String, Attachment>,
     working: bool,
     waiting: bool,
     waiting_for: Option<String>,
@@ -319,6 +348,9 @@ impl<E: Engine> Actor<E> {
                         let r = self.client(frame).await;
                         let _ = reply.send(r);
                     }
+                    Some(Cmd::Upload { id, a }) => {
+                        self.uploads.insert(id, a);
+                    }
                     // Every handle was dropped; nobody can reach this hub.
                     None => return,
                 },
@@ -334,7 +366,19 @@ impl<E: Engine> Actor<E> {
     }
 
     fn state(&self) -> Value {
-        let held: Vec<Value> = self.queue.list().iter().map(|h| json!({"id":h.id,"text":h.text})).collect();
+        let held: Vec<Value> = self
+            .queue
+            .list()
+            .iter()
+            .map(|h| {
+                let files: Vec<Value> = h
+                    .files
+                    .iter()
+                    .filter_map(|id| self.uploads.get(id).map(|a| json!({"id":id,"name":a.name,"kind":a.kind,"size":a.size,"mime":a.mime})))
+                    .collect();
+                json!({"id":h.id,"text":h.text,"files":files})
+            })
+            .collect();
         json!({"t":"state","working":self.working,"waiting":self.waiting,"waiting_for":self.waiting_for,"asks":self.asks,"settings":self.settings,"hooks":self.hooks,"ended":self.ended,"unreadable":self.unreadable,"held":held})
     }
 
@@ -467,7 +511,8 @@ impl<E: Engine> Actor<E> {
 
     async fn client(&mut self, f: ClientFrame) -> Option<Frame> {
         match f {
-            ClientFrame::Send { cid, text } => Some(frame(self.send(cid, &text).await)),
+            ClientFrame::Send { cid, text, files } => Some(frame(self.send(cid, &text, files).await)),
+            ClientFrame::Upload { .. } => None,
             ClientFrame::Stop => {
                 self.queue.stop_all();
                 if self.working || !self.pending.is_empty() {
@@ -490,7 +535,7 @@ impl<E: Engine> Actor<E> {
                     }
                 } else if let Some(h) = self.queue.take(&id) {
                     let steer = self.working;
-                    let a = self.deliver(&h.cid, &h.text, steer).await;
+                    let a = self.deliver(&h.cid, &h.text, &h.files, steer).await;
                     self.broadcast(a);
                 }
                 None
@@ -531,13 +576,27 @@ impl<E: Engine> Actor<E> {
         }
     }
 
-    async fn send(&mut self, cid: String, text: &str) -> Value {
+    fn resolve(&self, ids: &[String]) -> Result<Vec<Attachment>, &'static str> {
+        if ids.len() > MAX_FILES {
+            return Err("too many attachments");
+        }
+        ids.iter()
+            .map(|id| self.uploads.get(id).filter(|a| a.path.exists()).cloned().ok_or("attachment expired"))
+            .collect()
+    }
+
+    async fn send(&mut self, cid: String, text: &str, files: Vec<String>) -> Value {
         let text = match sanitize(text) {
             Ok(t) => t,
+            // Attachments alone are a message.
+            Err("empty message") if !files.is_empty() => String::new(),
             Err(e) => return ack(&cid, "refused", Some(e)),
         };
+        if let Err(e) = self.resolve(&files) {
+            return ack(&cid, "refused", Some(e));
+        }
         if self.working && !self.ended && !self.unreadable && !self.waiting {
-            let id = self.queue.hold(cid.clone(), text);
+            let id = self.queue.hold(cid.clone(), text, files);
             let mut a = ack(&cid, "held", None);
             a["id"] = json!(id);
             return a;
@@ -545,7 +604,7 @@ impl<E: Engine> Actor<E> {
         if let Some(e) = self.refusal() {
             return ack(&cid, "refused", Some(e));
         }
-        self.deliver(&cid, &text, false).await
+        self.deliver(&cid, &text, &files, false).await
     }
 
     /// Why nothing may be typed into the session right now, if anything.
@@ -564,8 +623,13 @@ impl<E: Engine> Actor<E> {
         }
     }
 
-    async fn deliver(&mut self, cid: &str, text: &str, steer: bool) -> Value {
-        match self.engine.send(text, steer, cid).await {
+    async fn deliver(&mut self, cid: &str, text: &str, ids: &[String], steer: bool) -> Value {
+        // Resolved again: an upload may have expired while the message waited.
+        let files = match self.resolve(ids) {
+            Ok(f) => f,
+            Err(e) => return ack(cid, "refused", Some(e)),
+        };
+        match self.engine.send(text, steer, cid, &files).await {
             Err(e) => ack(cid, "refused", Some(&e)),
             Ok(Sent::Done) => {
                 self.log.push(format!("chat send {}", self.name));
@@ -592,7 +656,7 @@ impl<E: Engine> Actor<E> {
         }
         if let Some(h) = self.queue.next_auto() {
             self.turn_ok = false;
-            let a = self.deliver(&h.cid, &h.text, false).await;
+            let a = self.deliver(&h.cid, &h.text, &h.files, false).await;
             self.broadcast(a);
         }
     }
@@ -692,6 +756,9 @@ impl<E: Engine> Actor<E> {
             self.broadcast(ack(cid, "refused", Some("session ended")));
         }
         self.publish_state();
+        if let Some(dir) = media::uploads_dir(&self.name) {
+            tokio::spawn(tokio::fs::remove_dir_all(dir));
+        }
     }
 }
 
@@ -714,14 +781,18 @@ mod tests {
         has: u64,
     }
     impl Engine for FakeEngine {
-        async fn send(&self, text: &str, steer: bool, _cid: &str) -> Result<Sent, String> {
+        async fn send(&self, text: &str, steer: bool, _cid: &str, files: &[Attachment]) -> Result<Sent, String> {
             match self.slow {
                 Some(d) => {
                     self.calls.lock().unwrap().push(format!("begin:{text}"));
                     tokio::time::sleep(d).await;
                     self.calls.lock().unwrap().push(format!("end:{text}"));
                 }
-                None => self.calls.lock().unwrap().push(format!("send:{text}:{steer}")),
+                None => {
+                    let names: Vec<&str> = files.iter().map(|a| a.name.as_str()).collect();
+                    let tail = if names.is_empty() { String::new() } else { format!(":{}", names.join(",")) };
+                    self.calls.lock().unwrap().push(format!("send:{text}:{steer}{tail}"));
+                }
             }
             Ok(self.sent)
         }
@@ -751,6 +822,7 @@ mod tests {
     type Calls = Arc<Mutex<Vec<String>>>;
 
     fn build(
+        name: &str,
         slow: Option<Duration>,
         sent: Sent,
         notes: Option<Sink>,
@@ -761,21 +833,21 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let engine = FakeEngine { calls: calls.clone(), sent, slow, has };
         let log = Arc::new(crate::host::log::LogBuffer::new());
-        let hub = Hub::spawn_with("claude", engine, rx, log, "cdash-a".into(), notes);
+        let hub = Hub::spawn_with("claude", engine, rx, log, name.into(), notes);
         if ready {
             tx.try_send(EngineMsg::Ready).unwrap();
         }
         (hub, tx, calls)
     }
     fn rig_with(slow: Option<Duration>) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(slow, Sent::Unconfirmed, None, true, u64::MAX)
+        build("cdash-a", slow, Sent::Unconfirmed, None, true, u64::MAX)
     }
     /// A rig whose engine confirms what it accepts, as Codex and OpenCode do.
     fn rig_accepting() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(None, Sent::Confirmed, None, true, u64::MAX)
+        build("cdash-a", None, Sent::Confirmed, None, true, u64::MAX)
     }
     fn rig_sending(sent: Sent) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(None, sent, None, true, u64::MAX)
+        build("cdash-a", None, sent, None, true, u64::MAX)
     }
     fn rig_noting(ready: bool) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Arc<Ctx>, broadcast::Receiver<Note>) {
         let ctx = crate::chat::claude::tests::ctx_with_path(
@@ -784,7 +856,7 @@ mod tests {
         );
         let notes = ctx.notes.subscribe();
         let sink = Sink { ctx: Arc::clone(&ctx), project: "proj".into() };
-        let (hub, tx, _) = build(None, Sent::Unconfirmed, Some(sink), ready, u64::MAX);
+        let (hub, tx, _) = build("cdash-a", None, Sent::Unconfirmed, Some(sink), ready, u64::MAX);
         (hub, tx, ctx, notes)
     }
     fn note_kinds(rx: &mut broadcast::Receiver<Note>) -> Vec<&'static str> {
@@ -798,13 +870,16 @@ mod tests {
     }
     /// The fake re-reads history as `{"type":"user","n":k}`, up to number `has`.
     fn rig_history_to(has: u64) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(None, Sent::Unconfirmed, None, true, has)
+        build("cdash-a", None, Sent::Unconfirmed, None, true, has)
     }
     fn rig_history() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_history_to(u64::MAX)
     }
+    fn rig_named(name: &str) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+        build(name, None, Sent::Unconfirmed, None, true, u64::MAX)
+    }
     fn rig() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        rig_with(None)
+        rig_named("cdash-a")
     }
     fn rig_slow(d: Duration) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_with(Some(d))
@@ -822,8 +897,19 @@ mod tests {
     fn answer(uuid: &str) -> Value {
         json!({"type":"assistant","uuid":uuid,"message":{"id":"m","role":"assistant","content":[{"type":"text","text":"ok"}]}})
     }
+    fn send_with(cid: &str, text: &str, ids: &[&str]) -> ClientFrame {
+        ClientFrame::Send { cid: cid.into(), text: text.into(), files: ids.iter().map(|s| s.to_string()).collect() }
+    }
     fn send(cid: &str, text: &str) -> ClientFrame {
-        ClientFrame::Send { cid: cid.into(), text: text.into() }
+        send_with(cid, text, &[])
+    }
+    async fn upload(hub: &Hub, id: &str, kind: Kind, name: &str) -> PathBuf {
+        let path = crate::chat::tmux_io::tests::tempfile_path(&format!("hub-up-{id}")).join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"12345678").unwrap();
+        let mime = if kind == Kind::Image { "image/png" } else { "text/plain" };
+        hub.add_upload(id.into(), Attachment { path: path.clone(), kind, mime: mime.into(), name: name.into(), size: 8 }).await;
+        path
     }
     fn reply(reply: Option<Frame>) -> Value {
         serde_json::from_str(&reply.expect("a reply")).unwrap()
@@ -847,6 +933,45 @@ mod tests {
         let acks: Vec<(String, String)> = frames(&mut sub).iter().filter(|f| f["t"] == "ack")
             .map(|f| (f["cid"].as_str().unwrap().into(), f["status"].as_str().unwrap().into())).collect();
         assert_eq!(acks, [("c1".to_string(), "unconfirmed".to_string())], "c2 was shown; it leaves with the old conversation");
+    }
+    #[tokio::test]
+    async fn sends_carry_their_uploads_and_unknown_or_vanished_ones_are_refused() {
+        let (hub, _tx, calls) = rig();
+        upload(&hub, "aaaa", Kind::Image, "shot.png").await;
+        std::fs::remove_file(upload(&hub, "bbbb", Kind::File, "gone.txt").await).unwrap();
+        assert_eq!(reply(hub.command(send_with("c1", "look", &["aaaa"])).await)["status"], "sent");
+        assert_eq!(reply(hub.command(send_with("c2", " ", &["aaaa"])).await)["status"], "sent", "attachments alone are a message");
+        for (cid, id) in [("c3", "nope"), ("c4", "bbbb")] {
+            let a = reply(hub.command(send_with(cid, "x", &[id])).await);
+            assert_eq!((a["status"].as_str(), a["error"].as_str()), (Some("refused"), Some("attachment expired")), "{cid}");
+        }
+        assert_eq!(reply(hub.command(send_with("c5", " ", &[])).await)["error"], "empty message");
+        assert_eq!(reply(hub.command(send_with("c6", "x", &["aaaa"; 11])).await)["error"], "too many attachments");
+        assert_eq!(*calls.lock().unwrap(), ["send:look:false:shot.png", "send::false:shot.png"]);
+    }
+    #[tokio::test]
+    async fn a_held_message_keeps_its_attachments_lists_them_and_sends_them() {
+        let (hub, tx, calls) = rig();
+        upload(&hub, "aaaa", Kind::Image, "shot.png").await;
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        tx.send(engine_status(true, false)).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(send_with("c1", "later", &["aaaa"])).await)["status"], "held");
+        settle().await;
+        let state = frames(&mut sub).into_iter().rev().find(|f| f["t"] == "state").unwrap();
+        assert_eq!(state["held"][0]["files"], json!([{"id":"aaaa","name":"shot.png","kind":"image","size":8,"mime":"image/png"}]));
+        hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h1".into() }).await;
+        assert_eq!(*calls.lock().unwrap(), ["send:later:true:shot.png"]);
+    }
+    #[tokio::test]
+    async fn an_ended_session_deletes_its_upload_folder() {
+        let (_hub, tx, _) = rig_named("cdash-hub-end");
+        let dir = media::uploads_dir("cdash-hub-end").unwrap();
+        let f = dir.join("0123456789abcdef/a.txt");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "x").unwrap();
+        tx.send(EngineMsg::Ended).await.unwrap();
+        crate::chat::tmux_io::tests::eventually("the session's uploads are gone", || !dir.exists()).await;
     }
     #[tokio::test]
     async fn a_message_the_tool_confirmed_is_forgotten_at_the_next_turn_end() {
@@ -1235,7 +1360,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Watched(Arc<AtomicUsize>);
         impl Engine for Watched {
-            async fn send(&self, _: &str, _: bool, _: &str) -> Result<Sent, String> { Ok(Sent::Unconfirmed) }
+            async fn send(&self, _: &str, _: bool, _: &str, _: &[Attachment]) -> Result<Sent, String> { Ok(Sent::Unconfirmed) }
             async fn stop(&self) -> Result<(), String> { Ok(()) }
             async fn watchers(&self, n: usize) { self.0.store(n, Ordering::Relaxed); }
         }
