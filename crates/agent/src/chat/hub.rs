@@ -282,12 +282,17 @@ fn is_todo(ev: &Value) -> bool {
     ev["type"] == "cdash" && ev["subtype"] == "todo"
 }
 
-/// Where the cut event `cut` leaves `log`, the part of a log still in memory:
-/// the length to keep, or `None` when it removes nothing or its anchor is not
-/// there (then nothing is removed, so chat never hides what the tool continues
-/// from). The hub and Claude's `history` replay both place cuts here, so their
-/// positions agree.
-pub(crate) fn place_cut<'a, I>(log: I, cut: &Value) -> Option<usize>
+fn is_retract(ev: &Value) -> bool {
+    ev["type"] == "cdash" && ev["subtype"] == "retract"
+}
+
+/// Where the cut event `cut` leaves `log`, the part of a log still in memory
+/// after `base` events left it: the length to keep, or `None` when it removes
+/// nothing or its anchor is not there (then nothing is removed, so chat never
+/// hides what the tool continues from). A `null` anchor is the log's start,
+/// which is not there once `base > 0`. The hub and Claude's `history` replay
+/// both place cuts here, so their positions agree.
+pub(crate) fn place_cut<'a, I>(log: I, base: usize, cut: &Value) -> Option<usize>
 where
     I: IntoIterator<Item = &'a Value>,
     I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
@@ -295,9 +300,9 @@ where
     let mut log = log.into_iter();
     let len = log.len();
     let keep = match &cut["after"] {
-        Value::Null => 0,
+        Value::Null if base == 0 => 0,
         // A retract's uuid names the prompt it withdraws, not itself.
-        Value::String(u) => 1 + log.rposition(|e| e["uuid"] == u.as_str() && !(e["type"] == "cdash" && e["subtype"] == "retract"))?,
+        Value::String(u) => 1 + log.rposition(|e| e["uuid"] == u.as_str() && !is_retract(e))?,
         _ => return None,
     };
     (keep < len).then_some(keep)
@@ -485,6 +490,9 @@ impl<E: Engine> Actor<E> {
             self.todo = self.log_events.iter().rposition(is_todo).map(|i| (self.base + i + 1, self.log_events[i]["items"].clone()));
         }
         self.epoch = new_epoch();
+        if self.out.receiver_count() == 0 {
+            return;
+        }
         for f in self.backlog(None, None) {
             let _ = self.out.send(f);
         }
@@ -551,7 +559,7 @@ impl<E: Engine> Actor<E> {
 
     fn event(&mut self, mut ev: Value) {
         if is_cut(&ev) {
-            if let Some(len) = place_cut(&self.log_events, &ev) {
+            if let Some(len) = place_cut(&self.log_events, self.base, &ev) {
                 self.cut_to(len);
             }
             return;
@@ -1527,6 +1535,36 @@ mod tests {
         settle().await;
         let st = last_state(&hub.subscribe(None, None).await.unwrap());
         assert_eq!((st["usage"].clone(), st["tasks"].clone(), hub.folder().await), (Value::Null, json!([]), None));
+    }
+    #[tokio::test]
+    async fn a_root_cut_cuts_everything_in_memory_and_nothing_once_events_left_it() {
+        let head = |s: Subscription| serde_json::from_str::<Value>(&s.backlog[0]).unwrap()["head"].clone();
+        let (hub, tx, _) = rig();
+        log6(&tx).await;
+        tx.send(EngineMsg::Ev(cut(None))).await.unwrap();
+        settle().await;
+        assert_eq!(head(hub.subscribe(None, None).await.unwrap()), 0, "the whole log goes");
+        let (hub, tx, _) = rig();
+        for i in 0..=WINDOW { tx.send(EngineMsg::Ev(answer(&format!("k{i}")))).await.unwrap(); } // position 1 leaves memory
+        tx.send(EngineMsg::Ev(cut(None))).await.unwrap();
+        settle().await;
+        assert_eq!(head(hub.subscribe(None, None).await.unwrap()), WINDOW + 1, "the start is not in memory: nothing goes");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_at_a_retracted_prompt_keeps_the_prompt_not_the_retract() {
+        let (hub, tx, _) = rig();
+        hub.command(send("c1", "first")).await;
+        tx.send(engine_status(true, false)).await.unwrap();
+        tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
+        settle().await;
+        hub.command(ClientFrame::Stop).await;
+        tx.send(engine_status(false, false)).await.unwrap();
+        tokio::time::sleep(STOP_SETTLE + Duration::from_millis(300)).await; // the retract, also uuid u1, lands at position 2
+        tx.send(EngineMsg::Ev(cut(Some("u1")))).await.unwrap();
+        settle().await;
+        let b: Vec<Value> = hub.subscribe(None, None).await.unwrap().backlog.iter().map(|f| serde_json::from_str(f).unwrap()).collect();
+        assert_eq!(b[0]["head"], 1, "a retract names the prompt it withdraws; it is not the anchor");
+        assert_eq!(b[1]["ev"]["uuid"], "u1");
     }
     #[tokio::test]
     async fn the_checklist_is_the_latest_kept_todo_and_a_reset_clears_it() {

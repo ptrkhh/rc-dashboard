@@ -241,13 +241,13 @@ impl Engine for ClaudeEngine {
         let path = self.transcript.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("no conversation yet")?;
         let (mut tail, mut tap) = (Tail::new(path), Tap::default());
         // Events `base + 1..` mirror the hub's memory: a cut whose anchor left it removes nothing.
-        // ponytail: the hub's window also counts its own retracts, so with retracts its edge sits a few events later than this one.
+        // ponytail: the hub's window also counts its own retracts, so ≤R older rows (R = hub retracts in the window) can shift by the cut's length; have the hub count retract extras in its window so both windows hold the same engine events.
         let (mut all, mut base, span) = (Vec::new(), 0, from as usize..=to as usize);
         loop {
             for line in tail.poll().await.map_err(|e| e.to_string())? {
                 for ev in tap.feed(&line) {
                     if is_cut(&ev) {
-                        if let Some(len) = place_cut(&all[base..], &ev) {
+                        if let Some(len) = place_cut(&all[base..], base, &ev) {
                             all.truncate(base + len);
                         }
                         continue;
@@ -1004,10 +1004,26 @@ pub(crate) mod tests {
     async fn a_cut_whose_anchor_left_the_hubs_window_removes_nothing_in_an_older_page_either() {
         let turn: String = include_str!("testdata/rewind.jsonl").lines().take(5).map(|l| format!("{l}\n")).collect(); // prompt, reply, turn end
         let end = "37929adb-63f0-4e64-b002-3f3c2f2a84b4";
-        let back = json!({"type":"user","uuid":"b1","parentUuid":end,"promptSource":"typed","message":{"role":"user","content":"back"}});
-        let (hub, _) = hub_over("history-far", &format!("{turn}{}{back}\n", replies(end, WINDOW))).await;
-        assert_eq!(hub_head(&hub).await, 3 + WINDOW + 1, "the turn end had left memory: nothing was cut");
-        let p = page(&hub, 5, 4).await;
-        assert_eq!((p["events"][3]["seq"].as_u64(), p["events"][3]["ev"]["uuid"].as_str()), (Some(4), Some("f0")), "the source keeps what the hub kept");
+        // Back to the turn end (a cut after it), or to the record before any event (a cut after null).
+        for (tag, parent) in [("history-far", end), ("history-far-root", ROOT)] {
+            let back = json!({"type":"user","uuid":"b1","parentUuid":parent,"promptSource":"typed","message":{"role":"user","content":"back"}});
+            let (hub, _) = hub_over(tag, &format!("{turn}{}{back}\n", replies(end, WINDOW))).await;
+            assert_eq!(hub_head(&hub).await, 3 + WINDOW + 1, "{tag}: the anchor had left memory, so nothing was cut");
+            let p = page(&hub, 5, 4).await;
+            assert_eq!((p["events"][3]["seq"].as_u64(), p["events"][3]["ev"]["uuid"].as_str()), (Some(4), Some("f0")), "{tag}: the source keeps what the hub kept");
+        }
+    }
+    /// The fixture's first record, which shows no event.
+    const ROOT: &str = "b2d9530c-cfa3-452a-8335-e1f1ef9c5d5a";
+    #[tokio::test]
+    async fn a_root_cut_in_memory_leaves_the_replay_only_what_follows_it() {
+        let turn: String = include_str!("testdata/rewind.jsonl").lines().take(5).map(|l| format!("{l}\n")).collect();
+        let back = json!({"type":"user","uuid":"b1","parentUuid":ROOT,"promptSource":"typed","message":{"role":"user","content":"back"}});
+        let (ctx, dir) = fixture_ctx("history-root");
+        write_transcript(&dir, "sid-1", &format!("{turn}{back}\n"));
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        let page = engine.history(1, 4).await.unwrap();
+        assert_eq!(page.iter().map(|e| e["uuid"].as_str().unwrap()).collect::<Vec<_>>(), ["b1"]);
     }
 }
