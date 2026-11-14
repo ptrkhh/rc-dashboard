@@ -215,9 +215,11 @@ Each device has its own switch, **Notifications on this device**, in the dashboa
 
 - A browser needs HTTPS or 127.0.0.1. On any other page the switch is disabled and says `needs HTTPS or 127.0.0.1`.
 - The Windows app registers its app ID (`HKCU\Software\Classes\AppUserModelId\dev.cdash.app`, no admin rights) while notifications are on, and removes it when they are off.
-- The Android app keeps a background service running with a quiet permanent notification (`Watching for replies`) and asks to be exempt from battery optimisation so replies still reach you.
+- The Android app keeps a background service running with a quiet permanent notification (`Watching for replies`) and asks for the Android notification permission and to be exempt from battery optimisation so replies still reach you. If you decline the exemption the service still runs, but Android may cut the connection while the phone sleeps.
 - A notification appears when a session finishes a turn, stops with an error, or needs your answer. The title is the project folder.
-- Push services see only an encrypted payload holding a session name, a project folder name, a kind and a time. No message text, tool names or file names.
+- Push services see only encrypted payloads, and the payload they carry holds only a session name, a project folder name, a kind and a time. No message text, tool names or file names.
+
+Windows and Android notification behaviour is not yet checked on real devices.
 
 ## Technical reference
 

@@ -122,6 +122,8 @@ Chat reads them in `crates/agent/src/chat/tap.rs` and `claude.rs`.
 - **Status file details (observed on 2.1.323).** `status: "shell"` is idle
   with background work still running. `waitingFor: "dialog open"` is also
   set for the `/exit` confirmation and the rewind selector. About 0.1 s
-  after Esc the status file shows `idle`.
-- **API error turns (observed on 2.1.323).** Turns whose last message has
-  `isApiErrorMessage` still end with a `turn_duration` record.
+  after Esc during a running tool the status file shows `idle`; that turn
+  writes no `turn_duration`.
+- **API error turns (observed on 2.1.323).** In 29 of 30 observed turns, a turn
+  whose last message has `isApiErrorMessage` still ends with a
+  `turn_duration` record.
