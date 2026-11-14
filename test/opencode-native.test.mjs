@@ -254,7 +254,24 @@ test('the supervisor serves chat: history, send as steering, and stop', { timeou
   assert.ok(!String(f.output()).includes('"t":"'), 'no feed frame leaked onto the TUI');
 });
 
-test('one failed history read neither leaves chat connecting forever nor freezes it', { timeout: 20000 }, async t => {
+test('a stop from any door reaches chat as interrupted, and a failed turn as an error', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const sid = f.native().sid;
+  const results = () => c.lines.filter(l => l.t === 'ev' && l.ev.type === 'result').map(l => l.ev.subtype);
+  await f.emit({ type: 'session.execution.started', data: { sessionID: sid } });
+  await f.emit({ type: 'session.execution.interrupted', data: { sessionID: sid } });
+  await until(() => results().length === 1);
+  await f.emit({ type: 'session.execution.started', data: { sessionID: sid } });
+  await f.emit({ type: 'session.execution.failed', data: { sessionID: sid } });
+  await until(() => results().length === 2);
+  assert.deepEqual(results(), ['interrupted', 'error_during_execution']);
+  c.close();
+});
+
+test('one failed history read neither leaves chat connecting forever nor freezes it',{ timeout: 20000 }, async t => {
   const f = await fixture(t, { flakyMessages: true });
   await f.wait(() => f.native()?.chat_sock);
   const c = await client(f.native().chat_sock, { after: 0, epoch: null });
