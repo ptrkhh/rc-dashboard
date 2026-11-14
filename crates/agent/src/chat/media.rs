@@ -2,6 +2,7 @@
 //! under `<cache>/uploads/<session>/<id>/`, images shown in chat under
 //! `<cache>/media/<sha256>.<ext>`. Folders are 0700, files 0600.
 
+use super::hub::{new_epoch, Attachment, Kind};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -10,6 +11,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
+use tokio::io::AsyncWriteExt;
 
 pub const MAX_UPLOAD: u64 = 20 * 1024 * 1024;
 pub const MAX_FILES: usize = 10;
@@ -93,10 +95,86 @@ pub fn sanitize_name(raw: &str) -> String {
 
 /// `name` with its extension replaced by `ext`, at most 100 bytes. `name` must
 /// come from `sanitize_name` (ASCII, so the byte cut is safe).
-#[allow(dead_code)] // first caller arrives with the upload frames (Task 3)
 pub(crate) fn image_name(name: &str, ext: &str) -> String {
     let stem = name.rfind('.').map_or(name, |i| &name[..i]);
     format!("{}.{ext}", &stem[..stem.len().min(99 - ext.len())])
+}
+
+/// One upload in progress: `uploads_dir(session)/<id>/.part` until `finish`
+/// renames it. Dropped unfinished, it removes its folder.
+pub struct Upload {
+    dir: PathBuf,
+    id: String,
+    name: String,
+    file: tokio::fs::File,
+    size: u64,
+    got: u64,
+    head: Vec<u8>,
+    done: bool,
+}
+
+impl Upload {
+    pub async fn begin(session: &str, name: &str, size: u64) -> Result<Upload, String> {
+        if size == 0 {
+            return Err("empty file".into());
+        }
+        if size > MAX_UPLOAD {
+            return Err("file over 20 MB".into());
+        }
+        let dir = uploads_dir(session).ok_or("bad session")?;
+        let id = new_epoch();
+        let dir = dir.join(&id);
+        let opened = async {
+            private_dirs(&dir)?;
+            let file = tokio::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dir.join(".part")).await?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600)).await?;
+            Ok::<_, Error>(file)
+        };
+        match opened.await {
+            Ok(file) => Ok(Upload { dir, id, name: sanitize_name(name), file, size, got: 0, head: vec![], done: false }),
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                Err("upload failed".into())
+            }
+        }
+    }
+
+    /// `Ok(true)` once every declared byte has arrived.
+    pub async fn write(&mut self, chunk: &[u8]) -> Result<bool, String> {
+        if self.got + chunk.len() as u64 > self.size {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            return Err("more bytes than declared".into());
+        }
+        self.file.write_all(chunk).await.map_err(|_| "upload failed")?;
+        self.got += chunk.len() as u64;
+        let need = 16usize.saturating_sub(self.head.len()).min(chunk.len());
+        self.head.extend_from_slice(&chunk[..need]);
+        Ok(self.got == self.size)
+    }
+
+    pub async fn finish(mut self) -> Result<(String, Attachment), String> {
+        if self.got != self.size {
+            return Err("upload failed".into());
+        }
+        self.file.flush().await.map_err(|_| "upload failed")?;
+        let mime = sniff(&self.head).unwrap_or("application/octet-stream");
+        let (kind, name) = match image_ext(mime) {
+            Some(ext) => (Kind::Image, image_name(&self.name, ext)),
+            None => (Kind::File, self.name.clone()),
+        };
+        let path = self.dir.join(&name);
+        tokio::fs::rename(self.dir.join(".part"), &path).await.map_err(|_| "upload failed")?;
+        self.done = true;
+        Ok((self.id.clone(), Attachment { path, kind, mime: mime.into(), name, size: self.size }))
+    }
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 /// Store an image once under its hash; a rewrite only refreshes its age.
@@ -239,7 +317,7 @@ pub(crate) mod tests {
         for (bytes, mime) in [(&b"plain text"[..], "image/png"), (&png[..], "image/jpeg"), (&b"%PDF-1.7"[..], "application/pdf")] {
             assert_eq!(stash(bytes, mime).unwrap_err().kind(), std::io::ErrorKind::InvalidData, "{mime}");
         }
-        let _ = std::fs::remove_dir_all(cache_root().parent().unwrap());
+        let _ = std::fs::remove_file(&f); // not the whole root: other tests share it
     }
     #[test]
     fn the_sweep_removes_what_has_not_been_touched_for_the_limit() {
@@ -311,6 +389,44 @@ pub(crate) mod tests {
     fn a_session_name_that_is_not_one_plain_component_has_no_folder() {
         for bad in ["", ".", "..", "a/b", "../x"] { assert_eq!(uploads_dir(bad), None, "{bad:?}"); }
         assert!(uploads_dir("cdash-a_1").is_some());
+    }
+    #[tokio::test]
+    async fn an_upload_over_the_limit_or_empty_is_refused_before_anything_is_written() {
+        let dir = uploads_dir("cdash-up-limit").unwrap();
+        assert_eq!(Upload::begin("cdash-up-limit", "big.bin", MAX_UPLOAD + 1).await.err().as_deref(), Some("file over 20 MB"));
+        assert_eq!(Upload::begin("cdash-up-limit", "e.txt", 0).await.err().as_deref(), Some("empty file"));
+        assert_eq!(Upload::begin("../x", "a.txt", 1).await.err().as_deref(), Some("bad session"));
+        assert!(!dir.exists(), "nothing was created");
+        drop(Upload::begin("cdash-up-limit", "ok.bin", MAX_UPLOAD).await.unwrap());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "an unfinished upload leaves no folder");
+    }
+    #[tokio::test]
+    async fn bytes_past_the_declared_size_abort_the_upload_and_delete_it() {
+        let mut u = Upload::begin("cdash-up-over", "a.txt", 4).await.unwrap();
+        assert_eq!(u.write(b"ab").await, Ok(false));
+        assert_eq!(u.write(b"cdef").await, Err("more bytes than declared".to_string()));
+        drop(u);
+        assert_eq!(std::fs::read_dir(uploads_dir("cdash-up-over").unwrap()).unwrap().count(), 0);
+    }
+    #[tokio::test]
+    async fn a_finished_upload_is_named_typed_by_its_bytes_and_private() {
+        let up = uploads_dir("cdash-up-done").unwrap();
+        let png = [PNG, b"0123"].concat();
+        let mut u = Upload::begin("cdash-up-done", "../My Shot.JPG", png.len() as u64).await.unwrap();
+        assert_eq!(u.write(&png[..5]).await, Ok(false));
+        assert_eq!(u.write(&png[5..]).await, Ok(true));
+        let (id, a) = u.finish().await.unwrap();
+        assert!(id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(a.path, up.join(&id).join("My Shot.png"), "a PNG named .JPG is stored as .png");
+        assert_eq!((a.kind, a.mime.as_str(), a.name.as_str(), a.size), (Kind::Image, "image/png", "My Shot.png", 12));
+        assert_eq!((std::fs::read(&a.path).unwrap(), mode(&a.path)), (png, 0o600));
+        assert!(!up.join(&id).join(".part").exists(), "the part file was renamed");
+        for d in [cache_root().join("uploads"), up.clone(), up.join(&id)] { assert_eq!(mode(&d), 0o700, "{d:?}"); }
+        let mut t = Upload::begin("cdash-up-done", "notes.png", 5).await.unwrap();
+        assert_eq!(t.write(b"hello").await, Ok(true));
+        let (_, f) = t.finish().await.unwrap();
+        assert_eq!((f.kind, f.mime.as_str(), f.name.as_str()), (Kind::File, "application/octet-stream", "notes.png"), "a text file named .png stays a file");
+        let _ = std::fs::remove_dir_all(&up);
     }
     #[test]
     fn a_trimmed_long_name_never_ends_in_a_space() {

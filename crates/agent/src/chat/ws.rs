@@ -1,9 +1,11 @@
 //! The WebSocket between one browser and a session's hub.
 
 use super::hub::{ClientFrame, Hub};
+use super::media::Upload;
 use crate::collect::ctx::{Ctx, FocusGuard};
 use crate::collect::term::{send_or_drop, PING_EVERY};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -21,6 +23,11 @@ pub async fn serve(ctx: Arc<Ctx>, hub: Hub, name: String, after: Option<u64>, ep
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), drain).await;
     }
     ctx.host.log.push(format!("chat close {name}"));
+}
+
+fn refused(ctx: &Ctx, name: &str, reference: &str, e: &str) -> String {
+    ctx.host.log.push(format!("chat upload refused {name}: {e}"));
+    json!({"t": "uploaded", "ref": reference, "error": e}).to_string()
 }
 
 fn ends_session(f: &str) -> bool {
@@ -44,6 +51,8 @@ async fn pump(ctx: &Ctx, name: &str, hub: &Hub, after: Option<u64>, epoch: Optio
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heard = true;
     let mut focus = FocusGuard::new(ctx, name);
+    // The one open upload and its `ref`; dropping it deletes its folder.
+    let mut upload: Option<(String, Upload)> = None;
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -72,10 +81,45 @@ async fn pump(ctx: &Ctx, name: &str, hub: &Hub, after: Option<u64>, epoch: Optio
                             focus.set(on);
                             continue;
                         }
+                        if let ClientFrame::Upload { reference, name: file, size } = frame {
+                            let begun = if upload.is_some() { Err("one upload at a time".into()) } else { Upload::begin(name, &file, size).await };
+                            match begun {
+                                Ok(u) => upload = Some((reference, u)),
+                                Err(e) => {
+                                    if !send_or_drop(ws, Message::Text(refused(ctx, name, &reference, &e).into())).await {
+                                        return None;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(reply) = hub.command(frame).await {
                             if !send_or_drop(ws, Message::Text(reply.as_ref().into())).await {
                                 return None;
                             }
+                        }
+                    }
+                    Some(Ok(Message::Binary(b))) => {
+                        let Some((_, u)) = upload.as_mut() else { continue };
+                        let written = u.write(&b).await;
+                        if matches!(written, Ok(false)) {
+                            continue;
+                        }
+                        // Done or failed: the slot empties either way, and a failed upload's folder goes with it.
+                        let Some((reference, u)) = upload.take() else { continue };
+                        let reply = match written {
+                            Ok(_) => match u.finish().await {
+                                Ok((id, a)) => {
+                                    hub.add_upload(id.clone(), a.clone()).await;
+                                    ctx.host.log.push(format!("chat upload {name}"));
+                                    json!({"t": "uploaded", "ref": reference, "id": id, "name": a.name, "size": a.size, "kind": a.kind, "mime": a.mime}).to_string()
+                                }
+                                Err(e) => refused(ctx, name, &reference, &e),
+                            },
+                            Err(e) => refused(ctx, name, &reference, &e),
+                        };
+                        if !send_or_drop(ws, Message::Text(reply.into())).await {
+                            return None;
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
@@ -89,11 +133,12 @@ async fn pump(ctx: &Ctx, name: &str, hub: &Hub, after: Option<u64>, epoch: Optio
 #[cfg(test)]
 mod tests {
     use crate::chat::claude::tests::{append, fixture_lines, fixture_with, write_session};
+    use crate::chat::media;
     use crate::chat::tmux_io::tests::{eventually, tempfile_path};
     use crate::collect::ctx::Ctx;
     use crate::http::serve::{serve, tests::cfg_for};
     use futures_util::{SinkExt, StreamExt};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
@@ -207,6 +252,48 @@ mod tests {
         eventually("chat focus counted", || b.ctx.focused("cdash-a")).await;
         drop(ws); // no "focus off": the phone went to sleep
         eventually("dropped socket uncounted", || !b.ctx.focused("cdash-a")).await;
+    }
+    #[tokio::test]
+    async fn an_upload_on_the_chat_socket_returns_an_id_that_send_accepts() {
+        let (b, _dir) = chat_server("upload").await;
+        let mut ws = connect(b.addr, "name=cdash-upload-flow", None).await.unwrap();
+        next_of(&mut ws, "state").await;
+        ws.send(WsMsg::Text(r#"{"t":"upload","ref":"r1","name":"notes.txt","size":11}"#.into())).await.unwrap();
+        for part in [&b"hello"[..], b" world"] { ws.send(WsMsg::Binary(part.to_vec().into())).await.unwrap(); }
+        let up = next_of(&mut ws, "uploaded").await;
+        assert_eq!((up["ref"].as_str(), up["name"].as_str(), up["kind"].as_str(), up["size"].as_u64(), up["mime"].as_str()),
+            (Some("r1"), Some("notes.txt"), Some("file"), Some(11), Some("application/octet-stream")));
+        let id = up["id"].as_str().unwrap().to_string();
+        let dir = media::uploads_dir("cdash-upload-flow").unwrap();
+        assert_eq!(std::fs::read(dir.join(&id).join("notes.txt")).unwrap(), b"hello world");
+        ws.send(WsMsg::Text(format!(r#"{{"t":"send","cid":"c1","text":"read it","files":["{id}"]}}"#).into())).await.unwrap();
+        assert_eq!(next_of(&mut ws, "ack").await["status"], "sent");
+        let log = b.ctx.host.log.lines().join("\n");
+        assert!(log.contains("chat upload cdash-upload-flow") && !log.contains("notes.txt") && !log.contains("read it"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[tokio::test]
+    async fn refused_parallel_and_abandoned_uploads_leave_nothing_behind() {
+        let (b, _dir) = chat_server("upload-refused").await;
+        let mut ws = connect(b.addr, "name=cdash-upload-gone", None).await.unwrap();
+        next_of(&mut ws, "state").await;
+        let text = |s: String| WsMsg::Text(s.into());
+        ws.send(WsMsg::Binary(b"stray".to_vec().into())).await.unwrap(); // no open upload: ignored
+        ws.send(text(format!(r#"{{"t":"upload","ref":"r1","name":"big.bin","size":{}}}"#, media::MAX_UPLOAD + 1))).await.unwrap();
+        assert_eq!(next_of(&mut ws, "uploaded").await, json!({"t":"uploaded","ref":"r1","error":"file over 20 MB"}));
+        ws.send(text(r#"{"t":"upload","ref":"r2","name":"a.txt","size":4}"#.into())).await.unwrap();
+        ws.send(WsMsg::Binary(b"abcdef".to_vec().into())).await.unwrap();
+        assert_eq!(next_of(&mut ws, "uploaded").await, json!({"t":"uploaded","ref":"r2","error":"more bytes than declared"}));
+        ws.send(text(r#"{"t":"upload","ref":"r3","name":"b.txt","size":10}"#.into())).await.unwrap();
+        ws.send(text(r#"{"t":"upload","ref":"r4","name":"c.txt","size":10}"#.into())).await.unwrap();
+        assert_eq!(next_of(&mut ws, "uploaded").await, json!({"t":"uploaded","ref":"r4","error":"one upload at a time"}));
+        ws.send(WsMsg::Binary(b"abc".to_vec().into())).await.unwrap();
+        let dir = media::uploads_dir("cdash-upload-gone").unwrap();
+        eventually("r3 is on disk", || std::fs::read_dir(&dir).is_ok_and(|d| d.count() == 1)).await;
+        drop(ws); // the socket closes in the middle of r3
+        eventually("the abandoned upload is gone", || std::fs::read_dir(&dir).map_or(true, |d| d.count() == 0)).await;
+        let log = b.ctx.host.log.lines().join("\n");
+        assert!(log.contains("chat upload refused cdash-upload-gone: one upload at a time") && !log.contains("big.bin"));
     }
     #[tokio::test]
     async fn garbage_frames_are_ignored_and_a_bare_terminal_pane_has_no_chat() {
