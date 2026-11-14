@@ -4,11 +4,12 @@ import { spawn } from 'node:child_process';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { createServer, createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
-import { readFile, writeFile, rename, mkdir, chmod, rm, readdir, mkdtemp, open, access } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { readFile, writeFile, rename, mkdir, chmod, rm, readdir, mkdtemp, open, access, stat } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
 
+const CODEX_IMAGES_MAX = 24 * 1024 * 1024; // Codex's base64 image budget per message
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const args = process.argv.slice(2);
 const option = key => args[args.indexOf(key) + 1];
@@ -163,7 +164,9 @@ function toolMessages(item, completed = true) {
   return messages;
 }
 
-async function replayHistory(codex, threadId, remoteSid, emit, submitted = new Set()) {
+const textOnly = async item => ({ content: item.content.filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text })) });
+
+async function replayHistory(codex, threadId, remoteSid, emit, submitted = new Set(), shapeUser = textOnly) {
   let cursor;
   const seen = new Set();
   do {
@@ -176,13 +179,11 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
       }
       const role = item.type === 'userMessage' ? 'user' : item.type === 'agentMessage' ? 'assistant' : null;
       if (!role || (role === 'user' && submitted.has(item.clientId))) continue;
-      const content = role === 'user'
-        ? item.content.filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text }))
-        : [{ type: 'text', text: item.text }];
-      if (!content.length) continue;
+      const { content, files } = role === 'user' ? await shapeUser(item) : { content: [{ type: 'text', text: item.text }] };
+      if (!content.length && !files?.length) continue;
       // Stable UUIDs let the remote deduplicate a replay interrupted by a crash.
       const uuid = messageUuid(remoteSid, threadId, turn.id, item.id);
-      await emit({ uuid, type: role, message: { id: item.id, role, content, ...(role === 'assistant' ? { stop_reason: item.phase === 'commentary' ? null : 'end_turn' } : {}) } });
+      await emit({ uuid, type: role, message: { id: item.id, role, content, ...(role === 'assistant' ? { stop_reason: item.phase === 'commentary' ? null : 'end_turn' } : {}) }, ...(files?.length ? { files } : {}) });
     }
     cursor = page.nextCursor;
     if (cursor && seen.has(cursor)) throw Error('Repeated Codex history cursor');
@@ -193,15 +194,37 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
 // Chat's view of one app-server notification, in the shapes the worker sends
 // Remote Control. Prompts typed in the native TUI arrive here too.
 // ponytail: mirrors the worker's inline shaping; fold the two together when the worker is next reworked.
-function chatMessages(m, sid) {
+// A userMessage item as chat shows it: its text without the `Attached:` lines, and files
+// as cache refs. Image bytes (a data URL, or a file Codex names) never leave this function.
+async function chatPrompt(item) {
+  const { MAX_MEDIA, splitAttached, stashMedia } = await import('./chat-feed.mjs'); // lazy: the worker is also copied alone
+  const blocks = item.content || [];
+  const { text, files: attached } = splitAttached(blocks.filter(b => b.type === 'text').map(b => b.text).join(''));
+  const images = [];
+  for (const b of blocks) {
+    let bytes = null, name = 'image';
+    if (b.type === 'image' && typeof b.url === 'string' && b.url.startsWith('data:')) {
+      const b64 = b.url.slice(b.url.indexOf(',') + 1);
+      if (b64.length / 4 * 3 <= MAX_MEDIA) bytes = Buffer.from(b64, 'base64'); // history is untrusted: never decode a huge one
+    } else if (b.type === 'localImage' && typeof b.path === 'string') {
+      name = basename(b.path);
+      try { if ((await stat(b.path)).size <= MAX_MEDIA) bytes = await readFile(b.path); } catch { /* gone */ }
+    } else continue;
+    const m = bytes && await stashMedia(process.env.CDASH_MEDIA_DIR, bytes);
+    images.push(m ? { kind: 'image', ref: m.ref, mime: m.mime } : { kind: 'file', name });
+  }
+  return { text, files: [...images, ...attached] };
+}
+
+async function chatMessages(m, sid) {
   const p = m.params || {};
   let out = [];
   if (m.method === 'item/started' && p.item) out = toolMessages(p.item, false);
   else if (m.method === 'item/completed' && p.item) {
     const item = p.item;
     if (item.type === 'userMessage') {
-      const content = (item.content || []).filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text }));
-      if (content.length) out = [{ type: 'user', message: { id: item.id, role: 'user', content } }];
+      const { text, files } = await chatPrompt(item);
+      if (text || files.length) out = [{ type: 'user', message: { id: item.id, role: 'user', content: text ? [{ type: 'text', text }] : [] }, ...(files.length ? { files } : {}) }];
     } else if (item.type === 'agentMessage') {
       out = [{ type: 'assistant', message: { id: item.id, role: 'assistant', content: [{ type: 'text', text: item.text }] } }];
     } else out = toolMessages(item);
@@ -210,6 +233,17 @@ function chatMessages(m, sid) {
     out = [{ type: 'result', subtype: status === 'interrupted' ? 'interrupted' : status === 'completed' ? 'success' : 'error_during_execution' }];
   }
   return out.map(msg => ({ ...msg, uuid: messageUuid('cdash-chat', sid, p.turnId ?? p.turn?.id, msg.message?.id ?? 'result') }));
+}
+
+// A prompt's input blocks: text with the other files as `Attached:` lines, then each image as a data URL.
+async function codexInput(text, files) {
+  const { withAttached } = await import('./chat-feed.mjs');
+  const images = files.filter(f => f.kind === 'image');
+  const sizes = await Promise.all(images.map(async f => Math.max(f.size || 0, (await stat(f.path)).size)));
+  if (sizes.reduce((a, b) => a + b, 0) > CODEX_IMAGES_MAX) throw Error('too many images for one Codex message');
+  const body = withAttached(text, files.filter(f => f.kind !== 'image').map(f => f.path));
+  return [...(body ? [{ type: 'text', text: body, text_elements: [] }] : []),
+    ...await Promise.all(images.map(async f => ({ type: 'image', url: `data:${f.mime};base64,${(await readFile(f.path)).toString('base64')}` })))];
 }
 
 const CODEX_COMMANDS = [
@@ -542,9 +576,10 @@ async function nativeLauncher(statePath, state, script) {
   // long as the pane, independent of Remote Control.
   const feed = new ChatFeed({
     ops,
-    send: async (text, { steer }) => {
+    send: async (text, { steer, files = [] }) => {
       const [, name, rest = ''] = /^\/([A-Za-z0-9_:-]+)(?:\s+([\s\S]*))?$/.exec(text) || []; // `/usr/bin/x ...` is a prompt
-      if (!name) return submit([{ type: 'text', text, text_elements: [] }], steer);
+      // ponytail: attachments on a command are ignored; refuse them if owners hit it.
+      if (!name) return submit(await codexInput(text, files), steer);
       const arg = rest.trim();
       if (name === 'compact') await control.call('thread/compact/start', { threadId: state.sid });
       else if (name === 'review') await control.call('review/start', { threadId: state.sid, target: { type: 'uncommittedChanges' } });
@@ -648,7 +683,7 @@ async function nativeLauncher(statePath, state, script) {
     }
     if (!mainThread(m, state.sid)) return; // a subagent's turns and items are not this conversation; its questions (above) still are
     if (state.sid) {
-      const chat = chatMessages(m, state.sid);
+      const chat = await chatMessages(m, state.sid);
       if (replayed) replayed.push(...chat); else for (const msg of chat) feed.accept(msg);
     }
     if (m.method === 'item/agentMessage/delta') feed.delta(p.itemId, p.delta);
@@ -703,7 +738,10 @@ async function nativeLauncher(statePath, state, script) {
   if (resuming) {
     // Not awaited: the TUI must not wait for history.
     replayed = [];
-    replayHistory(control, state.sid, 'cdash-chat', async msg => feed.accept(msg))
+    replayHistory(control, state.sid, 'cdash-chat', async msg => feed.accept(msg), new Set(), async item => {
+      const p = await chatPrompt(item);
+      return { content: p.text ? [{ type: 'text', text: p.text }] : [], ...(p.files.length ? { files: p.files } : {}) };
+    })
       .catch(e => log.write(`${new Date().toISOString()} chat history replay failed: ${e.message}\n`).catch(() => {}))
       .finally(() => {
         const live = replayed;

@@ -6,6 +6,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 
 async function fixture(t, failure = '', platform = 'linux', resuming = false) {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-native-test-'));
@@ -51,7 +52,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  if(['thread/start','thread/resume'].includes(m.method))send({thread:{id:'01234567-1234-1234-1234-0123456789ab'},model:'gpt-check',reasoningEffort:'low'});
  if(m.method==='thread/name/set')send({});
  if(m.method==='thread/turns/list')send({data:[{id:'t1',items:[
-   {id:'u1',type:'userMessage',content:[{type:'text',text:'hello'}]},
+   {id:'u1',type:'userMessage',content:[{type:'text',text:'hello'},{type:'image',url:'data:image/png;base64,'+Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('hist')]).toString('base64')}]},
    {id:'a1',type:'agentMessage',text:'hi there',phase:'final'}]}],nextCursor:null});
  if(['turn/steer','turn/interrupt','thread/settings/update','thread/compact/start','review/start'].includes(m.method))send({});
  if(m.method==='model/list')send({data:[{model:'gpt-check',displayName:'GPT Check',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'high'}],defaultReasoningEffort:'low'},{model:'gpt-mini',displayName:'GPT Mini',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'}],defaultReasoningEffort:'low'}],nextCursor:null});
@@ -73,7 +74,7 @@ setInterval(()=>{const marker=process.env.CDASH_CHECK_ROOT+'/stop-remote';if(fs.
   const pin = `data:text/javascript,${encodeURIComponent(`Object.defineProperty(process,'platform',{value:'${platform}'})`)}`;
   const child = spawn(process.execPath, ['--import', pin, resolve('crates/agent/src/collect/codex-remote.mjs'), '--state', state, '--name', 'cdash-test'], {
     env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_CHECK_ROOT: dir, CDASH_CHECK_WIRE: wire,
-      CDASH_CHECK_FAILURE: failure, CDASH_CODEX_AGENT: join(dir, 'agent'), CLAUDE_CODE_SESSION_ACCESS_TOKEN: 'test-must-not-leak' },
+      CDASH_CHECK_FAILURE: failure, CDASH_MEDIA_DIR: join(dir, 'media'), CDASH_CODEX_AGENT: join(dir, 'agent'), CLAUDE_CODE_SESSION_ACCESS_TOKEN: 'test-must-not-leak' },
     stdio: ['pipe','pipe','pipe'],
   });
   let output = '';
@@ -105,11 +106,11 @@ setInterval(()=>{const marker=process.env.CDASH_CHECK_ROOT+'/stop-remote';if(fs.
 }
 
 async function client(path, first) {
-  const socket = createConnection(path); const lines = []; let buf = '';
-  socket.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { lines.push(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); } });
+  const socket = createConnection(path); const lines = [], sizes = []; let buf = '';
+  socket.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { sizes.push(i); lines.push(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); } });
   await new Promise(r => socket.once('connect', r));
   socket.write(JSON.stringify(first) + '\n');
-  return { lines, write: o => socket.write(JSON.stringify(o) + '\n'), close: () => socket.destroy() };
+  return { lines, sizes, write: o => socket.write(JSON.stringify(o) + '\n'), close: () => socket.destroy() };
 }
 const SID = '01234567-1234-1234-1234-0123456789ab';
 const res = async (c, rid) => { await until(() => c.lines.some(l => l.t === 'res' && l.rid === rid)); return c.lines.find(l => l.t === 'res' && l.rid === rid); };
@@ -424,5 +425,45 @@ test('a path-like prompt is a prompt; set model falls back to the model default 
   assert.equal((await res(c, 3)).ok, true);
   await until(() => asksNow(c).length === 0);
   assert.equal(f.rpc('turn/start').id, before.id, 'no prompt sent');
+  c.close();
+});
+
+const PNG = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('hist')]);  // also the fixture's u1 image
+const sha = b => createHash('sha256').update(b).digest('hex');
+test('chat sends Codex images as data URLs and other files as paths, within its image budget', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const png = join(f.dir, 'a.png'); await writeFile(png, PNG);
+  const image = { path: png, kind: 'image', mime: 'image/png', name: 'a.png', size: PNG.length };
+  c.write({ t: 'send', cid: 'c1', text: 'look', steer: false, files: [image, { path: '/u/up/r.pdf', kind: 'file', mime: 'application/pdf', name: 'r.pdf', size: 9 }] });
+  await until(() => f.rpc('turn/start'));
+  assert.deepEqual(f.rpc('turn/start').params.input, [{ type: 'text', text: 'look\nAttached: /u/up/r.pdf', text_elements: [] },
+    { type: 'image', url: 'data:image/png;base64,' + PNG.toString('base64') }]);
+  const big = { ...image, size: 13 * 1024 * 1024 };
+  c.write({ t: 'send', cid: 'c2', text: 'two big ones', steer: false, files: [big, big] });
+  await until(() => c.lines.some(l => l.t === 'ack' && l.cid === 'c2'));
+  assert.deepEqual(c.lines.find(l => l.t === 'ack' && l.cid === 'c2'), { t: 'ack', cid: 'c2', ok: false, error: 'too many images for one Codex message' });
+  c.close();
+});
+test('image prompts from the native TUI and from history reach chat as cache refs, never as bytes', { timeout: 20000 }, async t => {
+  const f = await fixture(t, undefined, process.platform, true);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const history = c.lines.find(l => l.t === 'ev' && l.ev.type === 'user').ev;
+  assert.deepEqual([history.message.content[0].text, history.files], ['hello', [{ kind: 'image', ref: sha(PNG), mime: 'image/png' }]]);
+  const huge = Buffer.concat([PNG, Buffer.alloc(300 * 1024)]);
+  const up = '/home/u/.cache/cdash/uploads/cdash-test/0123456789abcdef';
+  await f.inject({ method: 'item/completed', params: { turnId: 't2', item: { id: 'u2', type: 'userMessage', content: [
+    { type: 'text', text: `see\nAttached: ${up}/r.pdf` }, { type: 'image', url: 'data:image/png;base64,' + huge.toString('base64') },
+    { type: 'localImage', path: join(f.dir, 'gone.png') }] } } });
+  await until(() => c.lines.some(l => l.t === 'ev' && l.ev.message?.id === 'u2'));
+  const ev = c.lines.find(l => l.t === 'ev' && l.ev.message?.id === 'u2').ev;
+  assert.equal(ev.message.content[0].text, 'see');
+  assert.deepEqual(ev.files, [{ kind: 'image', ref: sha(huge), mime: 'image/png' }, { kind: 'file', name: 'gone.png' }, { kind: 'file', name: 'r.pdf' }]);
+  assert.ok(existsSync(join(f.dir, 'media', sha(huge) + '.png')));
+  assert.ok(c.sizes.every(n => n < 64 * 1024), 'no line on the agent socket carries image bytes');
   c.close();
 });
