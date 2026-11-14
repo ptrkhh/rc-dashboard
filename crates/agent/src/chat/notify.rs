@@ -225,10 +225,10 @@ mod tests {
         assert!(inbox.take().is_empty(), "finished turns in history never notify");
         append(&transcript, &(fixture_lines(13..14) + &fixture_lines(9..10)));
         let done = inbox.wait(2).await;
-        assert_eq!(serde_json::from_slice::<Value>(&ece::decrypt(ka, &pa, &aa, &done[0].body)).unwrap()["k"], "done");
+        assert_eq!(serde_json::from_slice::<Value>(&ece::decrypt(ka, &pa, &aa, &done.iter().find(|r| r.id == "a").unwrap().body)).unwrap()["k"], "done");
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"permission prompt"}"#);
         let ask = inbox.wait(2).await;
-        assert_eq!(serde_json::from_slice::<Value>(&ece::decrypt(kb, &pb, &ab, &ask[1].body)).unwrap()["k"], "ask");
+        assert_eq!(serde_json::from_slice::<Value>(&ece::decrypt(kb, &pb, &ab, &ask.iter().find(|r| r.id == "b").unwrap().body)).unwrap()["k"], "ask");
         let mut looking = FocusGuard::new(&ctx, "cdash-a");
         looking.set(true);
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
