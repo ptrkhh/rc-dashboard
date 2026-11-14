@@ -104,6 +104,7 @@ support them keep compiling.
 | `rewind_undo(&self) -> Result<(), String>` (default `Err`) | Part 5 |
 | `aside(&self, id: &str, text: &str) -> Result<tokio::sync::mpsc::Receiver<AsideChunk>, String>` (default `Err`) | Part 5 |
 | `aside_cancel(&self, id: &str)` (default no-op) | Part 5 |
+| `history(&self, from: u64, to: u64) -> Result<Vec<Value>, String>`: the engine's own events numbered `from..=to` since the last `Reset`, re-read from the source; the hub keeps the last `hub::WINDOW` (2,000) events and pages older ones through it (default `Err("not supported")`) | Part 4 |
 
 All methods are `async` in the trait's existing style:
 `fn …(…) -> impl Future<Output = …> + Send`.

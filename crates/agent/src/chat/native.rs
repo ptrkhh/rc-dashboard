@@ -39,10 +39,13 @@ type Acks = Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>;
 struct Shared {
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
     acks: Acks,
+    /// The supervisor's epoch the reader last saw.
+    epoch: Mutex<Option<String>>,
 }
 
 pub struct NativeEngine {
     shared: Arc<Shared>,
+    sock: PathBuf,
 }
 
 impl NativeEngine {
@@ -77,15 +80,46 @@ impl Engine for NativeEngine {
     async fn stop(&self) -> Result<(), String> {
         self.write(r#"{"t":"stop"}"#.into()).await
     }
+
+    /// A second connection that resumes after `from - 1`; the supervisor's
+    /// replay ends with its `state` line.
+    async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
+        let epoch = self.shared.epoch.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("not connected")?;
+        let read = async {
+            let (r, mut w) = UnixStream::connect(&self.sock).await.map_err(|e| e.to_string())?.into_split();
+            let hello = serde_json::to_string(&Hello { after: from.saturating_sub(1), epoch: Some(&epoch) }).map_err(|e| e.to_string())?;
+            w.write_all(format!("{hello}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+            let (mut lines, mut out) = (BufReader::new(r).lines(), Vec::new());
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(mut v) = serde_json::from_str::<Value>(&line) else { continue };
+                match v["t"].as_str() {
+                    Some("hello") if v["epoch"].as_str() != Some(epoch.as_str()) => return Err("the session restarted".to_string()),
+                    Some("ev") => {
+                        let seq = v["seq"].as_u64().unwrap_or(0);
+                        if (from..=to).contains(&seq) {
+                            out.push(v["ev"].take());
+                        }
+                        if seq >= to {
+                            break;
+                        }
+                    }
+                    Some("state") => break,
+                    _ => {}
+                }
+            }
+            Ok(out)
+        };
+        tokio::time::timeout(ACK_WAIT, read).await.map_err(|_| "no answer from the session".to_string())?
+    }
 }
 
 pub fn start(sock: PathBuf, log: Arc<LogBuffer>, name: String) -> (NativeEngine, mpsc::Receiver<EngineMsg>) {
     // Roomy: the hub reads this channel while it waits on an ack the reader
     // routes, and Codex streams deltas.
     let (tx, rx) = mpsc::channel(4096);
-    let shared = Arc::new(Shared { writer: tokio::sync::Mutex::new(None), acks: Mutex::new(HashMap::new()) });
-    tokio::spawn(run(sock, Arc::clone(&shared), tx, log, name));
-    (NativeEngine { shared }, rx)
+    let shared = Arc::new(Shared { writer: tokio::sync::Mutex::new(None), acks: Mutex::new(HashMap::new()), epoch: Mutex::new(None) });
+    tokio::spawn(run(sock.clone(), Arc::clone(&shared), tx, log, name));
+    (NativeEngine { shared, sock }, rx)
 }
 
 async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, log: Arc<LogBuffer>, name: String) {
@@ -125,6 +159,7 @@ async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, lo
                     let e = v["epoch"].as_str().map(str::to_string);
                     let replaced = epoch.is_some() && e != epoch;
                     epoch = e;
+                    shared.epoch.lock().unwrap_or_else(|e| e.into_inner()).clone_from(&epoch);
                     if !replaced {
                         continue;
                     }
@@ -258,6 +293,42 @@ mod tests {
         engine.stop().await.unwrap();
         assert_eq!(sup.read_line().await, r#"{"t":"stop"}"#);
     }
+    /// Accept the next connection on the supervisor's socket, answer it with
+    /// `reply`, and return the hello it was sent.
+    async fn answer_once(sup: &FakeSup, reply: &str) -> String {
+        let (s, _) = tokio::time::timeout(std::time::Duration::from_secs(30), sup.listener.accept()).await.expect("a second connection").unwrap();
+        let (r, mut w) = s.into_split();
+        let mut hello = String::new();
+        BufReader::new(r).read_line(&mut hello).await.unwrap();
+        w.write_all(reply.as_bytes()).await.unwrap();
+        hello.trim_end().to_string()
+    }
+
+    #[tokio::test]
+    async fn history_reads_a_range_over_a_second_connection_and_refuses_another_epoch() {
+        let (sock, mut sup) = fake_supervisor("history");
+        let (engine, mut rx) = start(sock, log(), "cdash-a".into());
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":4}"#).await;
+        sup.write_line(r#"{"t":"ready"}"#).await;
+        assert!(matches!(rx.recv().await, Some(EngineMsg::Ready)));
+        let engine = Arc::new(engine);
+        let e = Arc::clone(&engine);
+        let reading = tokio::spawn(async move { e.history(2, 3).await });
+        let hello = answer_once(&sup, concat!(
+            r#"{"t":"hello","epoch":"e1","head":4}"#, "\n",
+            r#"{"t":"ev","seq":2,"ev":{"n":2}}"#, "\n",
+            r#"{"t":"ev","seq":3,"ev":{"n":3}}"#, "\n",
+            r#"{"t":"ev","seq":4,"ev":{"n":4}}"#, "\n",
+        )).await;
+        assert_eq!(hello, r#"{"after":1,"epoch":"e1"}"#);
+        assert_eq!(reading.await.unwrap(), Ok(vec![serde_json::json!({"n":2}), serde_json::json!({"n":3})]));
+        let e = Arc::clone(&engine);
+        let reading = tokio::spawn(async move { e.history(1, 1).await });
+        answer_once(&sup, concat!(r#"{"t":"hello","epoch":"e2","head":0}"#, "\n")).await;
+        assert!(reading.await.unwrap().is_err(), "another supervisor's positions are not these");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_supervisor_that_is_gone_ends_the_engine() {
         let sock = tempfile_path("gone").join("chat.sock");                  // nothing listens there

@@ -8,6 +8,7 @@ use super::wire::sanitize;
 use super::Frame;
 use crate::host::log::LogBuffer;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +18,8 @@ use tokio::time::Instant;
 /// Events a fresh client gets before it has to page.
 pub const BACKLOG: usize = 200;
 pub const PAGE_MAX: usize = 200;
+/// Events a hub keeps in memory; older pages are re-read from the source.
+pub const WINDOW: usize = 2000;
 /// A sent message the session's record never showed is reported after this.
 pub const CONFIRM_AFTER: Duration = Duration::from_secs(10);
 /// A Stop settles once the record has been quiet this long.
@@ -52,6 +55,11 @@ pub trait Engine: Send + Sync + 'static {
     /// Empty an input box a stopped prompt was handed back into.
     fn clear_input(&self, _text: &str) -> impl Future<Output = ()> + Send {
         async {}
+    }
+    /// The engine's own events numbered `from..=to` since the last `Reset`,
+    /// re-read from the source.
+    fn history(&self, _from: u64, _to: u64) -> impl Future<Output = Result<Vec<Value>, String>> + Send {
+        async { Err("not supported".to_string()) }
     }
 }
 
@@ -98,7 +106,9 @@ impl Hub {
             name,
             out,
             epoch: new_epoch(),
-            log_events: Vec::new(),
+            log_events: VecDeque::new(),
+            base: 0,
+            extra: Vec::new(),
             pending: Vec::new(),
             queue: Queue::default(),
             working: false,
@@ -190,8 +200,12 @@ struct Actor<E> {
     name: String,
     out: broadcast::Sender<Frame>,
     epoch: String,
-    // ponytail: the whole conversation is kept in memory; page from the source by offset if sessions get large enough to matter.
-    log_events: Vec<Value>,
+    /// Positions `base + 1..=head`, at most `WINDOW` of them.
+    log_events: VecDeque<Value>,
+    base: usize,
+    /// Events the hub appended itself, by position: the engine never numbered
+    /// them, so an engine number is a position less the extras before it.
+    extra: Vec<(usize, Value)>,
     pending: Vec<Pending>,
     queue: Queue,
     working: bool,
@@ -272,16 +286,21 @@ impl<E: Engine> Actor<E> {
         }
     }
 
+    fn head(&self) -> usize {
+        self.base + self.log_events.len()
+    }
+
     fn ev_frame(&self, seq: usize) -> Value {
-        json!({"t":"ev","seq":seq,"ev":self.log_events[seq - 1]})
+        json!({"t":"ev","seq":seq,"ev":self.log_events[seq - self.base - 1]})
     }
 
     /// Built inside the actor, so nothing is missed or repeated between the
     /// backlog and the live stream.
     fn subscription(&self, after: Option<u64>, epoch: Option<String>) -> Subscription {
         let live = self.out.subscribe();
-        let head = self.log_events.len();
-        let reset = epoch.as_deref() != Some(self.epoch.as_str());
+        let head = self.head();
+        // A position older than the window starts over, as a new conversation would.
+        let reset = epoch.as_deref() != Some(self.epoch.as_str()) || after.is_some_and(|a| (a as usize) < self.base);
         let first = match (reset, after) {
             (false, Some(a)) => (a as usize).min(head) + 1,
             _ => head.saturating_sub(BACKLOG) + 1,
@@ -295,9 +314,13 @@ impl<E: Engine> Actor<E> {
     }
 
     fn append(&mut self, ev: Value) {
-        self.log_events.push(ev);
-        let seq = self.log_events.len();
+        self.log_events.push_back(ev);
+        let seq = self.head();
         self.broadcast(self.ev_frame(seq));
+        if self.log_events.len() > WINDOW {
+            self.log_events.pop_front();
+            self.base += 1;
+        }
     }
 
     async fn engine_msg(&mut self, m: EngineMsg) {
@@ -329,6 +352,8 @@ impl<E: Engine> Actor<E> {
                 self.live = false;
                 self.epoch = new_epoch();
                 self.log_events.clear();
+                self.base = 0;
+                self.extra.clear();
                 self.broadcast(json!({"t":"reset","epoch":self.epoch}));
                 // As CONFIRM_AFTER would have: what no event showed (and the tool never accepted).
                 for p in std::mem::take(&mut self.pending) {
@@ -408,7 +433,7 @@ impl<E: Engine> Actor<E> {
                 }
                 None
             }
-            ClientFrame::Page { before, limit } => Some(frame(self.page(before, limit))),
+            ClientFrame::Page { before, limit } => Some(frame(self.page(before, limit).await)),
             // The socket pump consumes focus frames itself.
             ClientFrame::Focus { .. } => None,
         }
@@ -476,12 +501,38 @@ impl<E: Engine> Actor<E> {
         }
     }
 
-    fn page(&self, before: u64, limit: Option<usize>) -> Value {
+    // ponytail: an older page blocks this hub while the source is re-read; move it off the actor if it shows.
+    async fn page(&self, before: u64, limit: Option<usize>) -> Value {
         let limit = limit.unwrap_or(PAGE_MAX).min(PAGE_MAX);
-        let end = (before as usize).saturating_sub(1).min(self.log_events.len());
+        let end = (before as usize).saturating_sub(1).min(self.head());
         let start = end.saturating_sub(limit);
-        let events: Vec<Value> = (start + 1..=end).map(|seq| json!({"seq":seq,"ev":self.log_events[seq - 1]})).collect();
-        json!({"t":"page","events":events,"more":start > 0})
+        let own = |p: usize| self.extra.iter().find(|(q, _)| *q == p).map(|(_, v)| v);
+        let number = |p: usize| (p - self.extra.iter().filter(|(q, _)| *q < p).count()) as u64;
+        // Positions that left memory and are the engine's: one contiguous run of its numbers.
+        let gone: Vec<usize> = (start + 1..=end.min(self.base)).filter(|&p| own(p).is_none()).collect();
+        let (mut source, mut ok) = (Vec::new(), true);
+        if let (Some(&a), Some(&b)) = (gone.first(), gone.last()) {
+            match self.engine.history(number(a), number(b)).await {
+                Ok(v) => source = v,
+                Err(e) => {
+                    ok = false;
+                    self.log.push(format!("chat page failed {}: {e}", self.name));
+                }
+            }
+        }
+        let first = gone.first().map_or(0, |&p| number(p));
+        let events: Vec<Value> = (start + 1..=end)
+            .filter_map(|p| {
+                let ev = if p > self.base {
+                    Some(&self.log_events[p - self.base - 1])
+                } else {
+                    own(p).or_else(|| source.get((number(p) - first) as usize))
+                };
+                ev.map(|ev| json!({"seq":p,"ev":ev}))
+            })
+            .collect();
+        // Without the source, asking again would loop on the same empty page.
+        json!({"t":"page","events":events,"more":start > 0 && ok})
     }
 
     async fn tick(&mut self) {
@@ -513,7 +564,9 @@ impl<E: Engine> Actor<E> {
         let p = self.pending.remove(i);
         self.engine.clear_input(&p.text).await;
         if let Some(uuid) = &p.uuid {
-            self.append(json!({"type":"cdash","subtype":"retract","uuid":uuid}));
+            let ev = json!({"type":"cdash","subtype":"retract","uuid":uuid});
+            self.extra.push((self.head() + 1, ev.clone()));
+            self.append(ev);
         }
         self.broadcast(ack(&p.cid, "returned", None));
     }
@@ -566,6 +619,9 @@ mod tests {
         async fn clear_input(&self, text: &str) {
             self.calls.lock().unwrap().push(format!("clear:{text}"));
         }
+        async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
+            Ok((from..=to).map(|k| json!({"type":"user","n":k})).collect())
+        }
     }
 
     type Calls = Arc<Mutex<Vec<String>>>;
@@ -611,6 +667,10 @@ mod tests {
     }
     fn engine_status(working: bool, waiting: bool) -> EngineMsg {
         EngineMsg::Status { working, waiting, waiting_for: None }
+    }
+    /// The fake re-reads history as `{"type":"user","n":k}`.
+    fn rig_history() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+        rig()
     }
     fn rig() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_with(None)
@@ -983,5 +1043,35 @@ mod tests {
         tx.send(turn_end("success")).await.unwrap();
         settle().await;
         assert_eq!(note_kinds(&mut notes), ["done"]);
+    }
+
+    #[tokio::test]
+    async fn older_pages_come_from_the_source_and_a_position_older_than_the_window_starts_over() {
+        let (hub, tx, _) = rig_history();
+        for i in 0..2100 { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
+        settle().await;
+        let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 101, limit: Some(50) }).await.unwrap()).unwrap();
+        assert_eq!((page["events"][0]["seq"].as_u64(), page["events"][0]["ev"]["n"].as_u64()), (Some(51), Some(51)), "re-read from the source");
+        let epoch = serde_json::from_str::<Value>(&hub.subscribe(None, None).await.unwrap().backlog[0]).unwrap()["epoch"].as_str().unwrap().to_string();
+        let old = hub.subscribe(Some(10), Some(epoch)).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&old.backlog[0]).unwrap()["reset"], true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retract_the_hub_appended_keeps_its_position_in_an_older_page() {
+        let (hub, tx, _) = rig_history();
+        hub.command(send("c1", "first")).await;
+        tx.send(engine_status(true, false)).await.unwrap();
+        tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
+        settle().await;
+        hub.command(ClientFrame::Stop).await;
+        tx.send(engine_status(false, false)).await.unwrap();
+        tokio::time::sleep(STOP_SETTLE + Duration::from_millis(300)).await; // the retract lands at position 2
+        for i in 0..=WINDOW { tx.send(EngineMsg::Ev(answer(&format!("k{i}")))).await.unwrap(); } // positions 1 to 3 leave memory
+        settle().await;
+        let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 4, limit: Some(3) }).await.unwrap()).unwrap();
+        let got: Vec<(u64, Value)> = page["events"].as_array().unwrap().iter()
+            .map(|e| (e["seq"].as_u64().unwrap(), if e["ev"]["subtype"] == "retract" { json!("retract") } else { e["ev"]["n"].clone() })).collect();
+        assert_eq!(got, [(1, json!(1)), (2, json!("retract")), (3, json!(2))], "the engine's own numbers skip what the hub added");
     }
 }

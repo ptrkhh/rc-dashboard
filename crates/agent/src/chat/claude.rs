@@ -9,8 +9,9 @@ use crate::collect::lookup::session_file_for;
 use crate::host::cmd::Runner;
 use crate::host::log::LogBuffer;
 use crate::parse::paths::project_dir_name;
+use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc;
@@ -74,6 +75,8 @@ pub struct ClaudeEngine {
     runner: Arc<Runner>,
     log: Arc<LogBuffer>,
     name: String,
+    /// The transcript of the conversation the loop follows.
+    transcript: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl Engine for ClaudeEngine {
@@ -91,12 +94,42 @@ impl Engine for ClaudeEngine {
             self.log.push(format!("chat clear failed {}: {e}", self.name));
         }
     }
+
+    /// Replays the transcript from its start through a fresh tap, so cuts the
+    /// tap makes apply again; reading from an offset would bring back
+    /// abandoned branches.
+    async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
+        let path = self.transcript.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("no conversation yet")?;
+        let (mut tail, mut tap, mut n, mut out) = (Tail::new(path), Tap::default(), 0u64, Vec::new());
+        loop {
+            for line in tail.poll().await.map_err(|e| e.to_string())? {
+                for ev in tap.feed(&line) {
+                    n += 1;
+                    if n >= from {
+                        out.push(ev);
+                    }
+                    if n >= to {
+                        return Ok(out);
+                    }
+                }
+            }
+            if tail.at_end() {
+                return Ok(out);
+            }
+        }
+    }
 }
 
 pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Receiver<EngineMsg>) {
     let (tx, rx) = mpsc::channel(256);
-    let engine = ClaudeEngine { runner: Arc::clone(&ctx.runner), log: Arc::clone(&ctx.host.log), name: name.clone() };
-    tokio::spawn(run(ctx, name, pid, tx));
+    let transcript = Arc::new(Mutex::new(None));
+    let engine = ClaudeEngine {
+        runner: Arc::clone(&ctx.runner),
+        log: Arc::clone(&ctx.host.log),
+        name: name.clone(),
+        transcript: Arc::clone(&transcript),
+    };
+    tokio::spawn(run(ctx, name, pid, tx, transcript));
     (engine, rx)
 }
 
@@ -109,7 +142,7 @@ struct Conv {
 }
 
 // ponytail: polls for the pane's whole life once a chat was opened; park the loop when no client is attached if it ever shows in a profile.
-async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>) {
+async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>, transcript: Arc<Mutex<Option<PathBuf>>>) {
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut conv: Option<Conv> = None;
@@ -127,6 +160,7 @@ async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>)
                     return;
                 }
                 let path = ctx.claude_dir.join("projects").join(project_dir_name(&cwd)).join(format!("{sid}.jsonl"));
+                *transcript.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
                 conv = Some(Conv { sid, tail: Tail::new(path), tap: Tap::default(), ready: false });
                 last = None;
             }
@@ -191,6 +225,7 @@ pub(crate) mod tests {
     use crate::chat::tmux_io::tests::{stub_tmux, tempfile_path};
     use crate::host::cmd::Runner;
     use crate::host::log::LogBuffer;
+    use serde_json::Value;
     use std::path::Path;
     use std::time::Duration;
 
@@ -366,5 +401,15 @@ pub(crate) mod tests {
         let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         let got = collect_until_ready(&mut rx).await;
         assert_eq!(got.iter().filter(|m| matches!(m, EngineMsg::Ev(_))).count(), 6, "the prompt after the blob is history");
+    }
+
+    #[tokio::test]
+    async fn history_replays_the_transcript_from_its_start() {
+        let (ctx, _dir) = fixture_ctx("history");
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        let replayed: Vec<Value> = collect_until_ready(&mut rx).await.into_iter()
+            .filter_map(|m| if let EngineMsg::Ev(v) = m { Some(v) } else { None }).collect();
+        assert_eq!(engine.history(1, 3).await.unwrap(), replayed[..3]);
+        assert_eq!(engine.history(2, 2).await.unwrap(), replayed[1..2]);
     }
 }
