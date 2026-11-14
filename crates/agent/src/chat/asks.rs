@@ -233,7 +233,7 @@ fn new_id() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn ask_request(prompt: &str) -> Value {

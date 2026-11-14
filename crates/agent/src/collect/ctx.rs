@@ -49,6 +49,8 @@ pub struct Ctx {
     pub focus: Mutex<HashMap<String, usize>>,
     /// Finished, failed and needs-an-answer notes from every hub.
     pub notes: tokio::sync::broadcast::Sender<crate::chat::notify::Note>,
+    /// The port Claude's permission hook posts to, while that listener runs.
+    pub hook_port: Option<u16>,
 }
 
 impl Ctx {
@@ -79,6 +81,7 @@ impl Ctx {
             chats: tokio::sync::Mutex::new(HashMap::new()),
             focus: Mutex::new(HashMap::new()),
             notes: tokio::sync::broadcast::channel(64).0,
+            hook_port: None,
         }
     }
 

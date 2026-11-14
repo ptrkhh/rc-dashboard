@@ -53,14 +53,25 @@ pub async fn clear_input(runner: &Runner, name: &str, text: &str) -> Result<(), 
     runner.run_checked("tmux", &args, "tmux send-keys").await.map(drop)
 }
 
-/// The pane's pid, and whether it is a bare terminal (no tool to chat with).
-pub async fn pane(runner: &Runner, name: &str) -> Option<(i32, bool)> {
+/// What chat needs to know about a pane.
+pub struct Pane {
+    pub pid: i32,
+    /// A bare terminal: no tool to chat with.
+    pub bare: bool,
+    /// The token Claude's permission hook sends, when it was launched with one.
+    pub hook: Option<String>,
+}
+
+pub async fn pane(runner: &Runner, name: &str) -> Option<Pane> {
     let out = runner
-        .run_checked("tmux", &["display-message", "-p", "-t", &target(name), "#{pane_pid}|#{@cdash_kind}"], "tmux chat pane")
+        .run_checked("tmux", &["display-message", "-p", "-t", &target(name), "#{pane_pid}|#{@cdash_kind}|#{@cdash_hook}"], "tmux chat pane")
         .await
         .ok()?;
-    let (pid, kind) = out.trim().split_once('|')?;
-    Some((pid.parse().ok()?, kind == "terminal"))
+    let mut f = out.trim().split('|');
+    let pid = f.next()?.parse().ok()?;
+    let bare = f.next()? == "terminal";
+    let hook = f.next().filter(|h| !h.is_empty()).map(String::from);
+    Some(Pane { pid, bare, hook })
 }
 
 #[cfg(test)]
@@ -180,6 +191,16 @@ pub(crate) mod tests {
         assert_eq!(lines[0], "send-keys -t =cdash-a: Escape");
         assert!(lines[1].starts_with("send-keys -t =cdash-a: C-u C-u"));
         assert!(lines[1].split(' ').skip(3).all(|k| k == "C-u"));
+    }
+    #[tokio::test]
+    async fn pane_reads_the_pid_the_kind_and_the_hook_token() {
+        for (i, (answer, bare, hook)) in [("4242|", false, None), ("4242|terminal|", true, None), ("4242||tok-1", false, Some("tok-1"))].into_iter().enumerate() {
+            let dir = tempfile_path(&format!("pane-{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let runner = Runner::new(stub_tmux(&dir, answer, 0), Arc::new(LogBuffer::new()));
+            let p = pane(&runner, "cdash-a").await.unwrap();
+            assert_eq!((p.pid, p.bare, p.hook.as_deref()), (4242, bare, hook));
+        }
     }
     #[tokio::test]
     async fn text_reaches_a_real_pane_as_typed_and_multiline_stays_one_paste() {

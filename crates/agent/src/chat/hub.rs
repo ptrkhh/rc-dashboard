@@ -122,6 +122,8 @@ enum Cmd {
 #[derive(Clone)]
 pub struct Hub {
     cmds: mpsc::Sender<Cmd>,
+    /// A Claude session's hook cards and settings, for the hook listener.
+    pub(crate) claude: Option<super::claude::LiveRef>,
 }
 
 impl Hub {
@@ -179,7 +181,7 @@ impl Hub {
             watchers: 0,
         };
         tokio::spawn(actor.run(events, rx));
-        Hub { cmds }
+        Hub { cmds, claude: None }
     }
 
     /// `None` once the hub has stopped.

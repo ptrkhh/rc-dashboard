@@ -36,8 +36,9 @@ pub async fn hub_for(ctx: &Arc<Ctx>, name: &str) -> Result<hub::Hub, Refused> {
         return Ok(h.clone());
     }
     let no_chat = || Refused::BadRequest("this session has no chat".into());
-    let (pid, bare) = tmux_io::pane(&ctx.runner, name).await.ok_or_else(no_chat)?;
-    if bare {
+    let pane = tmux_io::pane(&ctx.runner, name).await.ok_or_else(no_chat)?;
+    let pid = pane.pid;
+    if pane.bare {
         return Err(no_chat());
     }
     // Same order as `collect_sessions`: OpenCode, then Codex, else Claude.
@@ -65,8 +66,12 @@ pub async fn hub_for(ctx: &Arc<Ctx>, name: &str) -> Result<hub::Hub, Refused> {
             hub::Hub::spawn_with(tool, engine, rx, log, name.to_string(), Some(notes))
         }
         None => {
-            let (engine, rx) = claude::start(Arc::clone(ctx), name.to_string(), pid);
-            hub::Hub::spawn_with("claude", engine, rx, log, name.to_string(), Some(notes))
+            let (mut engine, rx) = claude::start(Arc::clone(ctx), name.to_string(), pid);
+            engine.hooked = pane.hook.is_some() && ctx.hook_port.is_some();
+            let live = engine.live();
+            let mut hub = hub::Hub::spawn_with("claude", engine, rx, log, name.to_string(), Some(notes));
+            hub.claude = Some(live);
+            hub
         }
     };
     chats.insert(name.to_string(), hub.clone());

@@ -1,15 +1,14 @@
 //! The Claude engine: tails the session transcript and the session state
 //! file, and types through tmux.
 
-use super::hub::{Engine, EngineMsg, Sent};
+use super::asks::Cards;
+use super::hub::{Answer, Engine, EngineMsg, Sent};
 use super::tap::Tap;
 use super::tmux_io;
 use crate::collect::ctx::Ctx;
 use crate::collect::lookup::session_file_for;
-use crate::host::cmd::Runner;
-use crate::host::log::LogBuffer;
 use crate::parse::paths::project_dir_name;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,12 +81,40 @@ impl Tail {
 }
 
 pub struct ClaudeEngine {
-    runner: Arc<Runner>,
-    log: Arc<LogBuffer>,
+    ctx: Arc<Ctx>,
+    #[expect(dead_code, reason = "the pickers read it")]
+    pid: i32,
     name: String,
+    /// The pane was launched with the permission hook and the listener runs.
+    pub(crate) hooked: bool,
+    live: LiveRef,
     /// The transcript of the conversation the loop follows.
     transcript: Arc<Mutex<Option<PathBuf>>>,
     shared: Arc<Shared>,
+}
+
+/// The hook cards and the session's settings, shared by the engine, its loop
+/// and the hook listener.
+#[derive(Default)]
+pub struct Live {
+    pub cards: Cards,
+    pub plan: Option<bool>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+pub type LiveRef = Arc<Mutex<Live>>;
+
+fn lock(live: &LiveRef) -> std::sync::MutexGuard<'_, Live> {
+    live.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The model and effort of one assistant record; `None` for Claude's own
+/// `<synthetic>` replies and for lines without a model.
+pub fn model_effort(line: &str) -> Option<(String, Option<String>)> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    let model = v["message"]["model"].as_str().filter(|m| *m != "<synthetic>")?;
+    Some((model.to_string(), v["effort"].as_str().map(String::from)))
 }
 
 /// What the engine and its loop share.
@@ -104,16 +131,16 @@ struct Shared {
 impl Engine for ClaudeEngine {
     async fn send(&self, text: &str, _steer: bool, _cid: &str) -> Result<Sent, String> {
         // A paste cannot be confirmed by the TUI; the transcript confirms it.
-        tmux_io::paste(&self.runner, &self.name, text).await.map(|()| Sent::Unconfirmed)
+        tmux_io::paste(&self.ctx.runner, &self.name, text).await.map(|()| Sent::Unconfirmed)
     }
 
     async fn stop(&self) -> Result<(), String> {
-        tmux_io::escape(&self.runner, &self.name).await
+        tmux_io::escape(&self.ctx.runner, &self.name).await
     }
 
     async fn clear_input(&self, text: &str) {
-        if let Err(e) = tmux_io::clear_input(&self.runner, &self.name, text).await {
-            self.log.push(format!("chat clear failed {}: {e}", self.name));
+        if let Err(e) = tmux_io::clear_input(&self.ctx.runner, &self.name, text).await {
+            self.ctx.host.log.push(format!("chat clear failed {}: {e}", self.name));
         }
     }
 
@@ -141,9 +168,33 @@ impl Engine for ClaudeEngine {
         }
     }
 
+    async fn answer(&self, id: &str, a: &Answer) -> Result<(), String> {
+        let mut l = lock(&self.live);
+        let plan = l.cards.list().iter().any(|c| c["id"] == id && c["kind"] == "plan");
+        l.cards.answer(id, a)?;
+        if plan && a.choice.as_deref() == Some("yes") {
+            // Approving the plan leaves plan mode (the decision sets bypassPermissions).
+            l.plan = Some(false);
+        }
+        drop(l);
+        // The card is gone: publish the shorter list now, not at the next tick.
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+
+    fn hooks(&self) -> bool {
+        self.hooked
+    }
+
     async fn watchers(&self, n: usize) {
         self.shared.watchers.store(n, Ordering::Relaxed);
         self.shared.wake.notify_one();
+    }
+}
+
+impl ClaudeEngine {
+    pub fn live(&self) -> LiveRef {
+        Arc::clone(&self.live)
     }
 }
 
@@ -151,14 +202,21 @@ pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Rece
     let (tx, rx) = mpsc::channel(256);
     let transcript = Arc::new(Mutex::new(None));
     let shared = Arc::new(Shared::default());
+    let live = LiveRef::default();
     let engine = ClaudeEngine {
-        runner: Arc::clone(&ctx.runner),
-        log: Arc::clone(&ctx.host.log),
+        ctx: Arc::clone(&ctx),
+        pid,
         name: name.clone(),
+        hooked: false,
+        live: Arc::clone(&live),
         transcript: Arc::clone(&transcript),
         shared: Arc::clone(&shared),
     };
-    tokio::spawn(run(ctx, name, pid, tx, transcript, shared));
+    tokio::spawn(async move {
+        run(ctx, name, pid, tx, transcript, shared, &live).await;
+        // Held hooks get no decision once nothing follows the session.
+        lock(&live).cards.clear();
+    });
     (engine, rx)
 }
 
@@ -177,9 +235,11 @@ async fn run(
     tx: mpsc::Sender<EngineMsg>,
     transcript: Arc<Mutex<Option<PathBuf>>>,
     shared: Arc<Shared>,
+    live: &LiveRef,
 ) {
     let mut conv: Option<Conv> = None;
     let mut last: Option<(bool, bool, Option<String>)> = None;
+    let (mut last_asks, mut last_settings) = (None, None);
     let mut blind_sent = false;
     let mut slow = false;
     let mut idle_since: Option<Instant> = None;
@@ -232,6 +292,14 @@ async fn run(
                 }
             };
             let idle_read = lines.is_empty();
+            {
+                let mut l = lock(live);
+                lines.iter().for_each(|line| l.cards.seen(line));
+                let reply = lines.iter().rev().find(|l| l.contains(r#""type":"assistant""#) && !l.contains(r#""isSidechain":true"#));
+                if let Some((model, effort)) = reply.and_then(|r| model_effort(r)) {
+                    (l.model, l.effort) = (Some(model), effort);
+                }
+            }
             for line in lines {
                 for ev in c.tap.feed(&line) {
                     if tx.send(EngineMsg::Ev(ev)).await.is_err() {
@@ -260,6 +328,23 @@ async fn run(
                         return;
                     }
                 }
+                let (asks, settings) = {
+                    let mut l = lock(live);
+                    l.cards.tick(waiting, std::time::Instant::now());
+                    (l.cards.list(), json!({"model":l.model,"effort":l.effort,"plan":l.plan,"agent":null,"variant":null}))
+                };
+                if last_asks.as_ref() != Some(&asks) {
+                    last_asks = Some(asks.clone());
+                    if tx.send(EngineMsg::Asks(asks)).await.is_err() {
+                        return;
+                    }
+                }
+                if last_settings.as_ref() != Some(&settings) {
+                    last_settings = Some(settings.clone());
+                    if tx.send(EngineMsg::Settings(settings)).await.is_err() {
+                        return;
+                    }
+                }
             }
             if c.tap.blind() && !blind_sent {
                 blind_sent = true;
@@ -281,10 +366,12 @@ async fn run(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::chat::asks::tests::{ask_request, plan_request, result_line, use_line};
+    use crate::chat::hub::Answer;
     use crate::chat::tmux_io::tests::{stub_tmux, tempfile_path};
     use crate::host::cmd::Runner;
     use crate::host::log::LogBuffer;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::path::Path;
     use std::time::Duration;
 
@@ -523,6 +610,46 @@ pub(crate) mod tests {
         assert_eq!(got.iter().filter(|m| matches!(m, EngineMsg::Ev(_))).count(), 6, "the prompt after the blob is history");
     }
 
+    #[tokio::test]
+    async fn hook_cards_publish_settle_from_the_transcript_and_settings_follow_the_last_reply() {
+        let (ctx, dir) = fixture_ctx("cards");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"input needed"}"#); // keeps the 2 s net out of it
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        let hook = engine.live().lock().unwrap().cards.add(&ask_request("p1"), std::time::Instant::now()).unwrap();
+        next_of(&mut rx, |m| matches!(m, EngineMsg::Asks(a) if a.len() == 1 && a[0]["kind"] == "question")).await;
+        let t = dir.join("projects/-proj/sid-1.jsonl");
+        append(&t, &format!("{}\n{}\n", use_line("p1", "toolu_9", "AskUserQuestion", &ask_request("p1")["tool_input"]), result_line("toolu_9")));
+        next_of(&mut rx, |m| matches!(m, EngineMsg::Asks(a) if a.is_empty())).await;
+        assert!(hook.await.is_err());
+        append(&t, concat!(
+            r#"{"type":"assistant","uuid":"k8","effort":"low","message":{"id":"m8","model":"claude-haiku-5-5","role":"assistant","content":[{"type":"text","text":"ok"}]}}"#, "\n",
+            r#"{"type":"assistant","uuid":"k9","isSidechain":true,"effort":"max","message":{"id":"s9","model":"claude-fable-5-2","role":"assistant","content":[{"type":"text","text":"sub"}]}}"#, "\n"));
+        let EngineMsg::Settings(s) = next_of(&mut rx, |m| matches!(m, EngineMsg::Settings(s) if s["model"] == "claude-haiku-5-5")).await else { unreachable!() };
+        assert_eq!(s, json!({"model":"claude-haiku-5-5","effort":"low","plan":null,"agent":null,"variant":null}), "a subagent's reply is not the session's model");
+    }
+    #[tokio::test]
+    async fn a_chat_answer_resolves_the_held_hook_and_an_approved_plan_leaves_plan_mode() {
+        let (ctx, _dir) = fixture_ctx("answer");
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        let live = engine.live();
+        let hook = { let mut l = live.lock().unwrap(); l.plan = Some(true); l.cards.add(&plan_request("p1", "# P"), std::time::Instant::now()).unwrap() };
+        let id = live.lock().unwrap().cards.list()[0]["id"].as_str().unwrap().to_string();
+        engine.answer(&id, &Answer { choice: Some("yes".into()), ..Default::default() }).await.unwrap();
+        assert_eq!(hook.await.unwrap()["behavior"], "allow");
+        assert_eq!(live.lock().unwrap().plan, Some(false));
+        assert_eq!(engine.answer(&id, &Answer::default()).await, Err("already answered".into()));
+        assert!(!engine.hooks(), "start leaves hooked false; hub_for sets it");
+    }
+    #[test]
+    fn model_and_effort_come_from_one_reply_and_a_synthetic_one_is_skipped() {
+        let r = |m: &str| format!(r#"{{"type":"assistant","effort":"xhigh","message":{{"model":"{m}"}}}}"#);
+        assert_eq!(model_effort(&r("claude-opus-5-5")), Some(("claude-opus-5-5".into(), Some("xhigh".into()))));
+        assert_eq!(model_effort(r#"{"type":"assistant","message":{"model":"m"}}"#), Some(("m".into(), None)));
+        assert_eq!(model_effort(&r("<synthetic>")), None);
+        assert_eq!(model_effort("not json"), None);
+    }
     #[tokio::test]
     async fn history_replays_the_transcript_from_its_start() {
         let (ctx, _dir) = fixture_ctx("history");
