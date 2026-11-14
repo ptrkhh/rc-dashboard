@@ -53,7 +53,9 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  if(m.method==='thread/turns/list')send({data:[{id:'t1',items:[
    {id:'u1',type:'userMessage',content:[{type:'text',text:'hello'}]},
    {id:'a1',type:'agentMessage',text:'hi there',phase:'final'}]}],nextCursor:null});
- if(['turn/steer','turn/interrupt'].includes(m.method))send({});
+ if(['turn/steer','turn/interrupt','thread/settings/update','thread/compact/start','review/start'].includes(m.method))send({});
+ if(m.method==='model/list')send({data:[{model:'gpt-check',displayName:'GPT Check',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'high'}],defaultReasoningEffort:'low'}],nextCursor:null});
+ if(m.method==='skills/list')send({data:[{cwd:'/p',errors:[],skills:[{name:'lint',description:'Run lint',enabled:true,path:'/p/.codex/skills/lint/SKILL.md',scope:'repo'}]}]});
  if(m.method==='turn/start')send({turn:{id:'t3',status:'inProgress'}});
 });
 `, { mode: 0o700 });
@@ -109,6 +111,9 @@ async function client(path, first) {
   socket.write(JSON.stringify(first) + '\n');
   return { lines, write: o => socket.write(JSON.stringify(o) + '\n'), close: () => socket.destroy() };
 }
+const SID = '01234567-1234-1234-1234-0123456789ab';
+const res = async (c, rid) => { await until(() => c.lines.some(l => l.t === 'res' && l.rid === rid)); return c.lines.find(l => l.t === 'res' && l.rid === rid); };
+const asksNow = c => c.lines.findLast(l => l.t === 'asks')?.asks ?? [];
 const until = async (f, ms = 30000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
 
 test('native launcher owns one backend, isolates credentials, and preserves TUI after RC exit', {timeout:30000}, async t => {
@@ -335,5 +340,62 @@ test('a subagent thread never reaches the conversation, the working state or the
   c.write({ t: 'send', cid: 'c1', text: 'steer me', steer: true });
   await until(() => f.rpc('turn/steer'));
   assert.equal(f.rpc('turn/steer').params.expectedTurnId, 't2');
+  c.close();
+});
+test('questions from any thread become cards; an answer is the server-request response; resolution drops them', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const q = { id: 'q_file', header: 'File', question: 'Which file?', isOther: true, isSecret: false, options: [{ label: 'a.txt', description: 'A' }, { label: 'b.txt', description: 'B' }] };
+  await f.inject({ id: 41, method: 'item/tool/requestUserInput', params: { threadId: 'child-thread', turnId: 't9', itemId: 'i9', isBlocking: true, questions: [q] } });
+  await until(() => asksNow(c).length === 1);
+  assert.deepEqual(asksNow(c)[0], { id: '41', kind: 'question', tool: 'codex', questions: [{ id: 'q_file', header: 'File', question: 'Which file?', multi: false, other: true, secret: false, options: [{ label: 'a.txt', description: 'A' }, { label: 'b.txt', description: 'B' }] }] });
+  c.write({ t: 'req', rid: 1, op: 'answer', id: '41', answer: { answers: { q_file: { choices: ['b.txt'], text: 'keep it short' } } } });
+  assert.equal((await res(c, 1)).ok, true);
+  const reply = (await f.messages()).find(m => m.rpc?.id === 41 && m.rpc.result);
+  assert.deepEqual(reply.rpc.result, { answers: { q_file: { answers: ['b.txt', 'user_note: keep it short'] } } });
+  await until(() => asksNow(c).length === 0);
+  await f.inject({ id: 42, method: 'item/tool/requestUserInput', params: { threadId: SID, turnId: 't9', itemId: 'i10', isBlocking: true, questions: [{ ...q, isOther: false }] } });
+  await until(() => asksNow(c).length === 1);
+  await f.inject({ method: 'serverRequest/resolved', params: { threadId: SID, requestId: 42 } });
+  await until(() => asksNow(c).length === 0);
+  c.write({ t: 'req', rid: 2, op: 'answer', id: '42', answer: { answers: { q_file: { choices: ['a.txt'] } } } });
+  assert.deepEqual(await res(c, 2), { t: 'res', rid: 2, ok: false, error: 'already answered' });
+  c.close();
+});
+test('the plan switch, pickers, menu, slash commands and Implement this plan? drive the app server', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  c.write({ t: 'req', rid: 1, op: 'set', what: 'plan', value: true });
+  assert.equal((await res(c, 1)).ok, true);
+  assert.deepEqual(f.rpc('thread/settings/update').params, { threadId: SID, collaborationMode: { mode: 'plan', settings: { model: 'gpt-check', reasoning_effort: 'low', developer_instructions: null } } });
+  await until(() => c.lines.some(l => l.t === 'settings' && l.settings.plan === true));
+  c.write({ t: 'req', rid: 2, op: 'set', what: 'effort', value: 'high' });
+  await res(c, 2);
+  assert.deepEqual(f.rpc('thread/settings/update').params, { threadId: SID, effort: 'high' });
+  c.write({ t: 'req', rid: 3, op: 'set', what: 'effort', value: 'ultra' });
+  assert.deepEqual(await res(c, 3), { t: 'res', rid: 3, ok: false, error: 'unknown effort' });
+  c.write({ t: 'req', rid: 4, op: 'menu' });
+  const menu = (await res(c, 4)).data;
+  assert.deepEqual(menu.commands.map(x => x.name), ['compact', 'review', 'plan', 'model', 'effort', 'lint']);
+  assert.deepEqual([menu.models, menu.efforts, menu.agents], [[{ value: 'gpt-check', label: 'GPT Check', efforts: ['low', 'high'] }], ['low', 'high'], []]);
+  await f.inject({ method: 'turn/started', params: { threadId: SID, turn: { id: 't5' } } });
+  await f.inject({ method: 'item/completed', params: { threadId: SID, turnId: 't5', item: { id: 'p1', type: 'plan', text: '# Plan\n1. x' } } });
+  await f.inject({ method: 'turn/completed', params: { threadId: SID, turn: { id: 't5', status: 'completed' } } });
+  await until(() => asksNow(c).length === 1);
+  assert.deepEqual(asksNow(c)[0], { id: 'implement:t5', kind: 'plan', tool: 'codex', plan: '# Plan\n1. x' });
+  c.write({ t: 'req', rid: 5, op: 'answer', id: 'implement:t5', answer: { choice: 'yes' } });
+  await res(c, 5);
+  assert.equal(f.rpc('thread/settings/update').params.collaborationMode.mode, 'default');
+  assert.equal(f.rpc('turn/start').params.input[0].text, 'Implement the plan.');
+  for (const [cid, text] of [['c1', '/compact'], ['c2', '/review'], ['c3', '/lint fix it'], ['c4', '/diff']]) c.write({ t: 'send', cid, text, steer: false });
+  await until(() => c.lines.filter(l => l.t === 'ack').length === 4);
+  assert.ok(f.rpc('thread/compact/start'));
+  assert.deepEqual(f.rpc('review/start').params, { threadId: SID, target: { type: 'uncommittedChanges' } });
+  assert.deepEqual(f.rpc('turn/start').params.input, [{ type: 'skill', name: 'lint', path: '/p/.codex/skills/lint/SKILL.md' }, { type: 'text', text: 'fix it', text_elements: [] }]);
+  assert.deepEqual(c.lines.find(l => l.t === 'ack' && l.cid === 'c4'), { t: 'ack', cid: 'c4', ok: false, error: 'Use Terminal for this command' });
   c.close();
 });

@@ -212,6 +212,29 @@ function chatMessages(m, sid) {
   return out.map(msg => ({ ...msg, uuid: messageUuid('cdash-chat', sid, p.turnId ?? p.turn?.id, msg.message?.id ?? 'result') }));
 }
 
+const CODEX_COMMANDS = [
+  { name: 'compact', description: 'Summarize the conversation to free context' },
+  { name: 'review', description: 'Review uncommitted changes' },
+  { name: 'plan', description: 'Turn plan mode on' },
+  { name: 'model', description: 'Choose the model' },
+  { name: 'effort', description: 'Choose the reasoning effort' },
+];
+
+// A requestUserInput server request as a chat question card.
+const questionAsk = request => ({
+  id: String(request.id), kind: 'question', tool: 'codex',
+  questions: (request.params?.questions || []).map(q => ({
+    id: q.id, header: q.header, question: q.question, multi: false,
+    other: Boolean(q.isOther) || !q.options?.length, secret: Boolean(q.isSecret), options: q.options ?? [],
+  })),
+});
+
+// The card's answers as the server-request response: choices, then the typed note.
+const codexAnswers = (questions, answers) => Object.fromEntries(questions.map(q => {
+  const a = answers?.[q.id];
+  return [q.id, { answers: [...(a?.choices ?? []), ...(a?.text ? [`user_note: ${a.text}`] : [])] }];
+}));
+
 let stop = () => {};
 function fatal(e) { console.error(`Codex bridge: ${e.message}${e.cause ? ` (${e.cause.code || e.cause.message})` : ''}`); stop(); setTimeout(() => process.exit(1), 5000).unref(); process.exitCode = 1; }
 
@@ -449,14 +472,81 @@ async function nativeLauncher(statePath, state, script) {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-codex-native-'));
   const resuming = Boolean(state.sid);
   const { ChatFeed } = await import(new URL('./chat-feed.mjs', import.meta.url));
+  const asks = new Map(); // ask id -> { rpcId, questions } for a question, { implement: true } for the plan card
+  let lastPlan = null, plan = null, models = null;
+  const publishSettings = () => feed.setSettings({ model: state.model, effort: state.effort, plan, agent: null, variant: null });
+  const modelList = async () => models ??= await control.models();
+  const skills = async () => ((await control.call('skills/list', { cwds: [state.dir] }, 10_000)).data || [])
+    .flatMap(d => d.skills || []).filter(s => s.enabled);
+  const mode = on => control.call('thread/settings/update', { threadId: state.sid, collaborationMode: {
+    mode: on ? 'plan' : 'default', settings: { model: state.model, reasoning_effort: state.effort, developer_instructions: null } } });
+  const submit = async (input, steer) => {
+    const clientUserMessageId = randomUUID();
+    if (steer && control.turnId) await control.call('turn/steer', { threadId: state.sid, expectedTurnId: control.turnId, input, clientUserMessageId });
+    else await control.call('turn/start', { threadId: state.sid, input, effort: state.effort, clientUserMessageId });
+  };
+  const ops = {
+    answer: async ({ id, answer }) => {
+      const ask = asks.get(id);
+      if (!ask) throw Error('already answered');
+      asks.delete(id);
+      feed.dropAsk(id);
+      if (ask.implement) {
+        if (answer?.choice !== 'yes') return;
+        await mode(false);
+        plan = false; publishSettings();
+        await submit([{ type: 'text', text: 'Implement the plan.', text_elements: [] }], false);
+      } else control.send({ id: ask.rpcId, result: { answers: codexAnswers(ask.questions, answer?.answers) } });
+    },
+    set: async ({ what, value }) => {
+      if (what === 'plan') {
+        if (typeof value !== 'boolean') throw Error('plan takes true or false');
+        await mode(value);
+        plan = value;
+      } else if (what === 'model') {
+        const m = (await modelList()).find(x => x.model === value);
+        if (!m) throw Error('unknown model');
+        const effort = m.efforts.includes(state.effort) ? state.effort : m.defaultEffort;
+        await control.call('thread/settings/update', { threadId: state.sid, model: m.model, effort });
+        state.model = m.model; state.effort = effort;
+      } else if (what === 'effort') {
+        if (!(await modelList()).find(x => x.model === state.model)?.efforts.includes(value)) throw Error('unknown effort');
+        await control.call('thread/settings/update', { threadId: state.sid, effort: value });
+        state.effort = value;
+      } else throw Error('not supported');
+      publishSettings();
+    },
+    menu: async () => {
+      const list = await modelList();
+      const extra = (await skills().catch(() => [])).map(s => ({ name: s.name, description: (s.shortDescription || s.description || '').slice(0, 100) }));
+      return {
+        commands: [...CODEX_COMMANDS, ...extra].slice(0, 150),
+        models: list.map(m => ({ value: m.model, label: m.label, efforts: m.efforts })),
+        efforts: list.find(m => m.model === state.model)?.efforts ?? [], agents: [],
+      };
+    },
+  };
   // Dashboard chat: the agent connects to this feed's socket. It lives as
   // long as the pane, independent of Remote Control.
   const feed = new ChatFeed({
+    ops,
     send: async (text, { steer }) => {
-      const input = [{ type: 'text', text, text_elements: [] }];
-      const clientUserMessageId = randomUUID();
-      if (steer && control.turnId) await control.call('turn/steer', { threadId: state.sid, expectedTurnId: control.turnId, input, clientUserMessageId });
-      else await control.call('turn/start', { threadId: state.sid, input, effort: state.effort, clientUserMessageId });
+      const [, name, rest = ''] = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(text) || [];
+      if (!name) return submit([{ type: 'text', text, text_elements: [] }], steer);
+      const arg = rest.trim();
+      if (name === 'compact') await control.call('thread/compact/start', { threadId: state.sid });
+      else if (name === 'review') await control.call('review/start', { threadId: state.sid, target: { type: 'uncommittedChanges' } });
+      else if (name === 'plan' && !arg) await ops.set({ what: 'plan', value: true });
+      else if (name === 'model' || name === 'effort') {
+        if (!arg) throw Error('Use the model chip at the top of the chat');
+        await ops.set({ what: name, value: arg });
+      } else {
+        const skill = (await skills().catch(() => [])).find(s => s.name === name);
+        if (!skill) throw Error('Use Terminal for this command');
+        // A skill starts a real model turn, so it is not `done`.
+        return submit([{ type: 'skill', name, path: skill.path }, ...(arg ? [{ type: 'text', text: arg, text_elements: [] }] : [])], steer);
+      }
+      return { done: true };
     },
     stop: async () => { if (control?.turnId) await control.call('turn/interrupt', { threadId: state.sid, turnId: control.turnId }); },
   });
@@ -535,19 +625,41 @@ async function nativeLauncher(statePath, state, script) {
   control = new Codex(async m => {
     const p = m.params || {};
     if (m.id != null && m.method) feed.setState({ waiting: true }); // a server request: an approval or a question
-    if (m.method === 'serverRequest/resolved') feed.setState({ waiting: false });
+    if (m.method === 'serverRequest/resolved') {
+      feed.setState({ waiting: false });
+      asks.delete(String(p.requestId));
+      feed.dropAsk(String(p.requestId));
+    }
+    if (m.method === 'item/tool/requestUserInput') {
+      asks.set(String(m.id), { rpcId: m.id, questions: p.questions || [] });
+      feed.putAsk(questionAsk(m));
+    }
     if (!mainThread(m, state.sid)) return; // a subagent's turns and items are not this conversation; its questions (above) still are
     if (state.sid) {
       const chat = chatMessages(m, state.sid);
       if (replayed) replayed.push(...chat); else for (const msg of chat) feed.accept(msg);
     }
     if (m.method === 'item/agentMessage/delta') feed.delta(p.itemId, p.delta);
-    if (m.method === 'turn/started') feed.setState({ working: true });
-    if (m.method === 'turn/completed') feed.setState({ working: false, waiting: false });
+    if (m.method === 'turn/started') {
+      feed.setState({ working: true });
+      for (const id of asks.keys()) if (id.startsWith('implement:')) { asks.delete(id); feed.dropAsk(id); }
+      lastPlan = null;
+    }
+    if (m.method === 'item/completed' && p.item.type === 'plan') lastPlan = { turnId: p.turnId, text: p.item.text };
+    if (m.method === 'turn/completed') {
+      feed.setState({ working: false, waiting: false });
+      if (p.turn.status === 'completed' && lastPlan?.turnId === p.turn.id) {
+        const id = `implement:${p.turn.id}`;
+        asks.set(id, { implement: true });
+        feed.putAsk({ id, kind: 'plan', tool: 'codex', plan: lastPlan.text });
+      }
+    }
     if (m.method === 'thread/settings/updated') {
       state.model = p.threadSettings.model;
       state.effort = p.threadSettings.effort;
       state.model_label = state.model;
+      plan = p.threadSettings.collaborationMode?.mode === 'plan';
+      publishSettings();
     } else if (m.method === 'turn/started') state.working = true;
     else if (m.method === 'turn/completed') { state.working = false; state.ts = Date.now(); }
     else if (m.method === 'item/completed' && p.item.type === 'agentMessage') state.last_message = p.item.text;
@@ -569,6 +681,7 @@ async function nativeLauncher(statePath, state, script) {
   state.model = result.model;
   state.effort = result.reasoningEffort;
   state.working = Boolean(control.turnId);
+  publishSettings();
   // Naming persists an empty thread, so both clients can immediately resume it.
   await control.call('thread/name/set', { threadId: state.sid, name: state.display_name });
   state.chat_sock = await feed.listen(dir);
