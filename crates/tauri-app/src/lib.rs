@@ -8,6 +8,9 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[cfg(desktop)]
+mod notify;
+
 /// Thin-client platforms link no agent, so nothing there can construct a
 /// `Bound`. The commands keep their signatures across platforms; only the
 /// bodies differ.
@@ -312,9 +315,62 @@ fn agent_base(
     app: tauri::AppHandle,
     state: tauri::State<'_, ServerState>,
 ) -> Result<String, String> {
+    current_base(&app, &state)
+}
+
+fn current_base(app: &tauri::AppHandle, state: &ServerState) -> Result<String, String> {
     let inproc = addr_locked(&state.0)?;
-    let active = open_store(&app).ok().and_then(|s| active_record(&s));
+    let active = open_store(app).ok().and_then(|s| active_record(&s));
     base_url(inproc, active.as_ref()).ok_or_else(|| "server not running".to_string())
+}
+
+/// Desktop: system notifications for agent notes. Elsewhere the commands exist
+/// (the page calls them) but do nothing yet.
+#[tauri::command]
+async fn notify_set(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        use tauri::Manager;
+        use tauri_plugin_notification::{NotificationExt, PermissionState};
+        let state = app.state::<notify::NotifyState>();
+        if !on {
+            state.stop();
+            #[cfg(windows)]
+            notify::register_aumid(&app, false)?;
+            return Ok(());
+        }
+        #[cfg(windows)]
+        notify::register_aumid(&app, true)?;
+        if app.notification().request_permission().map_err(|e| e.to_string())? == PermissionState::Denied {
+            return Err("notifications are blocked for this app".into());
+        }
+        state.start(app.clone());
+        Ok(())
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, on);
+        Err("notifications are not available here".into())
+    }
+}
+
+#[tauri::command]
+fn notify_clear(_app: tauri::AppHandle, _name: String) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        use tauri::Manager;
+        use tauri_plugin_notification::NotificationExt;
+        let id = notify::note_id(&_name);
+        _app.state::<notify::NotifyState>().clear(id);
+        _app.notification().remove_active(vec![id]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// A tap that launched the app (Android). A desktop tap reaches the open window directly.
+#[tauri::command]
+fn notify_take_open() -> Option<serde_json::Value> {
+    None
 }
 
 #[tauri::command]
@@ -575,7 +631,10 @@ fn host_platform() -> String {
 pub fn run() {
     #[cfg(inproc_agent)]
     if cdash_agent::collect::codex_proxy::run_if_requested() { return; }
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_notification::init()).manage(notify::NotifyState::default());
+    builder
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .manage(ServerState::default())
@@ -598,6 +657,8 @@ pub fn run() {
         // Runs on the main thread before the event loop, which is what makes
         // start_locked's block_on legal.
         .setup(|_app| {
+            #[cfg(desktop)]
+            notify::on_tap(_app.handle());
             #[cfg(inproc_agent)]
             {
                 use tauri::Manager;
@@ -618,7 +679,10 @@ pub fn run() {
             agent_handoff,
             agent_build,
             host_platform,
-            open_external
+            open_external,
+            notify_set,
+            notify_clear,
+            notify_take_open
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
