@@ -53,7 +53,7 @@
       if (!m) return;
       if (b.dataset.again !== undefined) resend(c.state, cid, submitText);
       else {
-        c.state.mine = c.state.mine.filter(x => x !== m);
+        cdashChatStore.dropMine(c.state, cid);
         if (b.dataset.edit !== undefined) toBox(m.text);
       }
       schedule();
@@ -178,7 +178,7 @@
   function resend(state, cid, send) {
     const m = state.mine.find(x => x.cid === cid);
     if (!m || !send(m.text)) return false;
-    state.mine = state.mine.filter(x => x !== m);
+    cdashChatStore.dropMine(state, cid);
     return true;
   }
 

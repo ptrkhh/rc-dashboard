@@ -124,3 +124,12 @@ test('rows are reused until something they show changes', () => {
   s = S.apply(s, { t: 'delta', id: 'm9', text: 'x' });
   assert.equal(S.rows(s).length, 4, 'a delta recomputes');
 });
+
+test('dropMine removes an own row even after rows() was memoized', () => {
+  let s = feed([hello()]);
+  S.addMine(s, 'c1', 'mine');
+  s = S.apply(s, { t: 'ack', cid: 'c1', status: 'unconfirmed' });
+  assert.equal(S.rows(s).length, 1);
+  S.dropMine(s, 'c1');
+  assert.equal(S.rows(s).length, 0);
+});

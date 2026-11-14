@@ -671,3 +671,8 @@ test('a browser subscription follows the agent key and is registered again on ea
   assert.equal(await syncPush(pm, 'Ag', s => posted.push(s)), true);
   assert.deepEqual(posted.map(s => s.endpoint), ['https://p/1', 'https://p/2']);
 });
+
+test('view.js never assigns state.mine: only the store mutates what rows() reads', () => {
+  const src = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
+  assert.ok(!src.includes('state.mine ='));
+});

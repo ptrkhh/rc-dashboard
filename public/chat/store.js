@@ -107,6 +107,13 @@
     return s;
   }
 
+  // The view removes own rows here, so rows() never serves a stale memo.
+  function dropMine(s, cid) {
+    s.mine = s.mine.filter(x => x.cid !== cid);
+    s.rev++;
+    return s;
+  }
+
   const base = p => String(p || '').split('/').filter(Boolean).pop() || '';
   const VERBS = { Bash: ['Running', 'Ran'], Read: ['Reading', 'Read'], Edit: ['Editing', 'Edited'], Write: ['Editing', 'Edited'], Grep: ['Searching', 'Searched'], Glob: ['Searching', 'Searched'] };
   function toolLabel(name, input, done) {
@@ -196,5 +203,5 @@
     return out;
   }
 
-  g.cdashChatStore = { initial, apply, rows, addMine, toolLabel };
+  g.cdashChatStore = { initial, apply, rows, addMine, dropMine, toolLabel };
 })(typeof globalThis === 'undefined' ? this : globalThis);
