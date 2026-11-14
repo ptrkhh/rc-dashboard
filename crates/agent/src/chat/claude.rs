@@ -21,14 +21,15 @@ use tokio::time::Instant;
 /// Most bytes one poll reads, so a multi-megabyte record cannot stall a tick.
 const READ_MAX: u64 = 4 * 1024 * 1024;
 const TICK: Duration = Duration::from_millis(150);
-/// How often an idle session nobody watches has its status file read.
+/// How often an idle session nobody watches has its status file read and its
+/// transcript's length checked.
 const SLOW_TICK: Duration = Duration::from_secs(1);
 /// How often `has-session` checks the pane is still there.
 const ALIVE_EVERY: Duration = Duration::from_secs(2);
 /// How long after the status file says idle a turn the tap still holds open
 /// keeps the fast poll. The turn end lands about 0.2 s after `idle`; a local
 /// command such as `/model` opens a turn that never ends.
-// ponytail: a turn end written later than this is read only at the next status change or attach, so its note comes late.
+// ponytail: a turn end written later than this is read at the next slow pass, up to `SLOW_TICK` late.
 const TURN_END_GRACE: Duration = Duration::from_millis(2500);
 
 /// Complete lines appended to a file since the last poll.
@@ -200,12 +201,16 @@ async fn run(
             }
         }
         if let Some(c) = conv.as_mut() {
-            // Nobody watches and the session is idle: only the status file is
-            // read. An open turn keeps the fast poll until its end is read (or
-            // `TURN_END_GRACE` passes), so a turn end still notifies at once.
+            // Nobody watches and the session is idle: the status file is read
+            // and the transcript only measured. An open turn keeps the fast
+            // poll until its end is read (or `TURN_END_GRACE` passes), so a
+            // turn end still notifies at once; a transcript that changed length
+            // is read now, so a turn shorter than one slow wait is not missed.
             slow = watchers.load(Ordering::Relaxed) == 0
                 && c.ready
-                && idle_since.is_some_and(|t| !c.tap.turn_open() || t.elapsed() >= TURN_END_GRACE);
+                && idle_since.is_some_and(|t| !c.tap.turn_open() || t.elapsed() >= TURN_END_GRACE)
+                // No transcript yet (no prompt so far) counts as unchanged.
+                && tokio::fs::metadata(&c.tail.path).await.map_or(true, |m| m.len() == c.tail.offset);
             let lines = if slow {
                 Vec::new()
             } else {
@@ -373,17 +378,32 @@ pub(crate) mod tests {
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
         let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
+        next_status(&mut rx).await; // idle
         let wait = |ms| Duration::from_millis(ms);
-        append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(13..14));
-        assert!(tokio::time::timeout(wait(600), next_ev(&mut rx)).await.is_err(), "slow mode skips the transcript");
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy"}"#);
-        assert!(tokio::time::timeout(wait(1500), next_ev(&mut rx)).await.is_ok(), "busy: the prompt is read");
+        assert!(matches!(tokio::time::timeout(wait(1500), next_status(&mut rx)).await, Ok(EngineMsg::Status { working: true, .. })), "busy is seen within a slow wait");
+        append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(13..14));
+        assert!(tokio::time::timeout(wait(300), next_ev(&mut rx)).await.is_ok(), "busy: the prompt is read at the fast rate");
         append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(9..10)); // the turn ends
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
         next_ev(&mut rx).await; // its result: slow again
         engine.watchers(1).await;
         append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(13..14));
         assert!(tokio::time::timeout(wait(300), next_ev(&mut rx)).await.is_ok(), "someone watches: polled as today");
+    }
+
+    #[tokio::test]
+    async fn a_turn_shorter_than_a_slow_wait_is_read_from_the_transcript_growing() {
+        let (ctx, dir) = fixture_ctx("idle-grow");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
+        let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await; // parked
+        append(&dir.join("projects/-proj/sid-1.jsonl"), &format!("{}{}", fixture_lines(13..14), fixture_lines(9..10)));
+        let wait = |ms| Duration::from_millis(ms);
+        assert!(tokio::time::timeout(wait(1500), next_ev(&mut rx)).await.is_ok(), "the prompt, with no status change");
+        let end = tokio::time::timeout(wait(300), next_ev(&mut rx)).await;
+        assert!(matches!(end, Ok(EngineMsg::Ev(ref v)) if v["type"] == "result"), "and its turn end");
     }
 
     #[tokio::test]

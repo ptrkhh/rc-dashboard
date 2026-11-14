@@ -258,7 +258,9 @@ impl<E: Engine> Actor<E> {
                 cmd = cmds.recv() => match cmd {
                     Some(Cmd::Subscribe { after, epoch, reply }) => {
                         if self.ready {
-                            let _ = reply.send(self.subscription(after, epoch));
+                            let sub = self.subscription(after, epoch);
+                            self.watch().await;
+                            let _ = reply.send(sub);
                         } else {
                             self.waiters.push((after, epoch, reply));
                         }
@@ -546,12 +548,17 @@ impl<E: Engine> Actor<E> {
         json!({"t":"page","events":events,"more":start > 0 && ok})
     }
 
-    async fn tick(&mut self) {
+    /// Tells the engine how many clients are attached, when that changed.
+    async fn watch(&mut self) {
         let n = self.out.receiver_count();
         if n != self.watchers {
             self.watchers = n;
             self.engine.watchers(n).await;
         }
+    }
+
+    async fn tick(&mut self) {
+        self.watch().await;
         let now = Instant::now();
         if let (true, false, true, Some(since)) = (self.live, self.asked, self.waiting, self.waiting_since) {
             if now.duration_since(since) >= ASK_AFTER && self.waiting_for.as_deref() != Some("dialog open") {
@@ -1132,7 +1139,7 @@ mod tests {
         tx.send(EngineMsg::Ready).await.unwrap();
         let hub = Hub::spawn("claude", Watched(n.clone()), rx, Arc::new(crate::host::log::LogBuffer::new()), "cdash-a".into());
         let (a, b) = (hub.subscribe(None, None).await.unwrap(), hub.subscribe(None, None).await.unwrap());
-        crate::chat::tmux_io::tests::eventually("two attached", || n.load(Ordering::Relaxed) == 2).await;
+        assert_eq!(n.load(Ordering::Relaxed), 2, "told before the subscriber hears back, not at the next tick");
         drop((a, b));
         crate::chat::tmux_io::tests::eventually("none attached", || n.load(Ordering::Relaxed) == 0).await;
     }
