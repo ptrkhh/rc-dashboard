@@ -18,9 +18,11 @@ pub const BACKLOG: usize = 200;
 pub const PAGE_MAX: usize = 200;
 /// A sent message the session's record never showed is reported after this.
 pub const CONFIRM_AFTER: Duration = Duration::from_secs(10);
-/// How long after a Stop the hub looks for a prompt Claude handed back.
-/// Transcript writes were seen up to 2.2 s late; an interrupt marker that
-/// lands inside this window proves the prompt was taken, not handed back.
+/// A Stop settles once the record has been quiet this long.
+pub const STOP_QUIET: Duration = Duration::from_millis(500);
+/// The ceiling on how long after a Stop the hub looks for a prompt Claude
+/// handed back. Transcript writes were seen up to 2.2 s late; an interrupt
+/// marker that lands inside this window proves the prompt was taken.
 pub const STOP_SETTLE: Duration = Duration::from_millis(2500);
 const TICK: Duration = Duration::from_millis(250);
 
@@ -92,6 +94,7 @@ impl Hub {
             ready: false,
             turn_ok: false,
             stopped_at: None,
+            last_ev: Instant::now(),
             waiters: Vec::new(),
             last_state: String::new(),
         };
@@ -180,6 +183,8 @@ struct Actor<E> {
     /// The last turn ended on its own, so the next held message may go.
     turn_ok: bool,
     stopped_at: Option<Instant>,
+    /// When the engine last reported a record event.
+    last_ev: Instant,
     waiters: Vec<(Option<u64>, Option<String>, oneshot::Sender<Subscription>)>,
     last_state: String,
 }
@@ -266,7 +271,10 @@ impl<E: Engine> Actor<E> {
 
     async fn engine_msg(&mut self, m: EngineMsg) {
         match m {
-            EngineMsg::Ev(ev) => self.event(ev),
+            EngineMsg::Ev(ev) => {
+                self.last_ev = Instant::now();
+                self.event(ev)
+            }
             EngineMsg::Delta { id, text } => self.broadcast(json!({"t":"delta","id":id,"text":text})),
             EngineMsg::Status { working, waiting } => {
                 self.working = working;
@@ -438,7 +446,8 @@ impl<E: Engine> Actor<E> {
             self.broadcast(ack(&p.cid, "unconfirmed", None));
         }
         let Some(at) = self.stopped_at else { return };
-        if now.duration_since(at) < STOP_SETTLE || self.working {
+        let settled = now.duration_since(at) >= STOP_SETTLE || now.duration_since(at.max(self.last_ev)) >= STOP_QUIET;
+        if !settled || self.working {
             if now.duration_since(at) > CONFIRM_AFTER {
                 self.stopped_at = None;
             }
@@ -776,5 +785,33 @@ mod tests {
         assert_eq!(ack_of(hub.command(send("c3", "third")).await)["status"], "sent");
         assert_eq!(*calls.lock().unwrap(), ["send:first:false", "stop", "clear:first", "send:third:false"]);
     }
-
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_settles_half_a_second_after_the_record_goes_quiet() {
+        let (hub, tx, calls) = rig();
+        hub.command(send("c1", "first")).await;
+        tx.send(engine_status(true, false)).await.unwrap();
+        tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
+        settle().await;
+        hub.command(ClientFrame::Stop).await;
+        tx.send(engine_status(false, false)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(calls.lock().unwrap().len(), 2, "not before 500 ms of quiet");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(*calls.lock().unwrap(), ["send:first:false", "stop", "clear:first"]);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_record_that_keeps_growing_settles_at_the_ceiling() {
+        let (hub, tx, calls) = rig();
+        hub.command(send("c1", "first")).await;
+        tx.send(engine_status(true, false)).await.unwrap();
+        settle().await;
+        hub.command(ClientFrame::Stop).await;
+        tx.send(engine_status(false, false)).await.unwrap();
+        for i in 1..=14 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tx.send(EngineMsg::Ev(json!({"type":"cdash","subtype":"queued","text":"other"}))).await.unwrap();
+            if i == 12 { assert_eq!(calls.lock().unwrap().len(), 2, "2.4 s and still growing"); }
+        }
+        assert_eq!(calls.lock().unwrap().last().map(String::as_str), Some("clear:first"), "settled at the 2.5 s ceiling");
+    }
 }
