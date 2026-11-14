@@ -35,6 +35,18 @@ test('nothing of the next file goes out until the server answered the open one, 
   assert.equal(frames(sent)[1].ref, b.key);
   assert.equal(a.error, 'one upload at a time');
 });
+test('an error reply mid-stream stops the slices and the next file starts', async () => {
+  const sent = []; let backed = true;
+  const u = new A.Uploads({ send: d => (sent.push(d), true), buffered: () => backed && sent.length >= 2 ? 2 * MiB : 0, onChange: () => {} });  // backed up after the first slice
+  const a = u.add(new File([new Uint8Array(5 * MiB)], 'a.bin')), b = u.add(new File(['hi'], 'b.txt'));
+  await until(() => sent.length >= 2);
+  u.onFrame({ t: 'uploaded', ref: a.key, error: 'upload failed' });
+  backed = false;
+  await until(() => frames(sent).length === 2);
+  assert.deepEqual([a.state, a.error], ['failed', 'upload failed']);
+  assert.equal(frames(sent)[1].ref, b.key);
+  assert.equal(sent.filter(d => typeof d !== 'string' && d.byteLength === MiB).length, 1, 'only one slice of a went out');
+});
 test('over 20 MB, an eleventh attachment and empty files are refused on the chip and never sent', async () => {
   const { u, sent } = rig();
   const big = u.add(new File([new Uint8Array(A.LIMIT + 1)], 'big.bin')), empty = u.add(new File([], 'e.txt'));

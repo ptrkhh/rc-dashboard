@@ -81,6 +81,8 @@
 
     pending() { return this.items.some(i => i.state !== 'done'); }
 
+    // Call only when idle or when the socket was replaced: on the same socket the server's open
+    // upload stays, and the next `upload` is refused with `one upload at a time`.
     clear() {
       for (const i of this.items) if (i.url) URL.revokeObjectURL(i.url);
       this.items = [];
@@ -102,11 +104,16 @@
     async _upload(item) {
       const gen = this._gen;
       const live = () => gen === this._gen && item.state === 'uploading';
-      const fail = error => { if (live()) Object.assign(item, { state: 'failed', error }); this._change(); };
+      const fail = error => {
+        this._wait = null;
+        if (live()) { Object.assign(item, { state: 'failed', error }); this._change(); }
+      };
       item.state = 'uploading';
       item.progress = 0;
       const total = Math.ceil(item.size / CHUNK);
       this._change();
+      // The server may answer at any point after the upload frame (a refusal, a failed write), so listen from here.
+      const answered = new Promise(done => { this._wait = { item, done }; });
       if (!this._send(JSON.stringify({ t: 'upload', ref: item.key, name: item.name, size: item.size }))) return fail('Offline');
       for (let o = 0, sent = 1; o < item.size; o += CHUNK, sent++) {
         while (live() && this._buffered() >= CHUNK) await sleep(50);
@@ -120,7 +127,7 @@
       }
       // Binary frames carry no ref, so nothing else goes out until the server answers this one.
       // ponytail: no timeout; a silent server holds the queue until the socket drops and lost() runs.
-      await new Promise(done => { this._wait = { item, done }; });
+      await answered;
     }
   }
 
