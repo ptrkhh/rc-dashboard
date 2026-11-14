@@ -139,6 +139,9 @@ pub fn hook_settings(hook: Option<(u16, &str)>) -> String {
     }
 }
 
+/// The first tmux whose `new-session` takes `-e`.
+const TMUX_ENV_MIN: (u32, u32) = (3, 2);
+
 /// `(major, minor)` from `tmux -V`: `tmux 3.4`, `tmux 2.9a`, `tmux next-3.5`.
 // ponytail: other spellings (`tmux master`, distro tags) read as unknown, so those launch without the hook.
 fn tmux_version(out: &str) -> Option<(u32, u32)> {
@@ -150,7 +153,7 @@ fn tmux_version(out: &str) -> Option<(u32, u32)> {
 }
 
 /// The hook port for a launch: none without the listener, or when tmux is
-/// older than 3.0 and has no `new-session -e`. `tmux -V` runs once; a failed
+/// older than `TMUX_ENV_MIN` and has no `new-session -e`. `tmux -V` runs once; a failed
 /// run is not cached and that launch goes without the hook.
 async fn launch_hook_port(ctx: &Ctx) -> Option<u16> {
     let port = ctx.hook_port?;
@@ -158,10 +161,10 @@ async fn launch_hook_port(ctx: &Ctx) -> Option<u16> {
         .tmux_env
         .get_or_try_init(|| async {
             let out = ctx.runner.run_checked("tmux", &["-V"], "tmux -V").await?;
-            let ok = tmux_version(&out).is_some_and(|v| v >= (3, 0));
+            let ok = tmux_version(&out).is_some_and(|v| v >= TMUX_ENV_MIN);
             if !ok {
                 ctx.host.log.push(format!(
-                    "hook off: {:?} has no new-session -e (needs tmux 3.0); Claude sessions launch without the hook",
+                    "hook off: {:?} has no new-session -e (needs tmux 3.2); Claude sessions launch without the hook",
                     out.trim()
                 ));
             }
@@ -795,14 +798,17 @@ mod tests {
         assert_eq!(tmux_version("tmux 3.4\n"), Some((3, 4)));
         assert_eq!(tmux_version("tmux 2.9a"), Some((2, 9)));
         assert_eq!(tmux_version("tmux next-3.5"), Some((3, 5)));
+        assert!(tmux_version("tmux 3.1").unwrap() < TMUX_ENV_MIN, "3.1 is old");
+        assert!(tmux_version("tmux 3.2").unwrap() >= TMUX_ENV_MIN, "3.2 is new");
+        assert!(tmux_version("tmux 3.2a").unwrap() >= TMUX_ENV_MIN);
         for junk in ["4242", "", "tmux", "tmux master", "tmux 3", "screen 4.9"] {
             assert_eq!(tmux_version(junk), None, "{junk:?}");
         }
     }
     #[tokio::test]
-    async fn on_a_tmux_older_than_3_0_claude_launches_without_the_hook_and_says_so_once() {
+    async fn on_a_tmux_older_than_3_2_claude_launches_without_the_hook_and_says_so_once() {
         let d = tempdir("hook-old-tmux");
-        let ctx = tmux_ctx(d.clone(), 0, Some(23999), "tmux 2.9a");
+        let ctx = tmux_ctx(d.clone(), 0, Some(23999), "tmux 3.1");
         launch_session(&ctx, d.to_str().unwrap(), "haiku", "low", None).await.unwrap();
         launch_session(&ctx, d.to_str().unwrap(), "haiku", "low", None).await.unwrap();
         let args = std::fs::read_to_string(d.join("tmux-args")).unwrap();

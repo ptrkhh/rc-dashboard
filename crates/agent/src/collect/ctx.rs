@@ -51,7 +51,7 @@ pub struct Ctx {
     pub notes: tokio::sync::broadcast::Sender<crate::chat::notify::Note>,
     /// The port Claude's permission hook posts to, while that listener runs.
     pub hook_port: Option<u16>,
-    /// Whether tmux has `new-session -e` (3.0+), once `tmux -V` answered; see `spawn::launch_hook_port`.
+    /// Whether tmux has `new-session -e` (3.2+), once `tmux -V` answered; see `spawn::launch_hook_port`.
     pub tmux_env: tokio::sync::OnceCell<bool>,
 }
 
