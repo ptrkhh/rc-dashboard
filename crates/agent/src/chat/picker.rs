@@ -232,7 +232,7 @@ pub async fn switch_plan(ctx: &Arc<Ctx>, name: &str, pid: i32, on: bool) -> Resu
     }
     if mode == target { Ok(()) } else { Err(STUCK.into()) }
 }
-
+/// Text pasted but not submitted (a picker command, or image paths and a prompt from a failed send), still in the input box.
 /// A picker command pasted but not submitted, still in the input box.
 pub type Leftover = Mutex<Option<String>>;
 
