@@ -29,3 +29,23 @@ self.addEventListener('fetch', e => {
     return r;
   }, async () => (await caches.match(e.request)) || Response.error()));
 });
+
+const TEXT = { done: 'Finished', error: 'Stopped with an error', ask: 'Needs your answer' };
+self.addEventListener('push', e => {
+  let n = null;
+  try { n = e.data && e.data.json(); } catch {}       // unreadable payload: fall through to the generic note
+  const known = n && typeof n === 'object' && n.s && n.p;
+  e.waitUntil(known
+    ? self.registration.showNotification(n.p, { body: TEXT[n.k] || 'Open the dashboard', tag: n.s, data: { s: n.s, p: n.p }, icon: 'icon-192.png', renotify: true })
+    : self.registration.showNotification('RC Dashboard', { body: 'Open the dashboard', tag: 'cdash', icon: 'icon-192.png', renotify: true }));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const { s, p } = e.notification.data || {};
+  e.waitUntil((async () => {
+    const [c] = await self.clients.matchAll({ type: 'window' });
+    if (!c) return self.clients.openWindow(s ? `/?chat=${encodeURIComponent(s)}&title=${encodeURIComponent(p)}` : '/');
+    await c.focus();
+    if (s) c.postMessage({ t: 'open-chat', s, p });
+  })());
+});
