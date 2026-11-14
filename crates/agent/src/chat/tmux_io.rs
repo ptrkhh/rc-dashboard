@@ -8,10 +8,21 @@ fn target(name: &str) -> String {
     format!("={name}:")
 }
 
-/// Paste `text` with bracketed paste, then press Enter. The text goes through
+/// The pause between a paste and its Enter.
+// ponytail: 400 ms is the pause the spike used between paste and Enter; shorten once measured.
+pub const PASTE_PAUSE: Duration = Duration::from_millis(400);
+
+/// Paste `text` with bracketed paste, then press Enter.
+pub async fn paste(runner: &Runner, name: &str, text: &str) -> Result<(), String> {
+    paste_text(runner, name, text).await?;
+    tokio::time::sleep(PASTE_PAUSE).await;
+    key(runner, name, "Enter").await
+}
+
+/// Paste `text` with bracketed paste, without Enter. The text goes through
 /// a private file because `Runner` gives the child no stdin and tmux refuses
 /// commands longer than about 16 KB. Assumes `wire::sanitize`d text.
-pub async fn paste(runner: &Runner, name: &str, text: &str) -> Result<(), String> {
+pub async fn paste_text(runner: &Runner, name: &str, text: &str) -> Result<(), String> {
     let buffer = format!("cdash-chat-{name}");
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -23,12 +34,7 @@ pub async fn paste(runner: &Runner, name: &str, text: &str) -> Result<(), String
     let loaded = runner.run_checked("tmux", &["load-buffer", "-b", &buffer, &path], "tmux load-buffer").await;
     let _ = tokio::fs::remove_file(&file).await;
     loaded?;
-    let t = target(name);
-    runner.run_checked("tmux", &["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &t], "tmux paste-buffer").await?;
-    // ponytail: 400 ms is the pause the spike used between paste and Enter; shorten once measured.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    runner.run_checked("tmux", &["send-keys", "-t", &t, "Enter"], "tmux send-keys").await?;
-    Ok(())
+    runner.run_checked("tmux", &["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &target(name)], "tmux paste-buffer").await.map(drop)
 }
 
 async fn write_private(file: &std::path::Path, text: &str) -> std::io::Result<()> {

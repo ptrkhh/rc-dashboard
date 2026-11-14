@@ -171,10 +171,10 @@ const FOOTERS: [(&str, &str); 5] = [
 const PRESSES_MAX: usize = 5;
 const SETTLE_WAIT: Duration = Duration::from_secs(2);
 
-/// The permission mode the bottom-most footer line shows.
+/// The permission mode the footer shows. Only the last 3 non-blank lines
+/// count, so a transcript line quoting a footer is not read as one.
 pub fn footer_mode(screen: &str) -> Option<&'static str> {
-    screen.lines().rev().find_map(|l| {
-        let l = l.trim_start();
+    screen.lines().rev().map(str::trim_start).filter(|l| !l.trim().is_empty()).take(3).find_map(|l| {
         FOOTERS.iter().find(|(start, _)| l.starts_with(start)).map(|(_, mode)| *mode)
     })
 }
@@ -186,12 +186,14 @@ pub fn confirm_ready(screen: &str, title: &str) -> bool {
     lines[at + 1..].iter().any(|l| l.trim_start().starts_with('❯') && l.contains("Yes"))
 }
 
+const WAITING: &str = "Answer the open question first";
+
 /// Refuses unless the session is idle (a background shell counts).
 async fn idle(ctx: &Ctx, pid: i32) -> Result<(), String> {
     let file = session_file_for(&ctx.claude_dir, pid).await;
     match file.and_then(|f| f.status).as_deref() {
         Some("idle" | "shell") => Ok(()),
-        Some("waiting") => Err("Answer the open question first".into()),
+        Some("waiting") => Err(WAITING.into()),
         _ => Err("Stop the turn or wait for it to finish".into()),
     }
 }
@@ -207,7 +209,8 @@ pub async fn switch_plan(ctx: &Arc<Ctx>, name: &str, pid: i32, on: bool) -> Resu
     const STUCK: &str = "Plan mode did not switch; use Terminal";
     let target = if on { "plan" } else { "bypassPermissions" };
     idle(ctx, pid).await?;
-    let mut mode = read_footer(ctx, name).await.ok_or(UNKNOWN)?;
+    let start = read_footer(ctx, name).await.ok_or(UNKNOWN)?;
+    let mut mode = start;
     for _ in 0..PRESSES_MAX {
         if mode == target {
             return Ok(());
@@ -222,7 +225,8 @@ pub async fn switch_plan(ctx: &Arc<Ctx>, name: &str, pid: i32, on: bool) -> Resu
         }
         mode = match now {
             None => return Err(UNKNOWN.into()),
-            Some(m) if m == mode => return Err(STUCK.into()),
+            // Unchanged, or back at the start: a cycle without the target.
+            Some(m) if m == mode || m == start => return Err(STUCK.into()),
             Some(m) => m,
         };
     }
@@ -230,31 +234,52 @@ pub async fn switch_plan(ctx: &Arc<Ctx>, name: &str, pid: i32, on: bool) -> Resu
 }
 
 /// Types `/<cmd> <value>` and answers only the confirmation that command
-/// raises, after reading it on screen. Any other dialog is closed.
+/// raises, after reading it on screen. Ok means Claude took the value: no
+/// dialog and idle after the watch, or its confirmation pressed.
 pub async fn type_setting(ctx: &Arc<Ctx>, name: &str, pid: i32, cmd: &str, value: &str) -> Result<(), String> {
     let title = CONFIRMS.iter().find(|(c, _)| *c == cmd).map(|(_, t)| *t);
+    let text = format!("/{cmd} {value}");
     idle(ctx, pid).await?;
-    tmux_io::paste(&ctx.runner, name, &format!("/{cmd} {value}")).await?;
+    tmux_io::paste_text(&ctx.runner, name, &text).await?;
+    tokio::time::sleep(tmux_io::PASTE_PAUSE).await;
+    if let Err(e) = idle(ctx, pid).await {
+        // A turn's input box takes the clear; a dialog gets no key.
+        if e != WAITING {
+            tmux_io::clear_input(&ctx.runner, name, &text).await?;
+        }
+        return Err(e);
+    }
+    tmux_io::key(&ctx.runner, name, "Enter").await?;
     let deadline = Instant::now() + SETTLE_WAIT;
+    let mut status = None;
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let Some(f) = session_file_for(&ctx.claude_dir, pid).await else { continue };
-        if f.status.as_deref() != Some("waiting") {
+        status = f.status;
+        if status.as_deref() != Some("waiting") {
             continue;
         }
-        if let (Some("dialog open"), Some(title)) = (f.waiting_for.as_deref(), title) {
+        if f.waiting_for.as_deref() != Some("dialog open") {
+            return Err(WAITING.into());
+        }
+        if let Some(title) = title {
             // The status turns `waiting` about 10 ms before the dialog is drawn.
-            for _ in 0..3 {
+            for n in 0..3 {
+                if n > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 if confirm_ready(&tmux_io::capture(&ctx.runner, name).await.unwrap_or_default(), title) {
                     return tmux_io::key(&ctx.runner, name, "Enter").await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
         tmux_io::escape(&ctx.runner, name).await?;
         return Err("Claude opened an unexpected dialog; closed it".into());
     }
-    Ok(())
+    match status.as_deref() {
+        Some("idle" | "shell") => Ok(()),
+        _ => Err(format!("Claude did not confirm /{cmd}; check Terminal")),
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +393,11 @@ mod tests {
         assert!(confirm_ready(" Switch model?\n ❯ 1. Yes\n   2. No\n", "Switch model?"));
         assert!(!confirm_ready(" Switch model?\n   1. Yes\n ❯ 2. No\n", "Switch model?"));
         assert!(!confirm_ready(" Background work is running\n ❯ 1. Exit and stop tasks\n", "Switch model?"));
+        assert!(!confirm_ready(" ❯ 1. Yes\n Switch model?\n", "Switch model?"));
+    }
+    #[test]
+    fn a_footer_quoted_in_the_transcript_is_not_the_footer() {
+        assert_eq!(footer_mode("  ⏸ plan mode on\n● one\n● two\n\n● three\n\n"), None);
     }
 
     /// `<dir>/tmux-args` lines that press a key.
@@ -408,12 +438,14 @@ esac
     }
 
     /// A pane showing `screen` whose first Enter opens a dialog (`waiting`,
-    /// `dialog open`); later Enters and Escape close it.
+    /// `dialog open`; rewrite `waiting.json` for another outcome); later
+    /// Enters and Escape close it. A `pasted.json` is put on the paste.
     fn confirm_ctx(tag: &str, screen: &str) -> (Arc<Ctx>, PathBuf) {
         let body = r#"put() { cp "$D/$1.json" "$D/sessions/.t" && mv -f "$D/sessions/.t" "$D/sessions/4242.json"; }
 case "$*" in
   send-keys*Enter) if [ -e "$D/entered" ]; then put idle; else : > "$D/entered"; put waiting; fi ;;
   send-keys*Escape) put idle ;;
+  paste-buffer*) if [ -f "$D/pasted.json" ]; then put pasted; fi ;;
   capture-pane*) cat "$D/screen" ;;
 esac
 "#;
@@ -453,5 +485,47 @@ esac
         let (ctx, dir) = confirm_ctx("other", " Background work is running\n ❯ 1. Exit and stop tasks\n");
         assert!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await.is_err());
         assert_eq!(sent_keys(&dir), ["send-keys -t =cdash-a: Enter", "send-keys -t =cdash-a: Escape"]);
+    }
+    #[tokio::test]
+    async fn a_cycle_without_the_target_stops_back_at_the_start() {
+        let (ctx, dir) = cycle_ctx("no-plan");
+        let footers = std::fs::read_to_string(dir.join("footers")).unwrap().replace("⏸ plan mode on", "⏵⏵ bypass permissions on");
+        std::fs::write(dir.join("footers"), footers).unwrap();
+        assert_eq!(switch_plan(&ctx, "cdash-a", 4242, true).await, Err("Plan mode did not switch; use Terminal".into()));
+        assert_eq!(presses(&dir), 4, "stops when bypass shows again");
+    }
+    #[tokio::test]
+    async fn a_footer_that_does_not_change_stops_after_one_press() {
+        let (ctx, dir) = cycle_ctx("stuck");
+        std::fs::write(dir.join("footers"), "⏵⏵ bypass permissions on\n".repeat(5)).unwrap();
+        assert_eq!(switch_plan(&ctx, "cdash-a", 4242, true).await, Err("Plan mode did not switch; use Terminal".into()));
+        assert_eq!(presses(&dir), 1);
+    }
+    #[tokio::test]
+    async fn a_question_opened_during_the_watch_gets_no_key() {
+        let (ctx, dir) = confirm_ctx("question", " Which file?\n ❯ 1. Yes\n");
+        std::fs::write(dir.join("waiting.json"), r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"input needed"}"#).unwrap();
+        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await, Err("Answer the open question first".into()));
+        assert_eq!(sent_keys(&dir), ["send-keys -t =cdash-a: Enter"], "only the command's own Enter");
+    }
+    #[tokio::test]
+    async fn no_dialog_and_idle_is_success_and_a_watch_ending_busy_is_not() {
+        let idle = r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#;
+        let (ctx, dir) = confirm_ctx("no-dialog", "");
+        std::fs::write(dir.join("waiting.json"), idle).unwrap();
+        type_setting(&ctx, "cdash-a", 4242, "effort", "high").await.unwrap();
+        assert_eq!(sent_keys(&dir), ["send-keys -t =cdash-a: Enter"]);
+        let (ctx, dir) = confirm_ctx("busy-end", "");
+        std::fs::write(dir.join("waiting.json"), idle.replace("idle", "busy")).unwrap();
+        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "effort", "high").await, Err("Claude did not confirm /effort; check Terminal".into()));
+    }
+    #[tokio::test]
+    async fn a_turn_starting_during_the_paste_gets_no_enter_and_the_box_is_cleared() {
+        let (ctx, dir) = confirm_ctx("late-busy", "");
+        std::fs::write(dir.join("pasted.json"), r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy"}"#).unwrap();
+        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await, Err("Stop the turn or wait for it to finish".into()));
+        let keys = sent_keys(&dir);
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].starts_with("send-keys -t =cdash-a: C-u"), "{keys:?}");
     }
 }
