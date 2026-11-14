@@ -476,8 +476,15 @@ async function nativeLauncher(statePath, state, script) {
   let lastPlan = null, plan = null, models = null;
   const publishSettings = () => feed.setSettings({ model: state.model, effort: state.effort, plan, agent: null, variant: null });
   const modelList = async () => models ??= await control.models();
-  const skills = async () => ((await control.call('skills/list', { cwds: [state.dir] }, 10_000)).data || [])
-    .flatMap(d => d.skills || []).filter(s => s.enabled);
+  let skillCache = null, skillsAt = 0;
+  const skills = async () => {
+    if (!skillCache || Date.now() - skillsAt > 60_000) {
+      skillCache = ((await control.call('skills/list', { cwds: [state.dir] }, 10_000)).data || [])
+        .flatMap(d => d.skills || []).filter(s => s.enabled);
+      skillsAt = Date.now();
+    }
+    return skillCache;
+  };
   const mode = on => control.call('thread/settings/update', { threadId: state.sid, collaborationMode: {
     mode: on ? 'plan' : 'default', settings: { model: state.model, reasoning_effort: state.effort, developer_instructions: null } } });
   const submit = async (input, steer) => {
@@ -489,14 +496,19 @@ async function nativeLauncher(statePath, state, script) {
     answer: async ({ id, answer }) => {
       const ask = asks.get(id);
       if (!ask) throw Error('already answered');
+      if (ask.implement) {
+        if (ask.busy) throw Error('already answered');
+        if (answer?.choice === 'yes') {
+          ask.busy = true;
+          try {
+            await mode(false);
+            plan = false; publishSettings();
+            await submit([{ type: 'text', text: 'Implement the plan.', text_elements: [] }], false);
+          } finally { ask.busy = false; } // on failure the card stays, so the user can retry
+        }
+      } else control.send({ id: ask.rpcId, result: { answers: codexAnswers(ask.questions, answer?.answers) } });
       asks.delete(id);
       feed.dropAsk(id);
-      if (ask.implement) {
-        if (answer?.choice !== 'yes') return;
-        await mode(false);
-        plan = false; publishSettings();
-        await submit([{ type: 'text', text: 'Implement the plan.', text_elements: [] }], false);
-      } else control.send({ id: ask.rpcId, result: { answers: codexAnswers(ask.questions, answer?.answers) } });
     },
     set: async ({ what, value }) => {
       if (what === 'plan') {
@@ -531,7 +543,7 @@ async function nativeLauncher(statePath, state, script) {
   const feed = new ChatFeed({
     ops,
     send: async (text, { steer }) => {
-      const [, name, rest = ''] = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(text) || [];
+      const [, name, rest = ''] = /^\/([A-Za-z0-9_:-]+)(?:\s+([\s\S]*))?$/.exec(text) || []; // `/usr/bin/x ...` is a prompt
       if (!name) return submit([{ type: 'text', text, text_elements: [] }], steer);
       const arg = rest.trim();
       if (name === 'compact') await control.call('thread/compact/start', { threadId: state.sid });
@@ -658,7 +670,7 @@ async function nativeLauncher(statePath, state, script) {
       state.model = p.threadSettings.model;
       state.effort = p.threadSettings.effort;
       state.model_label = state.model;
-      plan = p.threadSettings.collaborationMode?.mode === 'plan';
+      if (p.threadSettings.collaborationMode) plan = p.threadSettings.collaborationMode.mode === 'plan';
       publishSettings();
     } else if (m.method === 'turn/started') state.working = true;
     else if (m.method === 'turn/completed') { state.working = false; state.ts = Date.now(); }

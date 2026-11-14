@@ -54,7 +54,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
    {id:'u1',type:'userMessage',content:[{type:'text',text:'hello'}]},
    {id:'a1',type:'agentMessage',text:'hi there',phase:'final'}]}],nextCursor:null});
  if(['turn/steer','turn/interrupt','thread/settings/update','thread/compact/start','review/start'].includes(m.method))send({});
- if(m.method==='model/list')send({data:[{model:'gpt-check',displayName:'GPT Check',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'high'}],defaultReasoningEffort:'low'}],nextCursor:null});
+ if(m.method==='model/list')send({data:[{model:'gpt-check',displayName:'GPT Check',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'high'}],defaultReasoningEffort:'low'},{model:'gpt-mini',displayName:'GPT Mini',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'}],defaultReasoningEffort:'low'}],nextCursor:null});
  if(m.method==='skills/list')send({data:[{cwd:'/p',errors:[],skills:[{name:'lint',description:'Run lint',enabled:true,path:'/p/.codex/skills/lint/SKILL.md',scope:'repo'}]}]});
  if(m.method==='turn/start')send({turn:{id:'t3',status:'inProgress'}});
 });
@@ -381,7 +381,7 @@ test('the plan switch, pickers, menu, slash commands and Implement this plan? dr
   c.write({ t: 'req', rid: 4, op: 'menu' });
   const menu = (await res(c, 4)).data;
   assert.deepEqual(menu.commands.map(x => x.name), ['compact', 'review', 'plan', 'model', 'effort', 'lint']);
-  assert.deepEqual([menu.models, menu.efforts, menu.agents], [[{ value: 'gpt-check', label: 'GPT Check', efforts: ['low', 'high'] }], ['low', 'high'], []]);
+  assert.deepEqual([menu.models, menu.efforts, menu.agents], [[{ value: 'gpt-check', label: 'GPT Check', efforts: ['low', 'high'] }, { value: 'gpt-mini', label: 'GPT Mini', efforts: ['low'] }], ['low', 'high'], []]);
   await f.inject({ method: 'turn/started', params: { threadId: SID, turn: { id: 't5' } } });
   await f.inject({ method: 'item/completed', params: { threadId: SID, turnId: 't5', item: { id: 'p1', type: 'plan', text: '# Plan\n1. x' } } });
   await f.inject({ method: 'turn/completed', params: { threadId: SID, turn: { id: 't5', status: 'completed' } } });
@@ -397,5 +397,32 @@ test('the plan switch, pickers, menu, slash commands and Implement this plan? dr
   assert.deepEqual(f.rpc('review/start').params, { threadId: SID, target: { type: 'uncommittedChanges' } });
   assert.deepEqual(f.rpc('turn/start').params.input, [{ type: 'skill', name: 'lint', path: '/p/.codex/skills/lint/SKILL.md' }, { type: 'text', text: 'fix it', text_elements: [] }]);
   assert.deepEqual(c.lines.find(l => l.t === 'ack' && l.cid === 'c4'), { t: 'ack', cid: 'c4', ok: false, error: 'Use Terminal for this command' });
+  c.close();
+});
+test('a path-like prompt is a prompt; set model falls back to the model default effort; no to the plan card keeps the thread in plan mode', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  c.write({ t: 'send', cid: 'p1', text: '/usr/bin/x broke, why?', steer: false });
+  await until(() => c.lines.some(l => l.t === 'ack' && l.cid === 'p1'));
+  assert.deepEqual(c.lines.find(l => l.t === 'ack' && l.cid === 'p1'), { t: 'ack', cid: 'p1', ok: true });
+  assert.equal(f.rpc('turn/start').params.input[0].text, '/usr/bin/x broke, why?');
+  assert.equal(f.rpc('skills/list'), undefined, 'no extra round trip');
+  c.write({ t: 'req', rid: 1, op: 'set', what: 'effort', value: 'high' });
+  await res(c, 1);
+  c.write({ t: 'req', rid: 2, op: 'set', what: 'model', value: 'gpt-mini' });
+  assert.equal((await res(c, 2)).ok, true);
+  assert.deepEqual(f.rpc('thread/settings/update').params, { threadId: SID, model: 'gpt-mini', effort: 'low' });
+  await until(() => c.lines.some(l => l.t === 'settings' && l.settings.model === 'gpt-mini' && l.settings.effort === 'low'));
+  await f.inject({ method: 'turn/started', params: { threadId: SID, turn: { id: 't6' } } });
+  await f.inject({ method: 'item/completed', params: { threadId: SID, turnId: 't6', item: { id: 'p2', type: 'plan', text: '# P' } } });
+  await f.inject({ method: 'turn/completed', params: { threadId: SID, turn: { id: 't6', status: 'completed' } } });
+  await until(() => asksNow(c).length === 1);
+  const before = f.rpc('turn/start');
+  c.write({ t: 'req', rid: 3, op: 'answer', id: 'implement:t6', answer: { choice: 'no' } });
+  assert.equal((await res(c, 3)).ok, true);
+  await until(() => asksNow(c).length === 0);
+  assert.equal(f.rpc('turn/start').id, before.id, 'no prompt sent');
   c.close();
 });
