@@ -366,6 +366,8 @@ impl<E: Engine> Actor<E> {
                 None
             }
             ClientFrame::Page { before, limit } => Some(frame(self.page(before, limit))),
+            // The socket pump consumes focus frames itself.
+            ClientFrame::Focus { .. } => None,
         }
     }
 

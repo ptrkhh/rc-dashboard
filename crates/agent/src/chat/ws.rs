@@ -1,7 +1,7 @@
 //! The WebSocket between one browser and a session's hub.
 
 use super::hub::{ClientFrame, Hub};
-use crate::collect::ctx::Ctx;
+use crate::collect::ctx::{Ctx, FocusGuard};
 use crate::collect::term::{send_or_drop, PING_EVERY};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ const BEHIND: u16 = 4002;
 
 pub async fn serve(ctx: Arc<Ctx>, hub: Hub, name: String, after: Option<u64>, epoch: Option<String>, mut ws: WebSocket) {
     ctx.host.log.push(format!("chat open {name}"));
-    if let Some((code, reason)) = pump(&hub, after, epoch, &mut ws).await {
+    if let Some((code, reason)) = pump(&ctx, &name, &hub, after, epoch, &mut ws).await {
         let _ = ws.send(Message::Close(Some(CloseFrame { code, reason: reason.into() }))).await;
         // Read the browser's Close reply, as `term::bridge` does, so it sees the code.
         let drain = async { while let Some(Ok(_)) = ws.recv().await {} };
@@ -28,7 +28,7 @@ fn ends_session(f: &str) -> bool {
         && serde_json::from_str::<serde_json::Value>(f).is_ok_and(|v| v["t"] == "state" && v["ended"] == true)
 }
 
-async fn pump(hub: &Hub, after: Option<u64>, epoch: Option<String>, ws: &mut WebSocket) -> Option<(u16, &'static str)> {
+async fn pump(ctx: &Ctx, name: &str, hub: &Hub, after: Option<u64>, epoch: Option<String>, ws: &mut WebSocket) -> Option<(u16, &'static str)> {
     let Some(mut sub) = hub.subscribe(after, epoch).await else { return Some((ENDED, "session ended")) };
     let mut ended = false;
     for f in sub.backlog {
@@ -43,6 +43,7 @@ async fn pump(hub: &Hub, after: Option<u64>, epoch: Option<String>, ws: &mut Web
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heard = true;
+    let mut focus = FocusGuard::new(ctx, name);
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -67,6 +68,10 @@ async fn pump(hub: &Hub, after: Option<u64>, epoch: Option<String>, ws: &mut Web
                 match msg {
                     Some(Ok(Message::Text(t))) => {
                         let Ok(frame) = serde_json::from_str::<ClientFrame>(t.as_str()) else { continue };
+                        if let ClientFrame::Focus { on } = frame {
+                            focus.set(on);
+                            continue;
+                        }
                         if let Some(reply) = hub.command(frame).await {
                             if !send_or_drop(ws, Message::Text(reply.as_ref().into())).await {
                                 return None;
@@ -84,7 +89,7 @@ async fn pump(hub: &Hub, after: Option<u64>, epoch: Option<String>, ws: &mut Web
 #[cfg(test)]
 mod tests {
     use crate::chat::claude::tests::{append, fixture_lines, fixture_with, write_session};
-    use crate::chat::tmux_io::tests::tempfile_path;
+    use crate::chat::tmux_io::tests::{eventually, tempfile_path};
     use crate::collect::ctx::Ctx;
     use crate::http::serve::{serve, tests::cfg_for};
     use futures_util::{SinkExt, StreamExt};
@@ -198,6 +203,16 @@ mod tests {
         assert_eq!(next_json(&mut again).await["t"], "state", "nothing is replayed");
         let log = b.ctx.host.log.lines().join("\n");
         assert!(log.contains("chat open cdash-a") && log.contains("chat send cdash-a") && !log.contains("zebra"));
+    }
+    #[tokio::test]
+    async fn focus_frames_feed_the_count_and_a_socket_that_drops_counts_as_off() {
+        let (b, _dir) = chat_server("focus");
+        let mut ws = connect(b.addr, "name=cdash-a", None).await.unwrap();
+        next_of(&mut ws, "state").await;
+        ws.send(WsMsg::Text(r#"{"t":"focus","on":true}"#.into())).await.unwrap();
+        eventually("chat focus counted", || b.ctx.focused("cdash-a")).await;
+        drop(ws); // no "focus off": the phone went to sleep
+        eventually("dropped socket uncounted", || !b.ctx.focused("cdash-a")).await;
     }
     #[tokio::test]
     async fn garbage_frames_are_ignored_and_a_bare_terminal_pane_has_no_chat() {

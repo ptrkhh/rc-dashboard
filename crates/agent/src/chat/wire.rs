@@ -11,6 +11,8 @@ pub enum ClientFrame {
     Stop,
     Held { op: HeldOp, id: String },
     Page { before: u64, limit: Option<usize> },
+    /// This socket's device is (or is no longer) looking at the session.
+    Focus { on: bool },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -65,6 +67,7 @@ mod tests {
         assert!(matches!(f(r#"{"t":"stop"}"#), Ok(ClientFrame::Stop)));
         assert!(matches!(f(r#"{"t":"held","op":"now","id":"h1"}"#), Ok(ClientFrame::Held { op: HeldOp::Now, .. })));
         assert!(matches!(f(r#"{"t":"page","before":40}"#), Ok(ClientFrame::Page { before: 40, limit: None })));
+        assert!(matches!(f(r#"{"t":"focus","on":true}"#), Ok(ClientFrame::Focus { on: true })));
         assert!(f(r#"{"t":"keys","data":"x"}"#).is_err());
     }
 }

@@ -45,6 +45,8 @@ pub struct Ctx {
     pub password: std::sync::OnceLock<crate::auth::login::PasswordState>,
     /// One hub per chatted pane, started by the first `/api/chat` for it.
     pub chats: tokio::sync::Mutex<HashMap<String, crate::chat::hub::Hub>>,
+    /// Sockets per session whose device is looking at it; see `FocusGuard`.
+    pub focus: Mutex<HashMap<String, usize>>,
 }
 
 impl Ctx {
@@ -73,6 +75,7 @@ impl Ctx {
             codex_threads: tokio::sync::Mutex::new(None),
             password: std::sync::OnceLock::new(),
             chats: tokio::sync::Mutex::new(HashMap::new()),
+            focus: Mutex::new(HashMap::new()),
         }
     }
 
@@ -104,5 +107,66 @@ impl Ctx {
 
     pub fn meta_delete(&self, name: &str) {
         self.meta.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+    }
+
+    /// Is any connected device looking at this session right now?
+    pub fn focused(&self, name: &str) -> bool {
+        self.focus.lock().unwrap_or_else(|e| e.into_inner()).contains_key(name)
+    }
+}
+
+/// One socket's vote in `Ctx::focus`. Counts at most once however often it is
+/// set, and a dropped guard (closed or vanished socket) counts as off.
+pub struct FocusGuard<'a> {
+    ctx: &'a Ctx,
+    name: &'a str,
+    on: bool,
+}
+
+impl<'a> FocusGuard<'a> {
+    pub fn new(ctx: &'a Ctx, name: &'a str) -> Self {
+        Self { ctx, name, on: false }
+    }
+
+    pub fn set(&mut self, on: bool) {
+        if on == self.on {
+            return;
+        }
+        self.on = on;
+        let mut m = self.ctx.focus.lock().unwrap_or_else(|e| e.into_inner());
+        if on {
+            *m.entry(self.name.to_string()).or_insert(0) += 1;
+        } else if let Some(n) = m.get_mut(self.name) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(self.name);
+            }
+        }
+    }
+}
+
+impl Drop for FocusGuard<'_> {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::tmux_io::tests::tempfile_path;
+
+    #[test]
+    fn focus_counts_each_connection_once_and_a_dropped_one_counts_as_off() {
+        let ctx = crate::chat::claude::tests::ctx_with_path(tempfile_path("focus"), String::new());
+        let (mut a, mut b) = (FocusGuard::new(&ctx, "cdash-a"), FocusGuard::new(&ctx, "cdash-a"));
+        a.set(true);
+        a.set(true);
+        b.set(true);
+        assert_eq!(ctx.focus.lock().unwrap().get("cdash-a"), Some(&2));
+        a.set(false);
+        assert!(ctx.focused("cdash-a"), "the other device still looks");
+        drop(b);
+        assert!(!ctx.focused("cdash-a") && !ctx.focus.lock().unwrap().contains_key("cdash-a"));
     }
 }
