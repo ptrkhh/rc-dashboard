@@ -512,18 +512,20 @@ test('pin keeps keyboard focus unless the user focuses something else while savi
 test('chat scripts load before app.js and the chat markup exists', () => {
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const at = s => html.indexOf(s);
-  for (const f of ['chat/md.js', 'chat/store.js', 'chat/view.js']) {
+  for (const f of ['chat/md.js', 'chat/store.js', 'chat/cards.js', 'chat/view.js']) {
     assert.ok(at(`<script src="${f}"></script>`) > 0 && at(`<script src="${f}"></script>`) < at('<script src="app.js"></script>'), f);
   }
-  for (const id of ['chat', 'chat-log', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'notify-toggle'])
+  for (const id of ['chat', 'chat-log', 'chat-cards', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'notify-toggle'])
     assert.ok(html.includes(`id="${id}"`), id);
   assert.ok(/id="chat"[^>]*\shidden/.test(html), 'chat starts hidden');
 });
 test('the chat view never builds markup from conversation text', () => {
-  const view = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
-  const uses = view.match(/\.innerHTML\s*=[^;]*;/g) || [];
-  assert.ok(uses.length > 0 && uses.every(u => /cdashMd\.render\(|=\s*''/.test(u)), uses.join('\n'));
-  assert.ok(!/insertAdjacentHTML|document\.write|eval\(/.test(view));
+  for (const f of ['view.js', 'cards.js']) {
+    const view = readFileSync(new URL('../public/chat/' + f, import.meta.url), 'utf8');
+    const uses = view.match(/\.innerHTML\s*=[^;]*;/g) || [];
+    assert.ok(uses.length > 0 && uses.every(u => /cdashMd\.render\(|=\s*''/.test(u)), f + uses.join('\n'));
+    assert.ok(!/insertAdjacentHTML|document\.write|eval\(/.test(view));
+  }
 });
 test('the composer follows the session: send, stop, or off', async () => {
   globalThis.document = undefined;                              // the helper must not touch the DOM

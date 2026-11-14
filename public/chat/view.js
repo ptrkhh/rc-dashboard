@@ -128,6 +128,7 @@
     $('#chat').hidden = true;
     $('#chat-log').textContent = '';
     $('#chat-held').textContent = '';
+    $('#chat-cards').textContent = '';
     if ($('#chat-sheet').open) $('#chat-sheet').close();
   }
 
@@ -149,8 +150,10 @@
       if (f.t === 'hello') { x.attempt = 0; x.link = ''; ws.send(JSON.stringify({ t: 'focus', on: focusNow() })); }
       if (f.t === 'page') { x.paging = false; x.paged = true; }
       const wasWorking = x.state.working;
+      const wasWaiting = x.state.waiting;
       cdashChatStore.apply(x.state, f);
       if (x.state.working && !wasWorking) x.since = Date.now();
+      if (x.state.waiting && !wasWaiting) { x.waitSince = Date.now(); setTimeout(() => { if (c === x) schedule(); }, 550); } // the banner waits 500 ms for an ask
       schedule();
     };
     ws.onclose = e => {
@@ -311,6 +314,7 @@
     for (const [k, n] of x.nodes) if (!keep.has(k)) { n.el.remove(); x.nodes.delete(k); }
     renderStatus();
     renderBanner();
+    cdashCards.render($('#chat-cards'), x.state, sendFrame);
     renderHeld();
     renderComposer();
     // Last: the held list and composer above change how tall the log is.
@@ -353,7 +357,7 @@
     input.disabled = go.disabled = mode === 'off';
     input.placeholder = s.ended || c.done ? 'Session ended'
       : s.unreadable ? 'Use Terminal for this session'
-      : s.waiting ? 'Answer in Terminal first'
+      : s.waiting ? (s.asks.length ? 'Answer the card first' : 'Answer in Terminal first')
       : s.working ? 'Queue a message…' : 'Message…';
     go.textContent = stop ? 'Stop' : 'Send';
     go.classList.toggle('stop', stop);
@@ -375,7 +379,8 @@
     const [text, term] = c.link ? [c.link, false]
       : s.ended || c.done ? ['Session ended.', false]
       : s.unreadable ? ['Chat can’t read this session.', true]
-      : s.waiting ? ['Answer in Terminal to continue.', true]
+      : s.waiting && cdashChatStore.needsTerminal(s, Date.now() - (c.waitSince || 0))
+        ? ['Answer in Terminal to continue.' + (s.hooks ? '' : ' Restart the session to answer from chat.'), true]
       : ['', false];
     const sig = text + term;
     if (b.dataset.sig === sig) return;
