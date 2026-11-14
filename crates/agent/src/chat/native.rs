@@ -34,6 +34,8 @@ struct SendFrame<'a> {
     cid: &'a str,
     text: &'a str,
     steer: bool,
+    #[serde(skip_serializing_if = "<[Attachment]>::is_empty")]
+    files: &'a [Attachment],
 }
 
 type Acks = Mutex<HashMap<String, oneshot::Sender<Result<Sent, String>>>>;
@@ -86,10 +88,10 @@ impl NativeEngine {
 }
 
 impl Engine for NativeEngine {
-    async fn send(&self, text: &str, steer: bool, cid: &str, _files: &[Attachment]) -> Result<Sent, String> {
+    async fn send(&self, text: &str, steer: bool, cid: &str, files: &[Attachment]) -> Result<Sent, String> {
         let (tx, rx) = oneshot::channel();
         self.shared.acks.lock().unwrap_or_else(|e| e.into_inner()).insert(cid.to_string(), tx);
-        let line = serde_json::to_string(&SendFrame { t: "send", cid, text, steer }).map_err(|e| e.to_string())?;
+        let line = serde_json::to_string(&SendFrame { t: "send", cid, text, steer, files }).map_err(|e| e.to_string())?;
         if let Err(e) = self.write(line).await {
             self.shared.acks.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
             return Err(e);
@@ -442,5 +444,19 @@ mod tests {
         let sock = tempfile_path("gone").join("chat.sock");                  // nothing listens there
         let (_engine, mut rx) = start(sock, log(), "cdash-a".into());
         assert!(matches!(rx.recv().await, Some(EngineMsg::Ended)));
+    }
+
+    #[tokio::test]
+    async fn attachments_travel_to_the_supervisor_as_paths_never_bytes() {
+        use crate::chat::hub::Kind;
+        let (sock, mut sup) = fake_supervisor("files");
+        let (engine, _rx) = start(sock, log(), "cdash-a".into());
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
+        let files = [Attachment { path: "/u/up/a.png".into(), kind: Kind::Image, mime: "image/png".into(), name: "a.png".into(), size: 8 }];
+        let sending = tokio::spawn(async move { engine.send("look", false, "c3", &files).await });
+        assert_eq!(sup.read_line().await, r#"{"t":"send","cid":"c3","text":"look","steer":false,"files":[{"path":"/u/up/a.png","kind":"image","mime":"image/png","name":"a.png","size":8}]}"#);
+        sup.write_line(r#"{"t":"ack","cid":"c3","ok":true}"#).await;
+        assert_eq!(sending.await.unwrap(), Ok(Sent::Confirmed));
     }
 }

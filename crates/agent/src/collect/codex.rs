@@ -316,6 +316,7 @@ pub async fn launch(
     .map_err(|e| Refused::Failed(format!("Codex runner trust write: {e}")))?;
     let agent = std::env::current_exe().map_err(|e| Refused::Failed(format!("agent executable: {e}")))?;
     let agent_env = format!("CDASH_CODEX_AGENT={}", agent.display());
+    let media_env = format!("CDASH_MEDIA_DIR={}", crate::chat::media::media_dir().display());
     ctx.runner
         .run_checked(
             "tmux",
@@ -324,6 +325,8 @@ pub async fn launch(
                 "-d",
                 "-e",
                 &agent_env,
+                "-e",
+                &media_env,
                 "-s",
                 &name,
                 "-c",
@@ -589,7 +592,9 @@ mod tests {
         assert_eq!(s.model_label.as_deref(), Some("GPT B"));
         assert_eq!(s.sid.as_deref(), Some(SID), "the thread being resumed must survive");
         assert_eq!(serde_json::to_value(&s).unwrap()["native_terminal"], true);
-        assert!(std::fs::read_to_string(dir.join("tmux-args")).unwrap().contains("CDASH_CODEX_AGENT="));
+        let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap();
+        assert!(args.contains("CDASH_CODEX_AGENT="));
+        assert!(args.contains(&format!("-e CDASH_MEDIA_DIR={}", crate::chat::media::media_dir().display())));
     }
 
     #[test]

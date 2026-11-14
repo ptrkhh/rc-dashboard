@@ -368,12 +368,15 @@ pub async fn launch(
     )
     .await
     .map_err(|e| Refused::Failed(format!("OpenCode runner trust write: {e}")))?;
+    let media_env = format!("CDASH_MEDIA_DIR={}", crate::chat::media::media_dir().display());
     ctx.runner
         .run_checked(
             "tmux",
             &[
                 "new-session",
                 "-d",
+                "-e",
+                &media_env,
                 "-s",
                 &name,
                 "-c",
@@ -522,6 +525,7 @@ mod tests {
             .await
             .unwrap();
         let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap();
+        assert!(args.contains(&format!("-e CDASH_MEDIA_DIR={}", crate::chat::media::media_dir().display())));
         let state_path = args
             .split("--state ")
             .nth(1)
