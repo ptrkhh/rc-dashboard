@@ -110,6 +110,8 @@
     $('#chat-jump').hidden = true;
     $('#chat').hidden = false;
     c.clock = setInterval(() => { if (c?.state.working) renderStatus(); }, 1000);
+    const x = c;
+    x.unwatch = watchFocus(on => { if (x.ws?.readyState === 1) x.ws.send(JSON.stringify({ t: 'focus', on })); });
     schedule();
     connect();
   }
@@ -120,6 +122,7 @@
     c = null;
     clearTimeout(x.retryTimer);
     clearInterval(x.clock);
+    x.unwatch?.();
     if (x.raf) cancelAnimationFrame(x.raf);
     x.ws?.close();
     $('#chat').hidden = true;
@@ -143,7 +146,7 @@
       if (c !== x || x.ws !== ws) return;
       let f;
       try { f = JSON.parse(e.data); } catch { return; }
-      if (f.t === 'hello') { x.attempt = 0; x.link = ''; }
+      if (f.t === 'hello') { x.attempt = 0; x.link = ''; ws.send(JSON.stringify({ t: 'focus', on: focusNow() })); }
       if (f.t === 'page') { x.paging = false; x.paged = true; }
       const wasWorking = x.state.working;
       cdashChatStore.apply(x.state, f);
@@ -413,7 +416,38 @@
     $('#chat-sheet').showModal();
   }
 
+  // Focus: a page counts only while visible, focused and used in the last two minutes.
+  const FOCUS_IDLE = 120000;
+  const focusActive = ({ visible, focused, lastInput, now }) => visible && focused && now - lastInput < FOCUS_IDLE;
+  const fw = { subs: new Set(), last: 0, on: false, timer: 0, started: false };
+  const focusNow = () => focusActive({
+    visible: !document.hidden, focused: document.hasFocus(), lastInput: fw.last, now: Date.now(),
+  });
+  function focusCheck() {
+    clearTimeout(fw.timer);
+    const on = focusNow();
+    if (on) fw.timer = setTimeout(focusCheck, fw.last + FOCUS_IDLE - Date.now() + 5);
+    if (on !== fw.on) { fw.on = on; for (const fn of fw.subs) fn(on); }
+  }
+  function watchFocus(fn) {
+    if (!fw.started) {
+      fw.started = true;
+      fw.last = Date.now();
+      document.addEventListener('visibilitychange', focusCheck);
+      addEventListener('focus', focusCheck);
+      addEventListener('blur', focusCheck);
+      for (const t of ['keydown', 'pointerdown', 'touchstart'])
+        document.addEventListener(t, () => { fw.last = Date.now(); focusCheck(); }, { capture: true, passive: true });
+    }
+    fw.on = focusNow();
+    fw.subs.add(fn);
+    return () => fw.subs.delete(fn);
+  }
+
   g.cdashChat = {
+    focusActive,
+    watchFocus,
+    focusNow,
     composerMode,
     needPage,
     resend,

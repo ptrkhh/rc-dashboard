@@ -644,6 +644,7 @@ async function termConnect() {
     // onResize drops sizes while connecting, and the keyboard that focus()
     // opens usually lands then; send the size the screen has now.
     ws.send(JSON.stringify({ resize: [t.xterm.cols, t.xterm.rows] }));
+    ws.send(JSON.stringify({ t: 'focus', on: cdashChat.focusNow() }));
   };
   ws.onmessage = e => { if (typeof e.data !== 'string') t.xterm.write(new Uint8Array(e.data)); };
   ws.onclose = e => {
@@ -705,6 +706,9 @@ function openTerm(name, title) {
   term.ro = new ResizeObserver(() => fit.fit());
   term.ro.observe($('#term-screen'));
   history.pushState({ term: name }, ''); // Android back closes the overlay
+  term.unwatch = cdashChat.watchFocus(on => {
+    if (term?.ws?.readyState === WebSocket.OPEN) term.ws.send(JSON.stringify({ t: 'focus', on }));
+  });
   termConnect();
   xterm.focus();
 }
@@ -713,6 +717,7 @@ function closeTerm() {
   if (!term) return;
   const t = term;
   term = null;
+  t.unwatch?.();
   t.ro.disconnect();
   t.ws?.close();
   t.xterm.dispose();

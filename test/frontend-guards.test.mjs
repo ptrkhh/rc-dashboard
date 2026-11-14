@@ -590,3 +590,16 @@ test('older history is asked for while the list cannot scroll, and Send again ke
   assert.equal(resend(s, 'c1', text => text === 'hi'), true);
   assert.deepEqual(s.mine, []);
 });
+
+test('focus counts only a visible, focused page with input in the last two minutes, and both sockets report it', async () => {
+  globalThis.document = undefined;
+  await import('../public/chat/store.js');
+  await import('../public/chat/view.js');
+  const at = o => globalThis.cdashChat.focusActive({ visible: true, focused: true, lastInput: 0, now: 0, ...o });
+  assert.equal(at({ now: 119_999 }), true);
+  assert.equal(at({ now: 120_000 }), false, 'a desk window left focused stops counting after two idle minutes');
+  assert.equal(at({ visible: false }), false);
+  assert.equal(at({ focused: false }), false);
+  const src = f => readFileSync(new URL(f, import.meta.url), 'utf8');
+  for (const f of ['../public/chat/view.js', '../public/app.js']) assert.match(src(f), /t: 'focus', on/, f);
+});
