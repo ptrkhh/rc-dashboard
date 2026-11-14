@@ -70,10 +70,9 @@ pub async fn ensure_hubs(ctx: &Arc<Ctx>) {
 pub fn spawn(ctx: Arc<Ctx>, mut stop: tokio::sync::watch::Receiver<bool>) {
     let mut notes = ctx.notes.subscribe();
     tokio::spawn(async move {
-        let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build() else {
-            return;
-        };
+        let http = super::push::client();
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = stop.changed() => return,
@@ -124,15 +123,8 @@ mod tests {
             std::mem::take(&mut *self.got.lock().unwrap())
         }
         async fn wait(&self, n: usize) -> Vec<Req> {
-            for _ in 0..300 {
-                if self.got.lock().unwrap().len() >= n {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            let got = self.take();
-            assert!(got.len() >= n, "expected {n} pushes, got {}", got.len());
-            got
+            eventually("the pushes arrived", || self.got.lock().unwrap().len() >= n).await;
+            self.take()
         }
     }
 
@@ -202,12 +194,15 @@ mod tests {
         push::add(&ctx, dead).await.unwrap();
         push::add(&ctx, sub(&inbox, "gone", &pa, &aa)).await.unwrap();
         push::add(&ctx, sub(&inbox, "a", &pa, &aa)).await.unwrap();
-        push::send(&ctx, &reqwest::Client::new(), &Note { session: "cdash-a".into(), project: "proj".into(), kind: NoteKind::Ask, at: 7 }).await;
+        push::send(&ctx, &push::client(), &Note { session: "cdash-a".into(), project: "proj".into(), kind: NoteKind::Ask, at: 7 }).await;
         let got = inbox.take();
-        assert_eq!(got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["gone", "a"], "a dead or gone device does not stop the next");
+        let mut ids: Vec<_> = got.iter().map(|r| r.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["a", "gone"], "a dead or gone device does not stop the next");
+        let got: Vec<_> = got.into_iter().filter(|r| r.id == "a").collect();
         let log = ctx.host.log.lines().join("\n");
-        assert!(log.contains("push failed") && log.contains("127.0.0.1") && !log.contains("cdash-a"), "logs name the host only");
-        let r = &got[1];
+        assert!(log.contains("push failed unreachable 127.0.0.1") && !log.contains("cdash-a"), "logs name the host only");
+        let r = &got[0];
         assert_eq!((r.header("content-encoding"), r.header("ttl"), r.header("urgency")), ("aes128gcm", "86400", "high"));
         assert_eq!(r.header("topic").len(), 32);
         assert!(r.header("authorization").starts_with("vapid t="));

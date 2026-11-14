@@ -28,7 +28,8 @@ use std::sync::Arc;
 /// The running hub for a pane, started on first use.
 pub async fn hub_for(ctx: &Arc<Ctx>, name: &str) -> Result<hub::Hub, Refused> {
     let mut chats = ctx.chats.lock().await;
-    if let Some(h) = chats.get(name).filter(|h| !h.is_closed()) {
+    chats.retain(|_, h| !h.is_closed());
+    if let Some(h) = chats.get(name) {
         return Ok(h.clone());
     }
     let no_chat = || Refused::BadRequest("this session has no chat".into());

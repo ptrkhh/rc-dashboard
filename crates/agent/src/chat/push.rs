@@ -139,9 +139,17 @@ pub async fn subscriptions(ctx: &Ctx) -> Vec<Sub> {
     }
 }
 
-/// One push per subscription, in file order. A dead or unreachable device never
-/// stops the next; 404 and 410 drop the subscription. Logs name only the host.
-// ponytail: one push at a time; send concurrently if several slow devices make notes late.
+/// The one HTTP client for push services: 10 s timeout, no redirects.
+pub fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
+}
+
+/// One push to every subscription, concurrently: a hanging device delays no
+/// other. 404 and 410 drop the subscription. Logs name only the host.
 pub async fn send(ctx: &Ctx, http: &reqwest::Client, note: &Note) {
     let subs = subscriptions(ctx).await;
     if subs.is_empty() {
@@ -151,37 +159,47 @@ pub async fn send(ctx: &Ctx, http: &reqwest::Client, note: &Note) {
         ctx.host.log.push("push failed: no signing key");
         return;
     };
+    let vapid = std::sync::Arc::new(vapid);
     let payload = note.payload();
     let topic = b64(&Sha256::digest(note.session.as_bytes()))[..32].to_string();
     let urgency = if note.kind == NoteKind::Done { "normal" } else { "high" };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut set = tokio::task::JoinSet::new();
     for sub in subs {
-        let host = reqwest::Url::parse(&sub.endpoint).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
-        let sent = async {
-            let ua = super::ece::unb64(&sub.p256dh).ok_or("bad p256dh")?;
-            let auth = super::ece::unb64(&sub.auth).ok_or("bad auth")?;
-            let body = super::ece::encrypt(&ua, &auth, payload.as_bytes())?;
-            let res = http
-                .post(&sub.endpoint)
-                .header("Authorization", vapid.authorization(&sub.endpoint, now)?)
-                .header("Content-Encoding", "aes128gcm")
-                .header("TTL", "86400")
-                .header("Urgency", urgency)
-                .header("Topic", &topic)
-                .body(body)
-                .send()
-                .await
-                .map_err(|_| "unreachable".to_string())?;
-            Ok::<_, String>(res.status())
-        }
-        .await;
+        let (http, vapid, payload, topic) = (http.clone(), vapid.clone(), payload.clone(), topic.clone());
+        set.spawn(async move {
+            let host = reqwest::Url::parse(&sub.endpoint).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
+            let sent = async {
+                let ua = super::ece::unb64(&sub.p256dh).ok_or("bad p256dh")?;
+                let auth = super::ece::unb64(&sub.auth).ok_or("bad auth")?;
+                let body = super::ece::encrypt(&ua, &auth, payload.as_bytes())?;
+                let res = http
+                    .post(&sub.endpoint)
+                    .header("Authorization", vapid.authorization(&sub.endpoint, now)?)
+                    .header("Content-Encoding", "aes128gcm")
+                    .header("TTL", "86400")
+                    .header("Urgency", urgency)
+                    .header("Topic", &topic)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|_| "unreachable".to_string())?;
+                Ok::<_, String>(res.status())
+            }
+            .await;
+            (sub.endpoint, host, sent)
+        });
+    }
+    while let Some(done) = set.join_next().await {
+        let Ok((endpoint, host, sent)) = done else { continue };
         match sent {
             Ok(s) if s.is_success() => {}
-            Ok(s) if s.as_u16() == 404 || s.as_u16() == 410 => {
-                let _ = remove(ctx, &sub.endpoint).await;
+            Ok(s) => {
+                if s.as_u16() == 404 || s.as_u16() == 410 {
+                    let _ = remove(ctx, &endpoint).await;
+                }
                 ctx.host.log.push(format!("push failed {} {host}", s.as_u16()));
             }
-            Ok(s) => ctx.host.log.push(format!("push failed {} {host}", s.as_u16())),
             Err(e) => ctx.host.log.push(format!("push failed {e} {host}")),
         }
     }
