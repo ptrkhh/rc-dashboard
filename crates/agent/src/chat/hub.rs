@@ -100,6 +100,14 @@ pub struct Attachment {
     pub size: u64,
 }
 
+/// A piece of a side question's answer; `done` ends it.
+#[derive(Debug)]
+pub struct AsideChunk {
+    pub text: String,
+    pub done: bool,
+    pub error: Option<String>,
+}
+
 /// The input side of a session.
 pub trait Engine: Send + Sync + 'static {
     fn send(&self, text: &str, steer: bool, cid: &str, files: &[Attachment]) -> impl Future<Output = Result<Sent, String>> + Send;
@@ -126,6 +134,21 @@ pub trait Engine: Send + Sync + 'static {
     /// Whether answers arrive through hooks; read once when the hub starts.
     fn hooks(&self) -> bool {
         true
+    }
+    /// Rewinds the conversation to before the prompt `uuid`, and the code too
+    /// when `files`; answers the prompt's text for the composer.
+    fn rewind(&self, _uuid: &str, _files: bool) -> impl Future<Output = Result<String, String>> + Send {
+        async { Err("not supported".to_string()) }
+    }
+    fn rewind_undo(&self) -> impl Future<Output = Result<(), String>> + Send {
+        async { Err("not supported".to_string()) }
+    }
+    /// Asks a side question that never enters the conversation.
+    fn aside(&self, _id: &str, _text: &str) -> impl Future<Output = Result<mpsc::Receiver<AsideChunk>, String>> + Send {
+        async { Err("not supported".to_string()) }
+    }
+    fn aside_cancel(&self, _id: &str) -> impl Future<Output = ()> + Send {
+        async {}
     }
     /// How many clients are attached now; the hub reports each change.
     fn watchers(&self, _n: usize) -> impl Future<Output = ()> + Send {
@@ -221,7 +244,8 @@ impl Hub {
         rx.await.ok()
     }
 
-    /// The reply for `send`, `page`, `answer`, `set` and `menu`; `None` for the rest.
+    /// The reply for `send`, `page`, `answer`, `set`, `menu`, `rewind` and
+    /// `rewind_undo`; `None` for the rest (`ws.rs` routes `aside` itself).
     pub async fn command(&self, frame: ClientFrame) -> Option<Frame> {
         let (reply, rx) = oneshot::channel();
         self.cmds.send(Cmd::Client { frame, reply }).await.ok()?;
@@ -262,6 +286,17 @@ fn ack(cid: &str, status: &str, error: Option<&str>) -> Value {
         a["error"] = json!(e);
     }
     a
+}
+
+/// The `rewound` reply: the `Ok` object's fields on success, `error` otherwise.
+fn rewound(uuid: Value, r: Result<Value, String>) -> Value {
+    let mut v = json!({"t":"rewound","uuid":uuid,"ok":r.is_ok()});
+    match r {
+        Ok(Value::Object(extra)) => v.as_object_mut().unwrap().extend(extra),
+        Ok(_) => {}
+        Err(e) => v["error"] = json!(e),
+    }
+    v
 }
 
 /// A prompt is a `user` event whose content is not a `tool_result` list.
@@ -666,6 +701,50 @@ impl<E: Engine> Actor<E> {
                 let list = |k: &str| m.get(k).cloned().unwrap_or_else(|| json!([]));
                 Some(frame(json!({"t":"menu","commands":list("commands"),"models":list("models"),"efforts":list("efforts"),"agents":list("agents")})))
             }
+            ClientFrame::Rewind { uuid, files } => Some(frame(self.rewind(uuid, files).await)),
+            ClientFrame::RewindUndo => {
+                let r = match self.rewind_refusal() {
+                    Some(e) => Err(e.to_string()),
+                    None => self.engine.rewind_undo().await,
+                };
+                Some(frame(rewound(Value::Null, r.map(|()| json!({})))))
+            }
+            ClientFrame::Aside { .. } | ClientFrame::AsideCancel { .. } => None,
+        }
+    }
+
+    /// Why the conversation may not be rewound now: only an idle session that
+    /// waits for nothing is, so no key lands in a turn or a dialog.
+    fn rewind_refusal(&self) -> Option<&'static str> {
+        if self.working { Some("Stop the turn or wait for it to finish") } else { self.refusal() }
+    }
+
+    /// Runs inside the actor, so no paste, release or other key interleaves.
+    async fn rewind(&mut self, uuid: String, files: bool) -> Value {
+        if let Some(e) = self.rewind_refusal() {
+            return rewound(json!(uuid), Err(e.into()));
+        }
+        // A prompt older than the window is not found: it is not in memory to cut.
+        let Some(i) = self.log_events.iter().rposition(|e| e["uuid"] == uuid.as_str() && prompt_text(e).is_some()) else {
+            return rewound(json!(uuid), Err("not in this conversation".into()));
+        };
+        let target = &self.log_events[i];
+        if target["src"] == "steer" {
+            return rewound(json!(uuid), Err("this prompt cannot be rewound".into()));
+        }
+        let attachments = target["files"].as_array().map_or(0, Vec::len);
+        // A uuid-less row just before it (a `cdash/queued`) announced this prompt.
+        let len = i - self.log_events.range(..i).rev().take_while(|e| !e["uuid"].is_string()).count();
+        match self.engine.rewind(&uuid, files).await {
+            Ok(text) => {
+                self.cut_to(len);
+                self.log.push(format!("chat rewind {}", self.name));
+                rewound(json!(uuid), Ok(json!({"text":text,"attachments":attachments})))
+            }
+            Err(e) => {
+                self.log.push(format!("chat rewind failed {}: {e}", self.name));
+                rewound(json!(uuid), Err(e))
+            }
         }
     }
 
@@ -872,6 +951,7 @@ mod tests {
         slow: Option<Duration>,
         /// The last event number the source still has.
         has: u64,
+        fail_rewind: bool,
     }
     impl Engine for FakeEngine {
         async fn send(&self, text: &str, steer: bool, _cid: &str, files: &[Attachment]) -> Result<Sent, String> {
@@ -910,6 +990,14 @@ mod tests {
         async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
             Ok((from..=to.min(self.has)).map(|k| json!({"type":"user","n":k})).collect())
         }
+        async fn rewind(&self, uuid: &str, files: bool) -> Result<String, String> {
+            self.calls.lock().unwrap().push(format!("rewind:{uuid}:{files}"));
+            if self.fail_rewind { Err("rewind failed; use Terminal".into()) } else { Ok(format!("text of {uuid}")) }
+        }
+        async fn rewind_undo(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("undo".into());
+            Ok(())
+        }
     }
 
     type Calls = Arc<Mutex<Vec<String>>>;
@@ -921,10 +1009,11 @@ mod tests {
         notes: Option<Sink>,
         ready: bool,
         has: u64,
+        fail_rewind: bool,
     ) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         let calls = Calls::default();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let engine = FakeEngine { calls: calls.clone(), sent, slow, has };
+        let engine = FakeEngine { calls: calls.clone(), sent, slow, has, fail_rewind };
         let log = Arc::new(crate::host::log::LogBuffer::new());
         let hub = Hub::spawn_with("claude", engine, rx, log, name.into(), notes);
         if ready {
@@ -933,14 +1022,17 @@ mod tests {
         (hub, tx, calls)
     }
     fn rig_with(slow: Option<Duration>) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build("cdash-a", slow, Sent::Unconfirmed, None, true, u64::MAX)
+        build("cdash-a", slow, Sent::Unconfirmed, None, true, u64::MAX, false)
     }
     /// A rig whose engine confirms what it accepts, as Codex and OpenCode do.
     fn rig_accepting() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build("cdash-a", None, Sent::Confirmed, None, true, u64::MAX)
+        build("cdash-a", None, Sent::Confirmed, None, true, u64::MAX, false)
+    }
+    fn rig_failing_rewind() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+        build("cdash-a", None, Sent::Unconfirmed, None, true, u64::MAX, true)
     }
     fn rig_sending(sent: Sent) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build("cdash-a", None, sent, None, true, u64::MAX)
+        build("cdash-a", None, sent, None, true, u64::MAX, false)
     }
     fn rig_noting(ready: bool) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Arc<Ctx>, broadcast::Receiver<Note>) {
         let ctx = crate::chat::claude::tests::ctx_with_path(
@@ -949,7 +1041,7 @@ mod tests {
         );
         let notes = ctx.notes.subscribe();
         let sink = Sink { ctx: Arc::clone(&ctx), project: "proj".into() };
-        let (hub, tx, _) = build("cdash-a", None, Sent::Unconfirmed, Some(sink), ready, u64::MAX);
+        let (hub, tx, _) = build("cdash-a", None, Sent::Unconfirmed, Some(sink), ready, u64::MAX, false);
         (hub, tx, ctx, notes)
     }
     fn note_kinds(rx: &mut broadcast::Receiver<Note>) -> Vec<&'static str> {
@@ -963,13 +1055,13 @@ mod tests {
     }
     /// The fake re-reads history as `{"type":"user","n":k}`, up to number `has`.
     fn rig_history_to(has: u64) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build("cdash-a", None, Sent::Unconfirmed, None, true, has)
+        build("cdash-a", None, Sent::Unconfirmed, None, true, has, false)
     }
     fn rig_history() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_history_to(u64::MAX)
     }
     fn rig_named(name: &str) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(name, None, Sent::Unconfirmed, None, true, u64::MAX)
+        build(name, None, Sent::Unconfirmed, None, true, u64::MAX, false)
     }
     fn rig() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_named("cdash-a")
@@ -1586,6 +1678,70 @@ mod tests {
         tx.send(EngineMsg::Reset).await.unwrap();
         settle().await;
         assert_eq!(todo_now().await, Value::Null);
+    }
+
+    fn rewind(uuid: &str) -> ClientFrame { ClientFrame::Rewind { uuid: uuid.into(), files: true } }
+    #[tokio::test]
+    async fn rewind_runs_only_while_idle_cuts_at_the_prompt_and_reloads_clients_once() {
+        let (hub, tx, calls) = rig();
+        log6(&tx).await;
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
+        settle().await;
+        let busy = reply(hub.command(rewind("u2")).await);
+        assert_eq!((busy["ok"].as_bool(), busy["error"].as_str()), (Some(false), Some("Stop the turn or wait for it to finish")));
+        tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
+        settle().await;
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        assert_eq!(reply(hub.command(rewind("u2")).await), json!({"t":"rewound","uuid":"u2","ok":true,"text":"text of u2","attachments":0}));
+        assert_eq!(*calls.lock().unwrap(), ["rewind:u2:true"], "nothing reached the engine while busy");
+        let f = frames(&mut sub);
+        assert_eq!((f[0]["t"].as_str(), f[0]["head"].as_u64()), (Some("hello"), Some(3)), "cut before the prompt");
+        tx.send(EngineMsg::Ev(cut(Some("s1")))).await.unwrap();             // the next prompt makes the tap cut at the same place
+        tx.send(EngineMsg::Ev(prompt("u3", "two, edited"))).await.unwrap();
+        settle().await;
+        let g = frames(&mut sub);
+        assert!(!g.iter().any(|x| x["t"] == "hello"), "a chat rewind followed by its prompt reloads clients once");
+        assert_eq!(g.iter().find(|x| x["t"] == "ev").unwrap()["seq"], 4);
+    }
+    #[tokio::test]
+    async fn a_failed_unknown_or_steered_rewind_leaves_the_conversation_alone() {
+        let (hub, tx, calls) = rig_failing_rewind();
+        log6(&tx).await;
+        let failed = reply(hub.command(rewind("u2")).await);
+        assert_eq!((failed["ok"].as_bool(), failed["error"].as_str()), (Some(false), Some("rewind failed; use Terminal")));
+        assert_eq!(reply(hub.command(rewind("zz")).await)["error"], "not in this conversation");
+        let mut steered = prompt("s9", "steered");
+        steered["src"] = json!("steer");
+        tx.send(EngineMsg::Ev(steered)).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(rewind("s9")).await)["error"], "this prompt cannot be rewound");
+        assert_eq!(*calls.lock().unwrap(), ["rewind:u2:true"]);
+        assert_eq!(serde_json::from_str::<Value>(&hub.subscribe(None, None).await.unwrap().backlog[0]).unwrap()["head"], 7);
+        let (hub, tx, _) = rig();
+        let mut p = prompt("u1", "a");
+        p["files"] = json!([{"kind":"file","name":"a.pdf"},{"kind":"image","ref":"ab","mime":"image/png"}]);
+        tx.send(EngineMsg::Ev(p)).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(rewind("u1")).await)["attachments"], 2);
+    }
+    #[tokio::test]
+    async fn a_rewind_also_cuts_the_queued_row_that_announced_its_prompt() {
+        let (hub, tx, _) = rig();
+        for e in [prompt("u1", "a"), answer("k1"), json!({"type":"cdash","subtype":"queued","text":"b"}), prompt("u2", "b")] { tx.send(EngineMsg::Ev(e)).await.unwrap(); }
+        settle().await;
+        assert_eq!(reply(hub.command(rewind("u2")).await)["ok"], true);
+        assert_eq!(serde_json::from_str::<Value>(&hub.subscribe(None, None).await.unwrap().backlog[0]).unwrap()["head"], 2);
+    }
+    #[tokio::test]
+    async fn undo_reaches_the_engine_only_while_idle() {
+        let (hub, tx, calls) = rig();
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(ClientFrame::RewindUndo).await)["ok"], false);
+        tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(ClientFrame::RewindUndo).await), json!({"t":"rewound","uuid":null,"ok":true}));
+        assert_eq!(*calls.lock().unwrap(), ["undo"]);
     }
 
     #[tokio::test]

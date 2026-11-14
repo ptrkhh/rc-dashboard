@@ -19,6 +19,14 @@ pub enum ClientFrame {
     Answer { id: String, choice: Option<String>, text: Option<String>, answers: Option<Value> },
     Set { what: String, value: Value },
     Menu,
+    /// Rewind to the prompt `uuid`; `files` also restores the code.
+    Rewind { uuid: String, #[serde(default)] files: bool },
+    #[serde(rename = "rewind_undo")]
+    RewindUndo,
+    /// A side question; `ws.rs` routes it and its cancel, the hub ignores both.
+    Aside { id: String, text: String },
+    #[serde(rename = "aside_cancel")]
+    AsideCancel { id: String },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -83,5 +91,15 @@ mod tests {
         assert!(matches!(f(r#"{"t":"menu"}"#), Ok(ClientFrame::Menu)));
         assert!(f(r#"{"t":"set","what":"plan"}"#).is_err(), "value is required");
         assert!(f(r#"{"t":"keys","data":"x"}"#).is_err());
+    }
+    #[test]
+    fn part_five_frames_parse() {
+        let f = |s| serde_json::from_str::<ClientFrame>(s);
+        assert!(matches!(f(r#"{"t":"rewind","uuid":"u"}"#), Ok(ClientFrame::Rewind { uuid, files: false }) if uuid == "u"));
+        assert!(matches!(f(r#"{"t":"rewind","uuid":"u","files":true}"#), Ok(ClientFrame::Rewind { files: true, .. })));
+        assert!(matches!(f(r#"{"t":"rewind_undo"}"#), Ok(ClientFrame::RewindUndo)));
+        assert!(matches!(f(r#"{"t":"aside","id":"a1","text":"why?"}"#), Ok(ClientFrame::Aside { id, text }) if id == "a1" && text == "why?"));
+        assert!(matches!(f(r#"{"t":"aside_cancel","id":"a1"}"#), Ok(ClientFrame::AsideCancel { id }) if id == "a1"));
+        assert!(f(r#"{"t":"rewindundo"}"#).is_err());
     }
 }
