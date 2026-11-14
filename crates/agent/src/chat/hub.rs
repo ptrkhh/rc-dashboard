@@ -7,6 +7,7 @@ use super::media::{self, MAX_FILES};
 use super::native::ACK_WAIT;
 use super::notify::{NoteKind, Sink};
 use super::queue::Queue;
+use super::tap::is_cut;
 use super::wire::sanitize;
 use super::Frame;
 use crate::host::log::LogBuffer;
@@ -47,6 +48,10 @@ pub enum EngineMsg {
     Asks(Vec<Value>),
     /// The session's model, effort, plan switch and so on, replacing the last.
     Settings(Value),
+    /// The session's folder, model, context and token use, replacing the last.
+    Usage(Value),
+    /// The background shells and subagents running now, replacing the last list.
+    Tasks(Vec<Value>),
     /// History has been replayed; subscribers may be answered.
     Ready,
     /// The conversation in the pane changed; positions restart at 1.
@@ -137,6 +142,7 @@ enum Cmd {
     Subscribe { after: Option<u64>, epoch: Option<String>, reply: oneshot::Sender<Subscription> },
     Client { frame: ClientFrame, reply: oneshot::Sender<Option<Frame>> },
     Upload { id: String, a: Attachment },
+    Folder { reply: oneshot::Sender<Option<String>> },
 }
 
 #[derive(Clone)]
@@ -186,6 +192,9 @@ impl Hub {
             waiting_for: None,
             asks: Vec::new(),
             settings: json!({}),
+            usage: Value::Null,
+            tasks: Vec::new(),
+            todo: None,
             hooks,
             ended: false,
             unreadable: false,
@@ -225,6 +234,13 @@ impl Hub {
         let _ = self.cmds.send(Cmd::Upload { id, a }).await;
     }
 
+    /// The session's current folder: the latest usage snapshot's `cwd`.
+    pub async fn folder(&self) -> Option<String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmds.send(Cmd::Folder { reply }).await.ok()?;
+        rx.await.ok().flatten()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.cmds.is_closed()
     }
@@ -262,6 +278,31 @@ fn prompt_text(ev: &Value) -> Option<String> {
     }
 }
 
+fn is_todo(ev: &Value) -> bool {
+    ev["type"] == "cdash" && ev["subtype"] == "todo"
+}
+
+/// Where the cut event `cut` leaves `log`, the part of a log still in memory:
+/// the length to keep, or `None` when it removes nothing or its anchor is not
+/// there (then nothing is removed, so chat never hides what the tool continues
+/// from). The hub and Claude's `history` replay both place cuts here, so their
+/// positions agree.
+pub(crate) fn place_cut<'a, I>(log: I, cut: &Value) -> Option<usize>
+where
+    I: IntoIterator<Item = &'a Value>,
+    I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
+{
+    let mut log = log.into_iter();
+    let len = log.len();
+    let keep = match &cut["after"] {
+        Value::Null => 0,
+        // A retract's uuid names the prompt it withdraws, not itself.
+        Value::String(u) => 1 + log.rposition(|e| e["uuid"] == u.as_str() && !(e["type"] == "cdash" && e["subtype"] == "retract"))?,
+        _ => return None,
+    };
+    (keep < len).then_some(keep)
+}
+
 /// A message handed to the engine and not yet answered.
 struct Pending {
     cid: String,
@@ -296,6 +337,11 @@ struct Actor<E> {
     waiting_for: Option<String>,
     asks: Vec<Value>,
     settings: Value,
+    usage: Value,
+    tasks: Vec<Value>,
+    /// The latest `todo` event's position and items: the pinned checklist,
+    /// kept here so it outlives the backlog.
+    todo: Option<(usize, Value)>,
     hooks: bool,
     ended: bool,
     unreadable: bool,
@@ -352,6 +398,9 @@ impl<E: Engine> Actor<E> {
                     Some(Cmd::Upload { id, a }) => {
                         self.uploads.insert(id, a);
                     }
+                    Some(Cmd::Folder { reply }) => {
+                        let _ = reply.send(self.usage["cwd"].as_str().map(String::from));
+                    }
                     // Every handle was dropped; nobody can reach this hub.
                     None => return,
                 },
@@ -380,7 +429,7 @@ impl<E: Engine> Actor<E> {
                 json!({"id":h.id,"text":h.text,"files":files})
             })
             .collect();
-        json!({"t":"state","working":self.working,"waiting":self.waiting,"waiting_for":self.waiting_for,"asks":self.asks,"settings":self.settings,"hooks":self.hooks,"ended":self.ended,"unreadable":self.unreadable,"held":held})
+        json!({"t":"state","working":self.working,"waiting":self.waiting,"waiting_for":self.waiting_for,"asks":self.asks,"settings":self.settings,"usage":self.usage,"tasks":self.tasks,"todo":self.todo.as_ref().map(|(_, v)| v),"hooks":self.hooks,"ended":self.ended,"unreadable":self.unreadable,"held":held})
     }
 
     fn publish_state(&mut self) {
@@ -402,7 +451,11 @@ impl<E: Engine> Actor<E> {
     /// Built inside the actor, so nothing is missed or repeated between the
     /// backlog and the live stream.
     fn subscription(&self, after: Option<u64>, epoch: Option<String>) -> Subscription {
-        let live = self.out.subscribe();
+        Subscription { live: self.out.subscribe(), backlog: self.backlog(after, epoch) }
+    }
+
+    /// `hello`, the events a client lacks, then `state`.
+    fn backlog(&self, after: Option<u64>, epoch: Option<String>) -> Vec<Frame> {
         let head = self.head();
         // A position older than the window starts over, as a new conversation would.
         let reset = epoch.as_deref() != Some(self.epoch.as_str()) || after.is_some_and(|a| (a as usize) < self.base);
@@ -415,7 +468,26 @@ impl<E: Engine> Actor<E> {
         }))];
         backlog.extend((first..=head).map(|seq| frame(self.ev_frame(seq))));
         backlog.push(frame(self.state()));
-        Subscription { backlog, live }
+        backlog
+    }
+
+    /// Keeps the first `len` events in memory and reloads every client as a
+    /// new one would load. Pending messages and the queue stay.
+    fn cut_to(&mut self, len: usize) {
+        if len >= self.log_events.len() {
+            return;
+        }
+        self.log_events.truncate(len);
+        let head = self.head();
+        self.extra.retain(|(p, _)| *p <= head);
+        if self.todo.as_ref().is_some_and(|(p, _)| *p > head) {
+            // ponytail: a checklist older than the window is not found again; keep a list per position if that shows.
+            self.todo = self.log_events.iter().rposition(is_todo).map(|i| (self.base + i + 1, self.log_events[i]["items"].clone()));
+        }
+        self.epoch = new_epoch();
+        for f in self.backlog(None, None) {
+            let _ = self.out.send(f);
+        }
     }
 
     fn append(&mut self, ev: Value) {
@@ -448,6 +520,8 @@ impl<E: Engine> Actor<E> {
             }
             EngineMsg::Asks(a) => self.asks = a,
             EngineMsg::Settings(v) => self.settings = v,
+            EngineMsg::Usage(v) => self.usage = v,
+            EngineMsg::Tasks(t) => self.tasks = t,
             EngineMsg::Ready => {
                 self.ready = true;
                 self.live = true;
@@ -461,6 +535,7 @@ impl<E: Engine> Actor<E> {
                 self.log_events.clear();
                 self.base = 0;
                 self.extra.clear();
+                (self.usage, self.tasks, self.todo) = (Value::Null, Vec::new(), None);
                 self.broadcast(json!({"t":"reset","epoch":self.epoch}));
                 // As CONFIRM_AFTER would have: what no event showed (and the tool never accepted).
                 for p in std::mem::take(&mut self.pending) {
@@ -475,6 +550,15 @@ impl<E: Engine> Actor<E> {
     }
 
     fn event(&mut self, mut ev: Value) {
+        if is_cut(&ev) {
+            if let Some(len) = place_cut(&self.log_events, &ev) {
+                self.cut_to(len);
+            }
+            return;
+        }
+        if is_todo(&ev) {
+            self.todo = Some((self.head() + 1, ev["items"].clone()));
+        }
         if let Some(text) = prompt_text(&ev) {
             if let Some(p) = self.pending.iter_mut().find(|p| p.uuid.is_none() && p.text == text) {
                 ev["cid"] = json!(p.cid);
@@ -897,6 +981,19 @@ mod tests {
     }
     fn answer(uuid: &str) -> Value {
         json!({"type":"assistant","uuid":uuid,"message":{"id":"m","role":"assistant","content":[{"type":"text","text":"ok"}]}})
+    }
+    fn result(uuid: &str) -> Value {
+        json!({"type":"result","subtype":"success","uuid":uuid})
+    }
+    fn cut(after: Option<&str>) -> Value {
+        json!({"type":"cdash","subtype":"cut","after":after})
+    }
+    async fn log6(tx: &mpsc::Sender<EngineMsg>) {
+        for e in [prompt("u1", "a"), answer("k1"), result("s1"), prompt("u2", "b"), answer("k2"), result("s2")] { tx.send(EngineMsg::Ev(e)).await.unwrap(); }
+        settle().await;
+    }
+    fn last_state(s: &Subscription) -> Value {
+        serde_json::from_str(s.backlog.last().unwrap()).unwrap()
     }
     fn send_with(cid: &str, text: &str, ids: &[&str]) -> ClientFrame {
         ClientFrame::Send { cid: cid.into(), text: text.into(), files: ids.iter().map(|s| s.to_string()).collect() }
@@ -1371,6 +1468,86 @@ mod tests {
         settle().await;
         let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 101, limit: Some(50) }).await.unwrap()).unwrap();
         assert_eq!(page["more"], false, "asking again would loop on the same short page");
+    }
+
+    #[tokio::test]
+    async fn a_cut_truncates_after_its_anchor_and_reloads_every_client() {
+        let (hub, tx, _) = rig();
+        log6(&tx).await;
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        let old: Value = serde_json::from_str(&sub.backlog[0]).unwrap();
+        tx.send(EngineMsg::Ev(cut(Some("s1")))).await.unwrap();
+        tx.send(EngineMsg::Ev(prompt("u3", "c"))).await.unwrap();
+        settle().await;
+        let f = frames(&mut sub);
+        assert_eq!((f[0]["t"].as_str(), f[0]["reset"].as_bool(), f[0]["head"].as_u64()), (Some("hello"), Some(true), Some(3)));
+        assert_ne!(f[0]["epoch"], old["epoch"]);
+        assert_eq!(f[1..4].iter().map(|x| x["ev"]["uuid"].as_str().unwrap()).collect::<Vec<_>>(), ["u1", "k1", "s1"]);
+        assert_eq!(f[4]["t"], "state");
+        assert_eq!((f[5]["seq"].as_u64(), f[5]["ev"]["uuid"].as_str()), (Some(4), Some("u3")), "the cut itself is not stored");
+    }
+    #[tokio::test]
+    async fn a_cut_that_removes_nothing_or_cannot_be_placed_changes_nothing() {
+        let (hub, tx, _) = rig();
+        log6(&tx).await;
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        for after in [Some("s2"), Some("not-in-this-log")] { tx.send(EngineMsg::Ev(cut(after))).await.unwrap(); }
+        settle().await;
+        assert!(frames(&mut sub).is_empty(), "no new epoch, no reload, nothing hidden");
+    }
+    #[tokio::test]
+    async fn a_cut_keeps_pending_and_held_messages() {
+        let (hub, tx, _) = rig();
+        log6(&tx).await;
+        hub.command(send("c1", "next")).await;
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
+        settle().await;
+        hub.command(send("c2", "later")).await;
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        tx.send(EngineMsg::Ev(cut(Some("s1")))).await.unwrap();
+        tx.send(EngineMsg::Ev(prompt("u3", "next"))).await.unwrap();
+        settle().await;
+        let f = frames(&mut sub);
+        assert_eq!(f.iter().find(|x| x["ev"]["uuid"] == "u3").unwrap()["ev"]["cid"], "c1", "the prompt after a cut still confirms it");
+        assert_eq!(f.iter().rev().find(|x| x["t"] == "state").unwrap()["held"][0]["text"], "later");
+    }
+    #[tokio::test]
+    async fn usage_and_tasks_are_state_not_history_and_a_reset_clears_them() {
+        let (hub, tx, _) = rig();
+        let st = last_state(&hub.subscribe(None, None).await.unwrap());
+        assert_eq!((st["usage"].clone(), st["tasks"].clone()), (Value::Null, json!([])), "keys always present");
+        tx.send(EngineMsg::Usage(json!({"cwd":"/w","context":{"used":5,"window":null}}))).await.unwrap();
+        tx.send(EngineMsg::Tasks(vec![json!({"id":"b1","kind":"shell","title":"sleep 60","started":"2026-11-13T10:00:00Z"})])).await.unwrap();
+        settle().await;
+        let s = hub.subscribe(None, None).await.unwrap();
+        assert_eq!((last_state(&s)["usage"]["cwd"].as_str(), last_state(&s)["tasks"][0]["id"].as_str()), (Some("/w"), Some("b1")));
+        assert_eq!(serde_json::from_str::<Value>(&s.backlog[0]).unwrap()["head"], 0, "snapshots are not events");
+        assert_eq!(hub.folder().await.as_deref(), Some("/w"));
+        tx.send(EngineMsg::Reset).await.unwrap();
+        settle().await;
+        let st = last_state(&hub.subscribe(None, None).await.unwrap());
+        assert_eq!((st["usage"].clone(), st["tasks"].clone(), hub.folder().await), (Value::Null, json!([]), None));
+    }
+    #[tokio::test]
+    async fn the_checklist_is_the_latest_kept_todo_and_a_reset_clears_it() {
+        let (hub, tx, _) = rig();
+        let todo = |uuid: &str, text: &str| json!({"type":"cdash","subtype":"todo","uuid":uuid,"items":[{"text":text,"status":"pending"}]});
+        let todo_now = || async { last_state(&hub.subscribe(None, None).await.unwrap())["todo"].clone() };
+        assert_eq!(todo_now().await, Value::Null);
+        log6(&tx).await;
+        for e in [todo("t1", "first"), result("s3"), todo("t2", "second")] { tx.send(EngineMsg::Ev(e)).await.unwrap(); }
+        settle().await;
+        assert_eq!(todo_now().await[0]["text"], "second");
+        tx.send(EngineMsg::Ev(cut(Some("s3")))).await.unwrap();
+        settle().await;
+        assert_eq!(todo_now().await[0]["text"], "first", "the cut list goes, the one before it is back");
+        tx.send(EngineMsg::Ev(cut(Some("s1")))).await.unwrap();
+        settle().await;
+        assert_eq!(todo_now().await, Value::Null);
+        tx.send(EngineMsg::Ev(todo("t3", "third"))).await.unwrap();
+        tx.send(EngineMsg::Reset).await.unwrap();
+        settle().await;
+        assert_eq!(todo_now().await, Value::Null);
     }
 
     #[tokio::test]

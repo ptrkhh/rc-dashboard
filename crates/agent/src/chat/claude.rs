@@ -2,10 +2,10 @@
 //! file, and types through tmux.
 
 use super::asks::Cards;
-use super::hub::{Answer, Attachment, Engine, EngineMsg, Kind, Sent};
+use super::hub::{place_cut, Answer, Attachment, Engine, EngineMsg, Kind, Sent, WINDOW};
 use super::media;
 use super::picker;
-use super::tap::Tap;
+use super::tap::{is_cut, Tap};
 use super::tmux_io;
 use crate::collect::ctx::Ctx;
 use crate::collect::lookup::session_file_for;
@@ -234,28 +234,37 @@ impl Engine for ClaudeEngine {
         }
     }
 
-    /// Replays the transcript from its start through a fresh tap, so cuts the
-    /// tap makes apply again; reading from an offset would bring back
-    /// abandoned branches.
+    /// Replays the whole transcript through a fresh tap and places its cuts
+    /// as the hub does, so positions match the hub's and an abandoned branch
+    /// never comes back; a later cut can still remove events before `to`.
     async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
         let path = self.transcript.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("no conversation yet")?;
-        let (mut tail, mut tap, mut n, mut out) = (Tail::new(path), Tap::default(), 0u64, Vec::new());
+        let (mut tail, mut tap) = (Tail::new(path), Tap::default());
+        // Events `base + 1..` mirror the hub's memory: a cut whose anchor left it removes nothing.
+        // ponytail: the hub's window also counts its own retracts, so with retracts its edge sits a few events later than this one.
+        let (mut all, mut base, span) = (Vec::new(), 0, from as usize..=to as usize);
         loop {
             for line in tail.poll().await.map_err(|e| e.to_string())? {
                 for ev in tap.feed(&line) {
-                    n += 1;
-                    if n >= from {
-                        out.push(stash_images(ev, &self.name, &self.ctx.host.log));
+                    if is_cut(&ev) {
+                        if let Some(len) = place_cut(&all[base..], &ev) {
+                            all.truncate(base + len);
+                        }
+                        continue;
                     }
-                    if n >= to {
-                        return Ok(out);
+                    // Outside the page only the uuid matters, to place cuts.
+                    all.push(if span.contains(&(all.len() + 1)) { ev } else { json!({"uuid":ev["uuid"]}) });
+                    if all.len() - base > WINDOW {
+                        base += 1;
                     }
                 }
             }
             if tail.at_end() {
-                return Ok(out);
+                break;
             }
         }
+        let page = all.into_iter().skip(span.start().saturating_sub(1)).take(span.count());
+        Ok(page.map(|ev| stash_images(ev, &self.name, &self.ctx.host.log)).collect())
     }
 
     async fn answer(&self, id: &str, a: &Answer) -> Result<(), String> {
@@ -509,6 +518,7 @@ pub(crate) mod tests {
     use crate::chat::asks::tests::{ask_request, plan_request, result_line, use_line};
     use crate::chat::hub::Answer;
     use crate::chat::hub::Kind;
+    use crate::chat::hub::{ClientFrame, Hub, WINDOW};
     use crate::chat::tmux_io::tests::{chip_stub, stub_tmux, tempfile_path};
     use crate::host::cmd::Runner;
     use crate::host::log::LogBuffer;
@@ -953,5 +963,51 @@ pub(crate) mod tests {
             .filter_map(|m| if let EngineMsg::Ev(v) = m { Some(v) } else { None }).collect();
         assert_eq!(engine.history(1, 3).await.unwrap(), replayed[..3]);
         assert_eq!(engine.history(2, 2).await.unwrap(), replayed[1..2]);
+    }
+
+    /// A hub over a Claude engine whose transcript holds `lines`, and the transcript.
+    async fn hub_over(tag: &str, lines: &str) -> (Hub, PathBuf) {
+        let (ctx, dir) = fixture_ctx(tag);
+        write_transcript(&dir, "sid-1", lines);
+        let (engine, rx) = start(ctx, "cdash-a".into(), 4242);
+        (Hub::spawn("claude", engine, rx, Arc::new(LogBuffer::new()), "cdash-a".into()), dir.join("projects/-proj/sid-1.jsonl"))
+    }
+    async fn hub_head(hub: &Hub) -> Value {
+        serde_json::from_str::<Value>(&hub.subscribe(None, None).await.unwrap().backlog[0]).unwrap()["head"].clone()
+    }
+    async fn page(hub: &Hub, before: u64, limit: usize) -> Value {
+        serde_json::from_str(&hub.command(ClientFrame::Page { before, limit: Some(limit) }).await.unwrap()).unwrap()
+    }
+    /// `n` replies, each the child of the one before, the first of `parent`.
+    fn replies(parent: &str, n: usize) -> String {
+        (0..n).map(|i| {
+            let p = if i == 0 { parent.to_string() } else { format!("f{}", i - 1) };
+            format!("{}\n", json!({"type":"assistant","uuid":format!("f{i}"),"parentUuid":p,"message":{"id":format!("m{i}"),"role":"assistant","content":[{"type":"text","text":"x"}]}}))
+        }).collect()
+    }
+    #[tokio::test]
+    async fn an_older_page_numbers_events_as_the_hub_did_and_skips_an_abandoned_branch() {
+        let (hub, t) = hub_over("history-cut", include_str!("testdata/rewind.jsonl")).await;
+        let shown: Vec<Value> = hub.subscribe(None, None).await.unwrap().backlog.iter()
+            .map(|f| serde_json::from_str::<Value>(f).unwrap()).filter(|f| f["t"] == "ev")
+            .map(|f| json!({"seq":f["seq"],"ev":f["ev"]})).collect();
+        let abandoned = ["dd5d85d6", "8a67cba9", "ea31531f", "44ede06f"];
+        assert!(shown.len() == 6 && !shown.iter().any(|e| abandoned.iter().any(|a| e["ev"]["uuid"].as_str().unwrap_or("").starts_with(a))), "{shown:?}");
+        append(&t, &replies("db5a7c16-64a2-4664-8f9a-652a769dbbce", WINDOW)); // the six leave the hub's memory
+        for _ in 0..300 {
+            if hub_head(&hub).await == 6 + WINDOW { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(page(&hub, 7, 6).await["events"], json!(shown), "re-read from the transcript, numbered as the hub did");
+    }
+    #[tokio::test]
+    async fn a_cut_whose_anchor_left_the_hubs_window_removes_nothing_in_an_older_page_either() {
+        let turn: String = include_str!("testdata/rewind.jsonl").lines().take(5).map(|l| format!("{l}\n")).collect(); // prompt, reply, turn end
+        let end = "37929adb-63f0-4e64-b002-3f3c2f2a84b4";
+        let back = json!({"type":"user","uuid":"b1","parentUuid":end,"promptSource":"typed","message":{"role":"user","content":"back"}});
+        let (hub, _) = hub_over("history-far", &format!("{turn}{}{back}\n", replies(end, WINDOW))).await;
+        assert_eq!(hub_head(&hub).await, 3 + WINDOW + 1, "the turn end had left memory: nothing was cut");
+        let p = page(&hub, 5, 4).await;
+        assert_eq!((p["events"][3]["seq"].as_u64(), p["events"][3]["ev"]["uuid"].as_str()), (Some(4), Some("f0")), "the source keeps what the hub kept");
     }
 }

@@ -208,7 +208,7 @@ fn unwrap_pastes(text: &str) -> String {
     if changed { out.trim().to_string() } else { out }
 }
 
-fn is_cut(ev: &Value) -> bool {
+pub(crate) fn is_cut(ev: &Value) -> bool {
     ev["type"] == "cdash" && ev["subtype"] == "cut"
 }
 
