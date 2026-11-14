@@ -406,7 +406,8 @@ pub async fn get_chat(
     };
     let after = q.get("after").and_then(|a| a.parse::<u64>().ok());
     let epoch = q.get("epoch").cloned();
-    Ok(ws.on_upgrade(move |socket| crate::chat::ws::serve(ctx, hub, name, after, epoch, socket)))
+    // Text is at most 32 KiB and upload slices 1 MiB; 2 MiB leaves room for JSON escapes.
+    Ok(ws.max_message_size(2 << 20).on_upgrade(move |socket| crate::chat::ws::serve(ctx, hub, name, after, epoch, socket)))
 }
 
 pub async fn post_purge(

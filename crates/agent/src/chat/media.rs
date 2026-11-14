@@ -399,6 +399,7 @@ pub(crate) mod tests {
         assert!(!dir.exists(), "nothing was created");
         drop(Upload::begin("cdash-up-limit", "ok.bin", MAX_UPLOAD).await.unwrap());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "an unfinished upload leaves no folder");
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[tokio::test]
     async fn bytes_past_the_declared_size_abort_the_upload_and_delete_it() {
@@ -406,7 +407,9 @@ pub(crate) mod tests {
         assert_eq!(u.write(b"ab").await, Ok(false));
         assert_eq!(u.write(b"cdef").await, Err("more bytes than declared".to_string()));
         drop(u);
-        assert_eq!(std::fs::read_dir(uploads_dir("cdash-up-over").unwrap()).unwrap().count(), 0);
+        let dir = uploads_dir("cdash-up-over").unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[tokio::test]
     async fn a_finished_upload_is_named_typed_by_its_bytes_and_private() {

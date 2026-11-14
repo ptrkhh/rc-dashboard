@@ -294,6 +294,23 @@ mod tests {
         eventually("the abandoned upload is gone", || std::fs::read_dir(&dir).map_or(true, |d| d.count() == 0)).await;
         let log = b.ctx.host.log.lines().join("\n");
         assert!(log.contains("chat upload refused cdash-upload-gone: one upload at a time") && !log.contains("big.bin"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[tokio::test]
+    async fn a_frame_over_2_mib_closes_the_socket_and_drops_its_upload() {
+        let (b, _dir) = chat_server("upload-huge").await;
+        let mut ws = connect(b.addr, "name=cdash-upload-huge", None).await.unwrap();
+        next_of(&mut ws, "state").await;
+        ws.send(WsMsg::Text(format!(r#"{{"t":"upload","ref":"r1","name":"a.bin","size":{}}}"#, media::MAX_UPLOAD).into())).await.unwrap();
+        let dir = media::uploads_dir("cdash-upload-huge").unwrap();
+        eventually("the upload is open", || std::fs::read_dir(&dir).is_ok_and(|d| d.count() == 1)).await;
+        let _ = ws.send(WsMsg::Binary(vec![0; (2 << 20) + 1].into())).await;
+        let ended = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        ended.await.expect("the socket closes");
+        eventually("the open upload is gone", || std::fs::read_dir(&dir).map_or(true, |d| d.count() == 0)).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
     #[tokio::test]
     async fn garbage_frames_are_ignored_and_a_bare_terminal_pane_has_no_chat() {
