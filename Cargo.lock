@@ -521,6 +521,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "reqwest",
+ "ring",
  "rustix",
  "scrypt",
  "serde",

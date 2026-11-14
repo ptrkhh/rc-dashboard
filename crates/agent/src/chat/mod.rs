@@ -3,9 +3,11 @@
 //! `docs/superpowers/specs/2026-11-12-chat-core-design.md`.
 
 pub mod claude;
+pub mod ece;
 pub mod hub;
 pub mod native;
 pub mod notify;
+pub mod push;
 pub mod queue;
 pub mod tap;
 pub mod tmux_io;
