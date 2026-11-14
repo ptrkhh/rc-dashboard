@@ -39,6 +39,7 @@ crate::guarded_routes! {
     get "/api/term" => routes::get_term,
     get "/api/chat" => routes::get_chat,
     get "/api/models" => routes::get_models,
+    get "/api/notify" => routes::get_notify,
     get "/api/push/key" => routes::get_push_key,
     post "/api/push/subscribe" => routes::post_push_subscribe,
     post "/api/push/unsubscribe" => routes::post_push_unsubscribe,
@@ -321,10 +322,10 @@ pub async fn serve(cfg: Config) -> std::io::Result<Bound> {
     if let Some(cf) = cf.clone() {
         crate::auth::cfaccess::spawn_refresh(cf, Arc::clone(&ctx.host.log));
     }
-    let app =
-        router(Arc::clone(&ctx), Arc::clone(&cfg.auth), cfg.password.clone(), cf);
-
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    // The notify streams end on this signal; see `routes::get_notify`.
+    let app = router(Arc::clone(&ctx), Arc::clone(&cfg.auth), cfg.password.clone(), cf)
+        .layer(axum::Extension(stop_rx.clone()));
     crate::chat::notify::spawn(Arc::clone(&ctx), stop_rx.clone());
     let task = tokio::spawn(async move {
         // `ConnectInfo` needs the peer address, which the trusted-proxy guard
@@ -389,6 +390,27 @@ pub(crate) mod tests {
             ),
             password: None,
         }
+    }
+
+    /// Serve `app` on an ephemeral loopback port, with connect info as `serve` does.
+    pub(crate) async fn serve_router(app: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn stop_returns_while_a_notify_stream_is_open() {
+        let b = serve(cfg_for(tempdir("stop-notify"))).await.unwrap();
+        let res = reqwest::get(format!("http://{}/api/notify", b.addr)).await.unwrap();
+        assert_eq!(res.status(), 200);
+        tokio::time::timeout(std::time::Duration::from_secs(2), b.stop())
+            .await
+            .expect("stop returns within 2 s of an open /api/notify stream");
+        drop(res);
     }
 
     #[tokio::test]

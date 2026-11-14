@@ -183,7 +183,8 @@ async fn under_none_no_route_is_rejected() {
         // No test drives /api/launch, /api/resume or /api/kill to success: that
         // spawns or kills real tmux sessions as a side effect of `cargo test`.
         let body = if m == "POST" { Some("{}") } else { None };
-        let (status, _) = req(&a, &m, path, &[], body).await;
+        // Status only: the body of /api/notify never ends.
+        let status = send(&a, &m, path, &[], body.map(|b| ("application/json", b))).await.status().as_u16();
         assert!(status != 401 && status != 403, "{m} {path} returned {status} under CDASH_AUTH=none");
     }
 }

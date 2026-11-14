@@ -236,4 +236,27 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(inbox.take().is_empty(), "a focused chat: nothing is pushed");
     }
+
+    #[tokio::test]
+    async fn the_stream_carries_each_note_as_one_data_line() {
+        use crate::http::serve::tests::{cfg_for, serve_router};
+        let (ctx, dir) = fixture_with("sse", "");
+        let addr = serve_router(crate::http::serve::router(Arc::clone(&ctx), Arc::clone(&cfg_for(dir).auth), None, None)).await;
+        let mut res = reqwest::get(format!("http://{addr}/api/notify")).await.unwrap();
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        eventually("the stream subscribed", || ctx.notes.receiver_count() >= 1).await;
+        for (s, k) in [("cdash-a", NoteKind::Done), ("cdash-b", NoteKind::Ask)] {
+            ctx.notes.send(Note { session: s.into(), project: "proj".into(), kind: k, at: 1 }).unwrap();
+        }
+        let mut text = String::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while text.matches("data: ").count() < 2 {
+                text.push_str(&String::from_utf8_lossy(&res.chunk().await.unwrap().unwrap()));
+            }
+        })
+        .await
+        .expect("two notes within 30 s");
+        let notes: Vec<Value> = text.lines().filter_map(|l| l.strip_prefix("data: ")).map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(notes, [json!({"s":"cdash-a","p":"proj","k":"done","t":1}), json!({"s":"cdash-b","p":"proj","k":"ask","t":1})]);
+    }
 }

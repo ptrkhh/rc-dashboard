@@ -114,22 +114,16 @@ mod tests {
 
     /// The real router over a ctx whose PATH holds only a stub tmux answering
     /// `answer`; `serve` would resolve the real PATH instead.
-    fn chat_server_with_pane(tag: &str, answer: &str) -> (Srv, std::path::PathBuf) {
+    async fn chat_server_with_pane(tag: &str, answer: &str) -> (Srv, std::path::PathBuf) {
         let (ctx, dir) = fixture_with(&format!("ws-{tag}"), answer);
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        std_listener.set_nonblocking(true).unwrap();
-        let addr = std_listener.local_addr().unwrap();
-        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
         let app = crate::http::serve::router(Arc::clone(&ctx), Arc::clone(&cfg_for(dir.clone()).auth), None, None);
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
-        });
+        let addr = crate::http::serve::tests::serve_router(app).await;
         (Srv { addr, ctx }, dir)
     }
 
-    fn chat_server(tag: &str) -> (Srv, std::path::PathBuf) {
-        chat_server_with_pane(tag, "4242|")
+    async fn chat_server(tag: &str) -> (Srv, std::path::PathBuf) {
+        chat_server_with_pane(tag, "4242|").await
     }
 
     fn append_transcript(dir: &Path, lines: &str) {
@@ -184,7 +178,7 @@ mod tests {
     }
     #[tokio::test]
     async fn a_client_reads_history_sends_a_prompt_and_resumes_without_repeats() {
-        let (b, dir) = chat_server("flow");                        // transcript = fixture lines 1..9, status idle
+        let (b, dir) = chat_server("flow").await;                        // transcript = fixture lines 1..9, status idle
         let mut ws = connect(b.addr, "name=cdash-a", None).await.unwrap();
         let hello = next_json(&mut ws).await;
         assert_eq!((hello["t"].as_str(), hello["tool"].as_str(), hello["head"].as_u64()), (Some("hello"), Some("claude"), Some(5)));
@@ -206,7 +200,7 @@ mod tests {
     }
     #[tokio::test]
     async fn focus_frames_feed_the_count_and_a_socket_that_drops_counts_as_off() {
-        let (b, _dir) = chat_server("focus");
+        let (b, _dir) = chat_server("focus").await;
         let mut ws = connect(b.addr, "name=cdash-a", None).await.unwrap();
         next_of(&mut ws, "state").await;
         ws.send(WsMsg::Text(r#"{"t":"focus","on":true}"#.into())).await.unwrap();
@@ -216,12 +210,12 @@ mod tests {
     }
     #[tokio::test]
     async fn garbage_frames_are_ignored_and_a_bare_terminal_pane_has_no_chat() {
-        let (b, _dir) = chat_server("garbage");
+        let (b, _dir) = chat_server("garbage").await;
         let mut ws = connect(b.addr, "name=cdash-a", None).await.unwrap();
         ws.send(WsMsg::Text("not json".into())).await.unwrap();
         ws.send(WsMsg::Text(r#"{"t":"stop"}"#.into())).await.unwrap();
         assert_eq!(next_of(&mut ws, "state").await["ended"], false, "still connected");
-        let (t, _d) = chat_server_with_pane("bare", "4242|terminal");
+        let (t, _d) = chat_server_with_pane("bare", "4242|terminal").await;
         assert_eq!(status_of(connect(t.addr, "name=cdash-a", None).await), 409);
     }
 }

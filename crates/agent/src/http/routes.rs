@@ -198,6 +198,38 @@ fn push_failed(e: std::io::Error) -> ApiError {
     ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("Could not read cdash-push.json: {e}") }
 }
 
+/// One `data:` line per note. Ends when the server stops, so `Bound::stop`
+/// never waits on an open stream. A lagged receiver skips ahead.
+pub async fn get_notify(
+    State(ctx): State<Arc<Ctx>>,
+    stop: Option<axum::Extension<tokio::sync::watch::Receiver<bool>>>,
+) -> axum::response::sse::Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
+    use axum::response::sse::{Event, KeepAlive};
+    use tokio::sync::broadcast::error::RecvError;
+    let stopped = async move {
+        match stop {
+            Some(axum::Extension(mut rx)) => {
+                let _ = rx.wait_for(|s| *s).await;
+            }
+            None => std::future::pending().await,
+        }
+    };
+    let stream = futures_util::stream::unfold((ctx.notes.subscribe(), Box::pin(stopped)), |(mut rx, mut stopped)| async move {
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return None,
+                r = rx.recv() => match r {
+                    Ok(n) => return Some((Ok(Event::default().data(n.payload())), (rx, stopped))),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return None,
+                },
+            }
+        }
+    });
+    axum::response::sse::Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(25)))
+}
+
 pub async fn get_push_key(State(ctx): State<Arc<Ctx>>) -> Result<Response, ApiError> {
     let key = crate::chat::push::key(&ctx).await.map_err(push_failed)?;
     Ok(Json(serde_json::json!({ "key": key })).into_response())
