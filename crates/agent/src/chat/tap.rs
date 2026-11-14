@@ -3,7 +3,7 @@
 //! The record shapes are internal to Claude Code (checked on 2.1.322, see
 //! `CLAUDE_FINDINGS.md`). Anything not understood produces nothing.
 
-use super::CAP;
+use super::{media::split_attached, CAP};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -73,8 +73,8 @@ impl Tap {
             return Vec::new();
         }
         let out = match r.kind.as_str() {
-            "queue-operation" => match (r.operation.as_deref(), r.content.as_ref().and_then(Value::as_str)) {
-                (Some("enqueue"), Some(text)) if !injected(text) => vec![json!({"type":"cdash","subtype":"queued","text":unwrap_pastes(text)})],
+            "queue-operation" => match (r.operation.as_deref(), r.content.as_ref().and_then(parts)) {
+                (Some("enqueue"), Some((text, _))) if !injected(&text) => vec![json!({"type":"cdash","subtype":"queued","text":clean(&text).0})],
                 _ => Vec::new(),
             },
             "attachment" => steer(&r).into_iter().collect(),
@@ -91,8 +91,12 @@ impl Tap {
                 assistant(&r)
             }
             "user" => match r.message.as_ref().map(|m| &m["content"]) {
-                Some(Value::Array(blocks)) => tool_results(&r, blocks),
-                Some(Value::String(text)) => self.typed(&r, text),
+                Some(Value::Array(blocks)) if is_tool_record(blocks) => tool_results(&r, blocks),
+                Some(c @ Value::Array(_)) => match parts(c) {
+                    Some((text, images)) if !(text.is_empty() && images.is_empty()) => self.typed(&r, &text, images),
+                    _ => Vec::new(),
+                },
+                Some(Value::String(text)) => self.typed(&r, text, Vec::new()),
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -112,7 +116,8 @@ impl Tap {
     }
 
     /// Rule 7 and 8: a `user` record with string content.
-    fn typed(&mut self, r: &Rec, text: &str) -> Vec<Value> {
+    fn typed(&mut self, r: &Rec, text: &str, mut files: Vec<Value>) -> Vec<Value> {
+        let text = &strip_image_tokens(text);
         let t = text.trim_start();
         if let Some(cmd) = between(t, "<bash-input>", "</bash-input>") {
             return vec![json!({"type":"cdash","subtype":"shell","uuid":r.uuid,"command":cmd.trim()})];
@@ -131,6 +136,8 @@ impl Tap {
             }
             None => unwrap_pastes(text),
         };
+        let (prompt, attached) = split_attached(&prompt);
+        files.extend(attached);
         self.api_error = false;
         let queued = r.source.as_deref() == Some("queued");
         let mut out = Vec::new();
@@ -142,7 +149,7 @@ impl Tap {
             }
         }
         self.last = Some(Typed { queued, parent: r.parent.clone(), uuid: r.uuid.clone() });
-        out.push(prompt_event(r.uuid.as_deref(), &prompt, if queued { "queued" } else { "typed" }));
+        out.push(prompt_event(r.uuid.as_deref(), prompt.trim(), if queued { "queued" } else { "typed" }, files));
         out
     }
 }
@@ -179,8 +186,58 @@ fn injected(text: &str) -> bool {
     ["<task-notification>", "<system-reminder>", "<local-command-"].iter().any(|p| t.starts_with(p))
 }
 
-fn prompt_event(uuid: Option<&str>, text: &str, src: &str) -> Value {
-    json!({"type":"user","uuid":uuid,"message":{"role":"user","content":text},"src":src})
+fn prompt_event(uuid: Option<&str>, text: &str, src: &str, files: Vec<Value>) -> Value {
+    let mut ev = json!({"type":"user","uuid":uuid,"message":{"role":"user","content":text},"src":src});
+    if !files.is_empty() {
+        ev["files"] = Value::Array(files);
+    }
+    ev
+}
+
+/// A string is its own text; a block list gives its text blocks joined and its
+/// base64 image blocks as `{kind:"image",mime,data}`. Anything else is `None`.
+fn parts(content: &Value) -> Option<(String, Vec<Value>)> {
+    let blocks = match content {
+        Value::String(s) => return Some((s.clone(), Vec::new())),
+        Value::Array(b) if !b.iter().any(|b| b["type"] == "tool_result") => b,
+        _ => return None,
+    };
+    let text = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+    let images = blocks
+        .iter()
+        .filter(|b| b["type"] == "image" && b["source"]["type"] == "base64")
+        .filter_map(|b| Some(json!({"kind":"image","mime":b["source"]["media_type"].as_str()?,"data":b["source"]["data"].as_str()?})))
+        .collect();
+    Some((text, images))
+}
+
+/// Rule 6 owns a list with a `tool_result` or the interrupt marker.
+fn is_tool_record(blocks: &[Value]) -> bool {
+    blocks.iter().any(|b| b["type"] == "tool_result" || b["text"].as_str().is_some_and(|t| t.starts_with("[Request interrupted by user")))
+}
+
+/// Remove each `[Image #<digits>]` and one space right after it.
+fn strip_image_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("[Image #") {
+        let after = &rest[i + 8..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        out.push_str(&rest[..i]);
+        if digits > 0 && after[digits..].starts_with(']') {
+            rest = after[digits + 1..].strip_prefix(' ').unwrap_or(&after[digits + 1..]);
+        } else {
+            out.push_str("[Image #");
+            rest = after;
+        }
+    }
+    out + rest
+}
+
+/// Image tokens, pastes and upload lines out; what is left is what was typed.
+fn clean(text: &str) -> (String, Vec<Value>) {
+    let (t, files) = split_attached(&unwrap_pastes(&strip_image_tokens(text)));
+    (t.trim().to_string(), files)
 }
 
 /// Rule 3: a message Claude absorbed mid-turn has no `user` record, only this.
@@ -189,7 +246,10 @@ fn steer(r: &Rec) -> Option<Value> {
     if a["type"] != "queued_command" || a["commandMode"] != "prompt" {
         return None;
     }
-    Some(prompt_event(r.uuid.as_deref(), &unwrap_pastes(a["prompt"].as_str()?), "steer"))
+    let (text, mut files) = parts(&a["prompt"])?;
+    let (text, attached) = clean(&text);
+    files.extend(attached);
+    Some(prompt_event(r.uuid.as_deref(), &text, "steer", files))
 }
 
 /// Rule 5: one event per `text` or `tool_use` block; thinking is status only.
@@ -296,6 +356,7 @@ mod tests {
             "tool_result:toolu_2", "result:interrupted", "assistant:text", "result:success",
             "prompt:typed:handed back", "cdash:retract", "prompt:typed:second try",
             "assistant:tool_use", "cdash:queued", "tool_result:toolu_3", "prompt:steer:use -j4",
+            "prompt:typed:What color is this image?",
         ]);
         assert!(tap.turn_open(), "the steered message has not been answered yet");
     }
@@ -310,6 +371,7 @@ mod tests {
         assert_eq!(evs[16]["uuid"], "u4", "the handed-back prompt is the one withdrawn");
         assert_eq!(evs[21]["uuid"], "q1", "an absorbed message takes the attachment's id");
         assert_eq!(evs[1]["message"]["id"], "msg_1");
+        assert_eq!(evs.last().unwrap()["files"], json!([{"kind":"image","mime":"image/png","data":"iVBORw0KGgo="}]));
     }
     #[test]
     fn oversized_and_unknown_lines_are_skipped_without_losing_what_follows() {
@@ -341,4 +403,35 @@ mod tests {
         assert_eq!(tap.feed(unclosed)[0]["message"]["content"], "<pasted_content id=\"9\">\nhalf", "anything not understood is left as written");
     }
 
+    const IMG: &str = r#"{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}"#;
+    fn rec(uuid: &str, content: Value) -> String {
+        json!({"type":"user","uuid":uuid,"parentUuid":format!("p-{uuid}"),"promptSource":"typed","message":{"role":"user","content":content}}).to_string()
+    }
+    #[test]
+    fn an_image_prompt_becomes_its_text_and_its_image_blocks_in_either_order() {
+        let img: Value = serde_json::from_str(IMG).unwrap();
+        let mut tap = Tap::default();
+        let ev = &tap.feed(&rec("i1", json!([img, {"type":"text","text":"[Image #1] What color?"}])))[0];
+        assert_eq!((ev["message"]["content"].as_str(), ev["src"].as_str()), (Some("What color?"), Some("typed")));
+        assert_eq!(ev["files"], json!([{"kind":"image","mime":"image/png","data":"iVBORw0KGgo="}]));
+        let two = &tap.feed(&rec("i2", json!([{"type":"text","text":"[Image #2] [Image #3] both"}, img, img])))[0];
+        assert_eq!((two["message"]["content"].as_str(), two["files"].as_array().map(Vec::len)), (Some("both"), Some(2)));
+        assert_eq!(tap.feed(&rec("i3", json!([{"type":"text","text":"[Image #4] "}, img])))[0]["message"]["content"], "", "an image alone is a prompt");
+        assert_eq!(tap.feed(&rec("i4", json!([{"type":"text","text":"[Request interrupted by user]"}])))[0]["subtype"], "interrupted");
+        assert!(tap.feed(&rec("i5", json!([{"type":"image","source":{"type":"url","url":"https://x"}}]))).is_empty(), "nothing usable, nothing shown");
+    }
+    #[test]
+    fn queued_absorbed_and_typed_prompts_lose_their_upload_lines_and_image_tokens() {
+        let pdf = "/home/u/.cache/cdash/uploads/cdash-a/0123456789abcdef/r.pdf";
+        let img: Value = serde_json::from_str(IMG).unwrap();
+        let mut tap = Tap::default();
+        let typed = &tap.feed(&rec("t1", json!(format!("read this\nAttached: {pdf}"))))[0];
+        assert_eq!((typed["message"]["content"].as_str(), &typed["files"]), (Some("read this"), &json!([{"kind":"file","name":"r.pdf"}])));
+        let queued = &tap.feed(&json!({"type":"queue-operation","operation":"enqueue","content":format!("[Image #5] later\nAttached: {pdf}")}).to_string())[0];
+        assert_eq!(queued["text"], "later", "the hub matches queued text against what chat sent");
+        let steer = &tap.feed(&json!({"type":"attachment","uuid":"q9","attachment":{"type":"queued_command","commandMode":"prompt",
+            "prompt":[{"type":"text","text":format!("[Image #5] later\nAttached: {pdf}")}, img]}}).to_string())[0];
+        assert_eq!((steer["src"].as_str(), steer["message"]["content"].as_str()), (Some("steer"), Some("later")));
+        assert_eq!(steer["files"].as_array().unwrap().iter().map(|f| f["kind"].as_str().unwrap()).collect::<Vec<_>>(), ["image", "file"]);
+    }
 }

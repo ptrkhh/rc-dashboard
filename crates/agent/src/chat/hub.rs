@@ -974,6 +974,23 @@ mod tests {
         tx.send(EngineMsg::Ended).await.unwrap();
         crate::chat::tmux_io::tests::eventually("the session's uploads are gone", || !dir.exists()).await;
     }
+    #[tokio::test(start_paused = true)]
+    async fn a_message_with_a_pdf_is_confirmed_by_the_prompt_the_tap_reads_back() {
+        let (hub, tx, _) = rig_named("cdash-hub-pdf");
+        let pdf = media::uploads_dir("cdash-hub-pdf").unwrap().join("0123456789abcdef/r.pdf"); // contains /cdash/uploads/
+        std::fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.7").unwrap();
+        hub.add_upload("pppp".into(), Attachment { path: pdf.clone(), kind: Kind::File, mime: "application/pdf".into(), name: "r.pdf".into(), size: 8 }).await;
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        assert_eq!(reply(hub.command(send_with("c1", "read this", &["pppp"])).await)["status"], "sent");
+        let typed = json!({"type":"user","uuid":"u1","parentUuid":"p","promptSource":"typed","message":{"role":"user","content":format!("read this\nAttached: {}", pdf.display())}});
+        for ev in crate::chat::tap::Tap::default().feed(&typed.to_string()) { tx.send(EngineMsg::Ev(ev)).await.unwrap(); }
+        tokio::time::sleep(CONFIRM_AFTER + Duration::from_secs(1)).await;
+        let f = frames(&mut sub);
+        let _ = std::fs::remove_dir_all(pdf.parent().unwrap());
+        assert!(f.iter().any(|x| x["ev"]["cid"] == "c1" && x["ev"]["files"] == json!([{"kind":"file","name":"r.pdf"}])));
+        assert!(!f.iter().any(|x| x["t"] == "ack" && x["status"] == "unconfirmed"), "confirmed, not unconfirmed");
+    }
     #[tokio::test]
     async fn a_message_the_tool_confirmed_is_forgotten_at_the_next_turn_end() {
         let (hub, tx, calls) = rig_accepting();
