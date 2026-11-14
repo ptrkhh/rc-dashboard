@@ -1,5 +1,7 @@
 /* Attachment uploads for the chat: a queue that sends one file at a time over the
-   chat socket. No DOM here beyond URL.revokeObjectURL. Same IIFE shape as store.js. */
+   chat socket, the composer's chips and the image viewer. The DOM is touched only
+   inside wire/renderChips/view, so node --test can drive Uploads. Names reach the
+   page as textContent only. Same IIFE shape as store.js. */
 (function (g) {
   const LIMIT = 20 * 1024 * 1024, MAX = 10, CHUNK = 1024 * 1024;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -131,5 +133,110 @@
     }
   }
 
-  g.cdashAttach = { LIMIT, MAX, CHUNK, Uploads, fmtSize };
+  const $ = s => document.querySelector(s);
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  const holdsFiles = dt => !!dt && [...(dt.types || [])].includes('Files');
+
+  // current() is the open chat's Uploads, or null; changed() asks for a render.
+  function wire(current, changed) {
+    const add = files => {
+      const u = current();
+      if (!u || !files.length) return;
+      for (const f of files) u.add(f);
+      changed();
+    };
+    const file = $('#chat-file');
+    $('#chat-attach').addEventListener('click', () => file.click());
+    file.addEventListener('change', () => { add([...file.files]); file.value = ''; });
+    $('#chat-input').addEventListener('paste', e => {
+      const files = [...(e.clipboardData?.files || [])];
+      if (!files.length) return; // plain text pastes as usual
+      e.preventDefault();
+      add(files);
+    });
+    const chat = $('#chat');
+    chat.addEventListener('dragover', e => {
+      if (!holdsFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      chat.classList.add('chat-drop');
+    });
+    chat.addEventListener('dragleave', e => { if (!chat.contains(e.relatedTarget)) chat.classList.remove('chat-drop'); });
+    chat.addEventListener('drop', e => {
+      chat.classList.remove('chat-drop');
+      if (!holdsFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      add([...e.dataTransfer.files]);
+    });
+    $('#chat-atts').addEventListener('click', e => {
+      const b = e.target.closest('[data-remove],[data-retry]');
+      const u = current();
+      if (!b || !u) return;
+      if (b.dataset.remove !== undefined) u.remove(b.dataset.remove); else u.retry(b.dataset.retry);
+      changed();
+    });
+    // Every way out (Escape, a click, back) ends in one history entry less, so
+    // Android back closes the image and not the chat.
+    const d = $('#chat-viewer');
+    d.addEventListener('click', () => d.close());
+    d.addEventListener('close', () => {
+      $('#chat-viewer-img').removeAttribute('src');
+      if (history.state?.viewer) history.back();
+    });
+    addEventListener('popstate', () => { if (!history.state?.viewer && d.open) d.close(); });
+  }
+
+  function renderChips(u) {
+    const box = $('#chat-atts');
+    const items = u?.items ?? [];
+    const sig = items.map(i => [i.key, i.state, Math.round(i.progress * 100), i.error].join(':')).join('|');
+    if (box.dataset.sig === sig) return; // render runs on every frame; the thumbnails stay put
+    box.dataset.sig = sig;
+    box.textContent = '';
+    box.hidden = !items.length;
+    for (const i of items) {
+      const chip = el('div', 'chat-att' + (i.error ? ' failed' : ''));
+      if (i.file && i.mime?.startsWith('image/')) {
+        i.url ||= URL.createObjectURL(i.file);
+        const img = el('img', 'chat-att-thumb');
+        img.src = i.url;
+        img.alt = i.name;
+        chip.append(img);
+      } else chip.append(el('span', 'chat-att-name', i.name));
+      chip.append(el('span', 'chat-att-size', fmtSize(i.size)));
+      if (i.state === 'uploading') {
+        const bar = el('progress', 'chat-att-bar');
+        bar.max = 1;
+        bar.value = i.progress;
+        chip.append(bar);
+      }
+      if (i.error) chip.append(el('span', 'chat-att-error', i.error));
+      if (i.state === 'failed' && i.file) {
+        const retry = el('button', 'chat-att-retry', 'Retry');
+        retry.type = 'button';
+        retry.dataset.retry = i.key;
+        chip.append(retry);
+      }
+      const rm = el('button', 'chat-att-remove', '×');
+      rm.type = 'button';
+      rm.dataset.remove = i.key;
+      rm.setAttribute('aria-label', 'Remove ' + i.name);
+      chip.append(rm);
+      box.append(chip);
+    }
+  }
+
+  function view(src) {
+    const d = $('#chat-viewer');
+    $('#chat-viewer-img').src = src;
+    if (d.open) return;
+    history.pushState({ ...history.state, viewer: true }, '');
+    d.showModal();
+  }
+
+  g.cdashAttach = { LIMIT, MAX, CHUNK, Uploads, fmtSize, wire, renderChips, view };
 })(typeof globalThis === 'undefined' ? this : globalThis);

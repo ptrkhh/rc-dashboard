@@ -825,6 +825,54 @@ button, input, select { font: inherit; }
 .chat-go.stop { color: var(--surface); background: var(--text); }
 .chat-go:disabled, .chat-form textarea:disabled { opacity: 0.5; cursor: default; }
 
+/* Attachments: the paperclip, the chips above the composer, thumbnails in
+   history and the full-screen viewer. */
+.chat-attach {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 44px; height: 44px; padding: 0; cursor: pointer; color: var(--text-muted);
+  background: none; border: 1px solid var(--border-strong); border-radius: 50%;
+}
+.chat-attach:hover { color: var(--text); background: var(--surface-hover); }
+.chat-attach:disabled { opacity: 0.5; cursor: default; }
+.chat-attach svg { width: 20px; height: 20px; }
+.chat-atts { display: flex; gap: 8px; overflow-x: auto; padding: 8px var(--chat-pad) 0; }
+.chat-atts[hidden] { display: none; }
+.chat-att {
+  flex: none; display: flex; align-items: center; gap: 6px; max-width: 16rem;
+  padding: 4px 4px 4px 8px; font-size: 12px; color: var(--text-muted);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.chat-att.failed { border-color: var(--danger); }
+.chat-att-thumb { width: 40px; height: 40px; object-fit: cover; border-radius: var(--r-sm); }
+.chat-att-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.chat-att-size { flex: none; }
+.chat-att-bar { width: 48px; height: 4px; accent-color: var(--accent); }
+.chat-att-error { color: var(--danger); }
+.chat-att button {
+  flex: none; padding: 4px 8px; cursor: pointer; font: inherit; color: var(--accent);
+  background: none; border: 0; border-radius: var(--r-sm);
+}
+.chat-att button:hover { background: var(--accent-weak); }
+.chat-att .chat-att-remove { color: var(--text-muted); font-size: 16px; line-height: 1; }
+/* Up to three square thumbnails per row, right-aligned like the bubble; file chips take whole rows. */
+.chat-files { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; max-width: calc(3 * 6rem + 8px); }
+.chat-thumb { width: 6rem; aspect-ratio: 1; padding: 0; cursor: zoom-in; overflow: hidden; background: var(--surface-2); border: 0; border-radius: var(--r-md); }
+.chat-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.chat-file {
+  flex: 0 0 100%; display: flex; gap: 8px; min-width: 0;
+  padding: 6px 10px; font-size: 13px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.chat-file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-file-size { flex: none; color: var(--text-muted); }
+.chat.chat-drop { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.chat-viewer {
+  width: 100vw; height: 100dvh; max-width: none; max-height: none; margin: 0; padding: 0;
+  background: #000; border: 0; cursor: zoom-out;
+}
+.chat-viewer::backdrop { background: rgba(0, 0, 0, 0.9); }
+.chat-viewer img { display: block; width: 100%; height: 100%; object-fit: contain; }
+
 .chat-sheet-body { display: flex; flex-direction: column; gap: 16px; padding: 0 16px 16px; overflow-y: auto; }
 .chat-call-name { margin: 0 0 6px; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
 .chat-call-name code, #chat-sheet-title code { font-family: var(--font-mono); font-size: 0.85em; }

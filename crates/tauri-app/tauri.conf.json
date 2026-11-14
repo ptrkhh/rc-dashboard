@@ -9,7 +9,7 @@
   "app": {
     "withGlobalTauri": true,
     "windows": [
-      { "title": "RC Dashboard", "width": 1100, "height": 800 }
+      { "title": "RC Dashboard", "width": 1100, "height": 800, "dragDropEnabled": false }
     ],
     "security": {
       "csp": null

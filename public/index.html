@@ -163,7 +163,10 @@
   <div id="chat-cards" class="chat-cards"></div>
   <div id="chat-held" class="chat-held"></div>
   <div id="chat-menu" class="chat-menu" role="listbox" hidden></div>
+  <div id="chat-atts" class="chat-atts" hidden></div>
   <form id="chat-form" class="chat-form">
+    <button id="chat-attach" class="chat-attach" type="button" aria-label="Attach files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
+    <input id="chat-file" type="file" multiple hidden>
     <textarea id="chat-input" aria-controls="chat-menu" aria-expanded="false" rows="1" placeholder="Message…" aria-label="Message"></textarea>
     <button id="chat-go" class="chat-go" type="submit">Send</button>
   </form>
@@ -186,6 +189,7 @@
     <div id="chat-sheet-body" class="chat-sheet-body"></div>
   </div>
 </dialog>
+<dialog id="chat-viewer" class="chat-viewer" aria-label="Image"><img id="chat-viewer-img" alt=""></dialog>
 
 <div id="toast" role="status" aria-live="polite"></div>
 <!-- Before app.js, deliberately: an error thrown while app.js is still loading
@@ -221,6 +225,7 @@
 <script src="chat/store.js"></script>
 <script src="chat/cards.js"></script>
 <script src="chat/menu.js"></script>
+<script src="chat/attach.js"></script>
 <script src="chat/view.js"></script>
 <script src="app.js"></script>
 </body>

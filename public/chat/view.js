@@ -43,6 +43,8 @@
     log.addEventListener('click', e => {
       const b = e.target.closest('[data-tools]');
       if (b && c) showTools(b.dataset.tools);
+      const v = e.target.closest('[data-view]');
+      if (v && c) cdashAttach.view(v.dataset.view);
     });
     cdashMenu.wire(sendFrame, () => c?.state ?? null);
     $('#chat-sheet-close').addEventListener('click', () => $('#chat-sheet').close());
@@ -55,7 +57,7 @@
       if (b.dataset.again !== undefined) resend(c.state, cid, submitText);
       else {
         cdashChatStore.dropMine(c.state, cid);
-        if (b.dataset.edit !== undefined) toBox(m.text);
+        if (b.dataset.edit !== undefined) { toBox(m.text); c.uploads.restore(m.files); }
       }
       schedule();
     });
@@ -64,7 +66,7 @@
       if (!b || !c) return;
       const h = c.state.held.find(x => x.id === b.dataset.id);
       if (!h || !sendFrame({ t: 'held', op: b.dataset.op === 'now' ? 'now' : 'remove', id: h.id })) return;
-      if (b.dataset.op === 'edit') toBox(h.text);
+      if (b.dataset.op === 'edit') { toBox(h.text); c.uploads.restore(h.files); }
     });
     $('#chat-banner').addEventListener('click', e => {
       if (e.target.closest('[data-open-term]') && c) c.opts.openTerm(c.opts.name, c.opts.title);
@@ -75,9 +77,17 @@
       if (!c) return;
       const text = input.value.trim();
       const mode = composerMode(c.state, pending(c.state));
-      if (mode === 'off') return;
-      if (!text) { if (mode === 'stop') sendFrame({ t: 'stop' }); return; }
-      if (submitText(text)) { input.value = ''; grow(); renderComposer(); }
+      const u = c.uploads;
+      if (mode === 'off' || u.pending()) return;
+      const files = u.ready();
+      if (!text && !files.length) { if (mode === 'stop') sendFrame({ t: 'stop' }); return; }
+      if (submitText(text, files)) {
+        input.value = '';
+        // remove(), not clear(): an upload removed mid-flight still holds the queue until the agent answers it.
+        for (const i of [...u.items]) u.remove(i.key);
+        grow();
+        renderComposer();
+      }
     });
     input.addEventListener('keydown', e => {
       // Enter inserts a newline on touch keyboards; a hardware keyboard sends.
@@ -87,6 +97,7 @@
       }
     });
     input.addEventListener('input', () => { grow(); if (c) renderComposer(); });
+    cdashAttach.wire(() => c?.uploads ?? null, schedule);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden && c && !c.ws && !c.done) { clearTimeout(c.retryTimer); connect(); }
     });
@@ -112,6 +123,12 @@
     $('#chat').hidden = false;
     c.clock = setInterval(() => { if (c?.state.working) renderStatus(); }, 1000);
     const x = c;
+    // Read the socket per call: a reconnect replaces x.ws.
+    x.uploads = new cdashAttach.Uploads({
+      send: d => { if (x.ws?.readyState !== WebSocket.OPEN) return false; x.ws.send(d); return true; },
+      buffered: () => x.ws?.bufferedAmount ?? 0,
+      onChange: () => { if (c === x) schedule(); },
+    });
     x.unwatch = watchFocus(on => { if (x.ws?.readyState === 1) x.ws.send(JSON.stringify({ t: 'focus', on })); });
     schedule();
     connect();
@@ -124,6 +141,7 @@
     clearTimeout(x.retryTimer);
     clearInterval(x.clock);
     x.unwatch?.();
+    x.uploads.clear();
     if (x.raf) cancelAnimationFrame(x.raf);
     x.ws?.close();
     $('#chat').hidden = true;
@@ -131,6 +149,8 @@
     $('#chat-held').textContent = '';
     $('#chat-cards').textContent = '';
     if ($('#chat-sheet').open) $('#chat-sheet').close();
+    if ($('#chat-viewer').open) $('#chat-viewer').close();
+    cdashAttach.renderChips(null);
     cdashMenu.reset();
   }
 
@@ -143,12 +163,14 @@
     try { url = await x.opts.wsUrl(q); }
     catch { if (c === x) retry(x); return; }
     if (c !== x || x.ws) return; // closed, or another attempt won, while resolving the URL
+    x.base = httpBase(url);
     const ws = new WebSocket(url);
     x.ws = ws;
     ws.onmessage = e => {
       if (c !== x || x.ws !== ws) return;
       let f;
       try { f = JSON.parse(e.data); } catch { return; }
+      if (f.t === 'uploaded') { x.uploads.onFrame(f); return; }
       if (f.t === 'hello') { x.attempt = 0; x.link = ''; ws.send(JSON.stringify({ t: 'focus', on: focusNow() })); }
       if (f.t === 'page') { x.paging = false; x.paged = true; }
       const wasWorking = x.state.working;
@@ -164,6 +186,7 @@
       if (c !== x || x.ws !== ws) return; // the UI closed it, or a newer socket replaced it
       x.ws = null;
       x.paging = false;
+      x.uploads.lost();
       if (e.code === 4000) { x.done = true; x.link = ''; schedule(); return; }
       if (e.code === 4002) { connect(); return; } // fell behind: catch up from the last position now
       retry(x);
@@ -181,10 +204,13 @@
     c.ws.send(JSON.stringify({ t: 'page', before: c.state.first }));
   }
 
+  // Thumbnails load over http(s) from the agent the socket reached: in the apps that is not the page's origin.
+  const httpBase = url => { const u = new URL(url); return u.protocol.replace('ws', 'http') + '//' + u.host; };
+
   // Send again: the row goes only once the text has been sent, so offline it stays.
   function resend(state, cid, send) {
     const m = state.mine.find(x => x.cid === cid);
-    if (!m || !send(m.text)) return false;
+    if (!m || !send(m.text, m.files ?? [])) return false;
     cdashChatStore.dropMine(state, cid);
     return true;
   }
@@ -195,10 +221,10 @@
     return true;
   }
 
-  function submitText(text) {
+  function submitText(text, files = []) {
     const cid = crypto.randomUUID();
-    if (!sendFrame({ t: 'send', cid, text })) return false;
-    cdashChatStore.addMine(c.state, cid, text);
+    if (!sendFrame({ t: 'send', cid, text, files: files.map(f => f.id) })) return false;
+    cdashChatStore.addMine(c.state, cid, text, files);
     c.follow = true;
     schedule();
     return true;
@@ -238,7 +264,8 @@
     }
     if (r.kind === 'user') {
       const n = el('div', 'chat-user chat-' + r.status);
-      n.append(el('div', 'chat-bubble', r.text));
+      if (r.files?.length) n.append(files(r.files));
+      if (r.text || !r.files?.length) n.append(el('div', 'chat-bubble', r.text));
       if (r.status !== 'sent') {
         const meta = el('div', 'chat-meta', STATUS[r.status] + (r.error ? ': ' + r.error : ''));
         if (r.cid && ['unconfirmed', 'returned', 'refused'].includes(r.status)) {
@@ -278,6 +305,31 @@
       return n;
     }
     return el('div', 'chat-note', r.text);
+  }
+
+  // Images with a ref as thumbnails, then chips; my own not yet shown images have no ref and show as chips.
+  function files(fs) {
+    const g = el('div', 'chat-files');
+    const thumbs = fs.filter(f => f.kind === 'image' && f.ref);
+    for (const f of thumbs) {
+      const src = c.base + '/api/chat/media/' + f.ref; // the store let through only 64-hex refs
+      const b = el('button', 'chat-thumb');
+      b.type = 'button';
+      b.dataset.view = src;
+      b.setAttribute('aria-label', 'View image');
+      const img = el('img');
+      Object.assign(img, { loading: 'lazy', decoding: 'async', alt: 'Image', src });
+      b.append(img);
+      g.append(b);
+    }
+    for (const f of fs) {
+      if (thumbs.includes(f)) continue;
+      const chip = el('div', 'chat-file');
+      chip.append(el('span', 'chat-file-name', f.name ?? 'Image'));
+      if (typeof f.size === 'number') chip.append(el('span', 'chat-file-size', cdashAttach.fmtSize(f.size)));
+      g.append(chip);
+    }
+    return g;
   }
 
   // "Ran `npm test`": the command shows as code, without the backticks.
@@ -358,14 +410,17 @@
     const input = $('#chat-input');
     const go = $('#chat-go');
     const mode = c.done ? 'off' : composerMode(s, pending(s));
-    const stop = mode === 'stop' && !input.value.trim();
-    input.disabled = go.disabled = mode === 'off';
+    const u = c.uploads;
+    const stop = mode === 'stop' && !input.value.trim() && !u.items.length;
+    input.disabled = $('#chat-attach').disabled = mode === 'off';
+    go.disabled = mode === 'off' || u.pending();
     input.placeholder = s.ended || c.done ? 'Session ended'
       : s.unreadable ? 'Use Terminal for this session'
       : s.waiting ? (s.asks.length ? 'Answer the card first' : 'Answer in Terminal first')
       : s.working ? 'Queue a message…' : 'Message…';
-    go.textContent = stop ? 'Stop' : 'Send';
+    go.textContent = stop ? 'Stop' : u.items.some(i => i.state === 'uploading' || i.state === 'queued') ? 'Uploading…' : 'Send';
     go.classList.toggle('stop', stop);
+    cdashAttach.renderChips(u);
   }
 
   function renderStatus() {
@@ -461,6 +516,7 @@
     composerMode,
     needPage,
     resend,
+    httpBase,
     open,
     close,
     isOpen: () => !!c,

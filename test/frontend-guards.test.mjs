@@ -512,12 +512,23 @@ test('pin keeps keyboard focus unless the user focuses something else while savi
 test('chat scripts load before app.js and the chat markup exists', () => {
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const at = s => html.indexOf(s);
-  for (const f of ['chat/md.js', 'chat/store.js', 'chat/cards.js', 'chat/menu.js', 'chat/view.js']) {
+  for (const f of ['chat/md.js', 'chat/store.js', 'chat/cards.js', 'chat/menu.js', 'chat/attach.js', 'chat/view.js']) {
     assert.ok(at(`<script src="${f}"></script>`) > 0 && at(`<script src="${f}"></script>`) < at('<script src="app.js"></script>'), f);
   }
-  for (const id of ['chat', 'chat-log', 'chat-cards', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'chat-chip', 'chat-menu', 'chat-settings', 'notify-toggle'])
+  for (const id of ['chat', 'chat-log', 'chat-cards', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'chat-chip', 'chat-menu', 'chat-settings', 'notify-toggle', 'chat-attach', 'chat-file', 'chat-atts', 'chat-viewer', 'chat-viewer-img'])
     assert.ok(html.includes(`id="${id}"`), id);
   assert.ok(/id="chat"[^>]*\shidden/.test(html), 'chat starts hidden');
+  assert.ok(at('<script src="chat/attach.js"></script>') < at('<script src="chat/view.js"></script>'));
+  assert.ok(at('id="chat-menu"') < at('id="chat-atts"') && at('id="chat-atts"') < at('id="chat-form"'), 'menu, then chips, then the form');
+});
+test('attachments never become markup', () => {
+  const attach = readFileSync(new URL('../public/chat/attach.js', import.meta.url), 'utf8');
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|eval\(/.test(attach));
+  assert.match(readFileSync(new URL('../public/index.html', import.meta.url), 'utf8'), /<input id="chat-file" type="file" multiple hidden>/);
+});
+test('the desktop app lets dropped files reach the page', () => {
+  const conf = JSON.parse(readFileSync(new URL('../crates/tauri-app/tauri.conf.json', import.meta.url), 'utf8'));
+  assert.equal(conf.app.windows[0].dragDropEnabled, false);
 });
 test('the chat view never builds markup from conversation text', () => {
   for (const f of ['view.js', 'cards.js']) {
@@ -583,7 +594,9 @@ test('older history is asked for while the list cannot scroll, and Send again ke
   globalThis.document = undefined;
   await import('../public/chat/store.js');
   await import('../public/chat/view.js');
-  const { needPage, resend } = globalThis.cdashChat;
+  const { needPage, resend, httpBase } = globalThis.cdashChat;
+  assert.equal(httpBase('wss://h.example:8443/api/chat?name=a'), 'https://h.example:8443', 'thumbnails come from the agent the socket reached');
+  assert.equal(httpBase('ws://127.0.0.1:41234/api/chat?name=a'), 'http://127.0.0.1:41234');
   assert.equal(needPage(true, false, 0, 500, 600), true, 'a first screen that does not scroll still pages');
   assert.equal(needPage(true, false, 10, 3000, 600), true, 'scrolled to the top');
   assert.equal(needPage(true, false, 900, 3000, 600), false);
@@ -594,6 +607,9 @@ test('older history is asked for while the list cannot scroll, and Send again ke
   assert.deepEqual(s.mine.map(m => m.cid), ['c1'], 'offline: the row and its text stay');
   assert.equal(resend(s, 'c1', text => text === 'hi'), true);
   assert.deepEqual(s.mine, []);
+  const files = [{ id: '0123456789abcdef', name: 'a.png', kind: 'image', size: 8, mime: 'image/png' }];
+  const t = { mine: [{ cid: 'c2', text: '', status: 'unconfirmed', seq: null, files }] };
+  assert.equal(resend(t, 'c2', (text, fs) => text === '' && fs === files), true, 'Send again carries the attachments');
 });
 
 test('focus counts only a visible, focused page with input in the last two minutes, and both sockets report it', async () => {

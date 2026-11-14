@@ -880,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn chat_assets_are_embedded() {
         let b = serve(cfg_for(tempdir("chat-assets"))).await.unwrap();
-        for (path, marker) in [("/chat/md.js", "cdashMd"), ("/chat/store.js", "cdashChatStore"), ("/chat/cards.js", "cdashCards"), ("/chat/menu.js", "cdashMenu"), ("/chat/view.js", "cdashChat")] {
+        for (path, marker) in [("/chat/md.js", "cdashMd"), ("/chat/store.js", "cdashChatStore"), ("/chat/cards.js", "cdashCards"), ("/chat/menu.js", "cdashMenu"), ("/chat/attach.js", "cdashAttach"), ("/chat/view.js", "cdashChat")] {
             assert!(reqwest_get(&format!("http://{}{path}", b.addr)).await.contains(marker), "{path}");
         }
     }
