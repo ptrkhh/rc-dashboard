@@ -34,6 +34,8 @@ struct Rec {
     message: Option<Value>,
     #[serde(rename = "durationMs")]
     duration: Option<Value>,
+    #[serde(rename = "isApiErrorMessage", default)]
+    api_error: Option<bool>,
 }
 
 /// The last prompt rule 7 emitted, for spotting a handed-back prompt.
@@ -49,6 +51,8 @@ pub struct Tap {
     seen: usize,
     understood: bool,
     last: Option<Typed>,
+    /// The last main-chain assistant record was an API error message.
+    api_error: bool,
 }
 
 impl Tap {
@@ -75,13 +79,17 @@ impl Tap {
             },
             "attachment" => steer(&r).into_iter().collect(),
             "system" if r.subtype.as_deref() == Some("turn_duration") => {
-                let mut ev = json!({"type":"result","subtype":"success"});
+                let subtype = if std::mem::take(&mut self.api_error) { "error_during_execution" } else { "success" };
+                let mut ev = json!({"type":"result","subtype":subtype});
                 if let Some(d) = r.duration.filter(Value::is_number) {
                     ev["duration_ms"] = d;
                 }
                 vec![ev]
             }
-            "assistant" => assistant(&r),
+            "assistant" => {
+                self.api_error = r.api_error == Some(true);
+                assistant(&r)
+            }
             "user" => match r.message.as_ref().map(|m| &m["content"]) {
                 Some(Value::Array(blocks)) => tool_results(&r, blocks),
                 Some(Value::String(text)) => self.typed(&r, text),
@@ -123,6 +131,7 @@ impl Tap {
             }
             None => unwrap_pastes(text),
         };
+        self.api_error = false;
         let queued = r.source.as_deref() == Some("queued");
         let mut out = Vec::new();
         if let Some(prev) = &self.last {
@@ -247,6 +256,19 @@ fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_that_ended_on_an_api_error_ends_with_an_error_result() {
+        let mut tap = Tap::default();
+        let end = r#"{"type":"system","subtype":"turn_duration","durationMs":5,"uuid":"s9"}"#;
+        tap.feed(r#"{"type":"user","uuid":"u9","promptSource":"typed","message":{"role":"user","content":"go"}}"#);
+        tap.feed(r#"{"type":"assistant","uuid":"k9","isApiErrorMessage":true,"message":{"id":"m9","role":"assistant","content":[{"type":"text","text":"API Error: Rate limit reached"}]}}"#);
+        assert_eq!(tap.feed(end)[0]["subtype"], "error_during_execution");
+        assert_eq!(tap.feed(end)[0]["subtype"], "success", "reported once");
+        tap.feed(r#"{"type":"assistant","uuid":"k9","isApiErrorMessage":true,"message":{"id":"m9","role":"assistant","content":[{"type":"text","text":"API Error"}]}}"#);
+        tap.feed(r#"{"type":"assistant","uuid":"k10","message":{"id":"m10","role":"assistant","content":[{"type":"text","text":"ok"}]}}"#);
+        assert_eq!(tap.feed(end)[0]["subtype"], "success");
+    }
 
     fn run() -> (Vec<serde_json::Value>, Tap) {
         let mut tap = Tap::default();

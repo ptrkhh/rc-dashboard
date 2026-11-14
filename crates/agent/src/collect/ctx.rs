@@ -47,6 +47,8 @@ pub struct Ctx {
     pub chats: tokio::sync::Mutex<HashMap<String, crate::chat::hub::Hub>>,
     /// Sockets per session whose device is looking at it; see `FocusGuard`.
     pub focus: Mutex<HashMap<String, usize>>,
+    /// Finished, failed and needs-an-answer notes from every hub.
+    pub notes: tokio::sync::broadcast::Sender<crate::chat::notify::Note>,
 }
 
 impl Ctx {
@@ -76,6 +78,7 @@ impl Ctx {
             password: std::sync::OnceLock::new(),
             chats: tokio::sync::Mutex::new(HashMap::new()),
             focus: Mutex::new(HashMap::new()),
+            notes: tokio::sync::broadcast::channel(64).0,
         }
     }
 

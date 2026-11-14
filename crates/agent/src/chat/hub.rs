@@ -2,6 +2,7 @@
 //! held-message queue and the delivery rules.
 
 pub use super::wire::{ClientFrame, HeldOp};
+use super::notify::{NoteKind, Sink};
 use super::queue::Queue;
 use super::wire::sanitize;
 use super::Frame;
@@ -24,6 +25,8 @@ pub const STOP_QUIET: Duration = Duration::from_millis(500);
 /// handed back. Transcript writes were seen up to 2.2 s late; an interrupt
 /// marker that lands inside this window proves the prompt was taken.
 pub const STOP_SETTLE: Duration = Duration::from_millis(2500);
+/// How long a session waits for an answer before it is worth a notification.
+pub const ASK_AFTER: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(250);
 
 /// What an engine reports about its session.
@@ -75,6 +78,17 @@ impl Hub {
         log: Arc<LogBuffer>,
         name: String,
     ) -> Hub {
+        Self::spawn_with(tool, engine, events, log, name, None)
+    }
+
+    pub fn spawn_with<E: Engine>(
+        tool: &'static str,
+        engine: E,
+        events: mpsc::Receiver<EngineMsg>,
+        log: Arc<LogBuffer>,
+        name: String,
+        notes: Option<Sink>,
+    ) -> Hub {
         let (cmds, rx) = mpsc::channel(64);
         let (out, _) = broadcast::channel(1024);
         let actor = Actor {
@@ -98,6 +112,10 @@ impl Hub {
             last_ev: Instant::now(),
             waiters: Vec::new(),
             last_state: String::new(),
+            notes,
+            live: false,
+            waiting_since: None,
+            asked: false,
         };
         tokio::spawn(actor.run(events, rx));
         Hub { cmds }
@@ -189,9 +207,20 @@ struct Actor<E> {
     last_ev: Instant,
     waiters: Vec<(Option<u64>, Option<String>, oneshot::Sender<Subscription>)>,
     last_state: String,
+    notes: Option<Sink>,
+    /// Past the replayed history: only live turn ends notify.
+    live: bool,
+    waiting_since: Option<Instant>,
+    asked: bool,
 }
 
 impl<E: Engine> Actor<E> {
+    fn note(&self, kind: NoteKind) {
+        if let (true, Some(s)) = (self.live, &self.notes) {
+            s.note(&self.name, kind);
+        }
+    }
+
     async fn run(mut self, mut events: mpsc::Receiver<EngineMsg>, mut cmds: mpsc::Receiver<Cmd>) {
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -279,17 +308,25 @@ impl<E: Engine> Actor<E> {
             }
             EngineMsg::Delta { id, text } => self.broadcast(json!({"t":"delta","id":id,"text":text})),
             EngineMsg::Status { working, waiting, waiting_for } => {
+                if waiting && !self.waiting {
+                    self.waiting_since = Some(Instant::now());
+                    self.asked = false;
+                } else if !waiting {
+                    self.waiting_since = None;
+                }
                 self.working = working;
                 self.waiting = waiting;
                 self.waiting_for = waiting_for;
             }
             EngineMsg::Ready => {
                 self.ready = true;
+                self.live = true;
                 for (after, epoch, reply) in std::mem::take(&mut self.waiters) {
                     let _ = reply.send(self.subscription(after, epoch));
                 }
             }
             EngineMsg::Reset => {
+                self.live = false;
                 self.epoch = new_epoch();
                 self.log_events.clear();
                 self.broadcast(json!({"t":"reset","epoch":self.epoch}));
@@ -321,6 +358,12 @@ impl<E: Engine> Actor<E> {
                     self.queue.stop_all();
                 } else {
                     self.turn_ok = true;
+                }
+                match ev["subtype"].as_str() {
+                    // A held message about to leave on its own is not the end.
+                    Some("success") if !self.queue.list().first().is_some_and(|h| h.auto) => self.note(NoteKind::Done),
+                    Some("error_during_execution") => self.note(NoteKind::Error),
+                    _ => {}
                 }
             }
         } else if ev["type"] == "cdash" && ev["subtype"] == "queued" {
@@ -443,6 +486,12 @@ impl<E: Engine> Actor<E> {
 
     async fn tick(&mut self) {
         let now = Instant::now();
+        if let (true, false, true, Some(since)) = (self.live, self.asked, self.waiting, self.waiting_since) {
+            if now.duration_since(since) >= ASK_AFTER && self.waiting_for.as_deref() != Some("dialog open") {
+                self.asked = true;
+                self.note(NoteKind::Ask);
+            }
+        }
         let (late, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.pending)
             .into_iter()
             .partition(|p| !p.exempt && p.uuid.is_none() && now.duration_since(p.at) > CONFIRM_AFTER);
@@ -486,6 +535,8 @@ impl<E: Engine> Actor<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::notify::Note;
+    use crate::collect::ctx::{Ctx, FocusGuard};
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -519,21 +570,44 @@ mod tests {
 
     type Calls = Arc<Mutex<Vec<String>>>;
 
-    fn build(slow: Option<Duration>, accepts: bool) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+    fn build(
+        slow: Option<Duration>,
+        accepts: bool,
+        notes: Option<Sink>,
+        ready: bool,
+    ) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         let calls = Calls::default();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let engine = FakeEngine { calls: calls.clone(), accepts, slow };
         let log = Arc::new(crate::host::log::LogBuffer::new());
-        let hub = Hub::spawn("claude", engine, rx, log, "cdash-a".into());
-        tx.try_send(EngineMsg::Ready).unwrap();
+        let hub = Hub::spawn_with("claude", engine, rx, log, "cdash-a".into(), notes);
+        if ready {
+            tx.try_send(EngineMsg::Ready).unwrap();
+        }
         (hub, tx, calls)
     }
     fn rig_with(slow: Option<Duration>) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(slow, false)
+        build(slow, false, None, true)
     }
     /// A rig whose engine confirms what it accepts, as Codex and OpenCode do.
     fn rig_accepting() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(None, true)
+        build(None, true, None, true)
+    }
+    fn rig_noting(ready: bool) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Arc<Ctx>, broadcast::Receiver<Note>) {
+        let ctx = crate::chat::claude::tests::ctx_with_path(
+            crate::chat::tmux_io::tests::tempfile_path("noting"),
+            String::new(),
+        );
+        let notes = ctx.notes.subscribe();
+        let sink = Sink { ctx: Arc::clone(&ctx), project: "proj".into() };
+        let (hub, tx, _) = build(None, false, Some(sink), ready);
+        (hub, tx, ctx, notes)
+    }
+    fn note_kinds(rx: &mut broadcast::Receiver<Note>) -> Vec<&'static str> {
+        std::iter::from_fn(|| rx.try_recv().ok()).map(|n| n.kind.as_str()).collect()
+    }
+    fn turn_end(subtype: &str) -> EngineMsg {
+        EngineMsg::Ev(json!({"type":"result","subtype":subtype}))
     }
     fn engine_status(working: bool, waiting: bool) -> EngineMsg {
         EngineMsg::Status { working, waiting, waiting_for: None }
@@ -846,5 +920,68 @@ mod tests {
             if i == 12 { assert_eq!(calls.lock().unwrap().len(), 2, "2.4 s and still growing"); }
         }
         assert_eq!(calls.lock().unwrap().last().map(String::as_str), Some("clear:first"), "settled at the 2.5 s ceiling");
+    }
+
+    #[tokio::test]
+    async fn history_never_notifies_only_live_turn_ends_do() {
+        let (_hub, tx, _ctx, mut notes) = rig_noting(false);
+        tx.send(turn_end("success")).await.unwrap(); // replayed history
+        tx.send(EngineMsg::Ready).await.unwrap();
+        for s in ["success", "error_during_execution", "interrupted"] {
+            tx.send(turn_end(s)).await.unwrap();
+        }
+        tx.send(EngineMsg::Reset).await.unwrap();
+        tx.send(turn_end("success")).await.unwrap(); // the new conversation's history
+        tx.send(EngineMsg::Ready).await.unwrap();
+        tx.send(turn_end("success")).await.unwrap();
+        settle().await;
+        assert_eq!(note_kinds(&mut notes), ["done", "error", "done"], "a Stop or Esc (interrupted) never notifies");
+    }
+
+    #[tokio::test]
+    async fn finished_waits_for_the_queue_but_an_error_does_not() {
+        let (hub, tx, _ctx, mut notes) = rig_noting(true);
+        tx.send(engine_status(true, false)).await.unwrap();
+        settle().await;
+        hub.command(send("c1", "next")).await; // held; leaves on its own
+        tx.send(turn_end("success")).await.unwrap();
+        settle().await;
+        assert!(note_kinds(&mut notes).is_empty(), "the held message is about to go");
+        tx.send(turn_end("error_during_execution")).await.unwrap();
+        settle().await;
+        assert_eq!(note_kinds(&mut notes), ["error"]);
+        hub.command(ClientFrame::Stop).await; // after a Stop nothing leaves on its own
+        tx.send(turn_end("success")).await.unwrap();
+        settle().await;
+        assert_eq!(note_kinds(&mut notes), ["done"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn needs_an_answer_after_five_seconds_once_per_spell_and_never_for_a_dialog() {
+        let (_hub, tx, _ctx, mut notes) = rig_noting(true);
+        let waiting = |w: &str| EngineMsg::Status { working: false, waiting: true, waiting_for: Some(w.into()) };
+        tx.send(waiting("permission prompt")).await.unwrap();
+        tokio::time::sleep(ASK_AFTER - Duration::from_millis(500)).await;
+        assert!(note_kinds(&mut notes).is_empty(), "answered quickly in Terminal: no buzz");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(note_kinds(&mut notes), ["ask"], "once per waiting spell");
+        tx.send(engine_status(true, false)).await.unwrap();
+        tx.send(waiting("dialog open")).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(note_kinds(&mut notes).is_empty(), "/exit, rewind and model-switch dialogs never notify");
+    }
+
+    #[tokio::test]
+    async fn a_session_someone_is_looking_at_does_not_notify() {
+        let (_hub, tx, ctx, mut notes) = rig_noting(true);
+        let mut looking = FocusGuard::new(&ctx, "cdash-a");
+        looking.set(true);
+        tx.send(turn_end("success")).await.unwrap();
+        settle().await;
+        assert!(note_kinds(&mut notes).is_empty());
+        drop(looking);
+        tx.send(turn_end("success")).await.unwrap();
+        settle().await;
+        assert_eq!(note_kinds(&mut notes), ["done"]);
     }
 }
