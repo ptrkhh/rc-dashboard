@@ -67,11 +67,18 @@ fn write_synthetic(path: &Path, turns: usize) {
     w.flush().unwrap();
 }
 
-/// A tmux server that is not the owner's: `TMUX_TMPDIR` is private and `TMUX` unset.
+/// A tmux server that is not the owner's. Refuses when `TMUX` is set or no private
+/// `TMUX_TMPDIR` was given, then points this process at a fresh empty `TMUX_TMPDIR`
+/// of its own: an exported `TMUX_TMPDIR` of the owner's can never be reached, and
+/// the test aborts if a server already answers there.
 fn private_tmux() {
     assert!(std::env::var_os("TMUX").is_none(), "run with `env -u TMUX`");
     let t = std::env::var("TMUX_TMPDIR").unwrap_or_default();
     assert!(!t.is_empty() && t != "/tmp", "run with a private TMUX_TMPDIR");
+    let own = tempfile_path("perf-tmux");
+    std::fs::create_dir_all(&own).unwrap();
+    std::env::set_var("TMUX_TMPDIR", &own); // every tmux call below, and the Runner's, inherits it
+    assert!(tmux(&["list-sessions"]).is_empty(), "a tmux server already answers in {}", own.display());
 }
 
 fn tmux(args: &[&str]) -> String {
@@ -177,4 +184,31 @@ async fn perf_hub_for_latency() {
     let made = ctx.chats.lock().await.len();
     ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     println!("perf_hub_for_latency: {made} hubs; 50 calls, median {:.1} ms, p95 {:.1} ms, max {:.1} ms", ms[25], ms[47], ms[49]);
+}
+
+/// The liveness checks alone: the 10 hubs' `has-session` spawns at the engine's rate
+/// (every 13th 150 ms tick), with no polling, to split `perf_idle_cpu` into spawns
+/// and everything else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement"]
+async fn perf_idle_cpu_spawns_only() {
+    let (ctx, _dir) = fixture_with("perf-spawn", "");
+    let (c0, t0) = (cpu_secs(), Instant::now());
+    let loops: Vec<_> = (0..10)
+        .map(|i| {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(150 * 13));
+                while t0.elapsed() < Duration::from_secs(60) {
+                    tick.tick().await;
+                    let _ = ctx.runner.run_checked("tmux", &["has-session", "-t", &format!("=cdash-perf-{i}:")], "tmux has-session").await;
+                }
+            })
+        })
+        .collect();
+    for l in loops {
+        l.await.unwrap();
+    }
+    let pct = (cpu_secs() - c0) / t0.elapsed().as_secs_f64() * 100.0;
+    println!("perf_idle_cpu_spawns_only: 10 has-session loops, 60 s: {pct:.2}% of one core");
 }
