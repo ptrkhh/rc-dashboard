@@ -16,7 +16,11 @@
     return commands.filter(c => c.name.toLowerCase().startsWith(p)).slice(0, MAX);
   }
 
-  const askMenu = () => { ui.asked = true; ui.send({ t: 'menu' }); };
+  const askMenu = () => { if (ui.send({ t: 'menu' })) ui.asked = true; };
+
+  // A value the list lacks (a fresh Claude session has no model yet) shows as a disabled dash, not as the first option.
+  const withPlaceholder = (options, current) =>
+    options.some(([v]) => v === current) ? options : [['', '—', true], ...options];
 
   function complete(c) {
     const input = $('#chat-input');
@@ -34,6 +38,7 @@
     ui.sel = Math.min(ui.sel, Math.max(0, ui.list.length - 1));
     box.textContent = '';
     box.hidden = !(ui.list.length || (typing && !s.menu));
+    $('#chat-input').setAttribute('aria-expanded', String(!box.hidden));
     if (typing && !s.menu) box.append(el('div', 'chat-menu-note', 'Loading…'));
     ui.list.forEach((c, i) => {
       const item = el('div', 'chat-menu-item');
@@ -52,10 +57,11 @@
   function select(label, options, current, onchange, disabled) {
     const s = el('select');
     s.setAttribute('aria-label', label);
-    for (const [value, text] of options) {
+    for (const [value, text, ph] of withPlaceholder(options, current)) {
       const o = el('option', '', text);
       o.value = value;
-      o.selected = value === current;
+      o.selected = ph || value === current;
+      o.disabled = !!ph;
       s.append(o);
     }
     s.disabled = disabled;
@@ -98,7 +104,7 @@
       const variants = model?.variants || [];
       row('Variant', select('Variant', [['', 'default'], ...variants.map(v => [v, v])], cur.variant ?? '', v => change('variant', v), busy));
     } else {
-      const efforts = claude ? m.efforts : model?.efforts || [];
+      const efforts = model?.efforts || m.efforts;
       row('Effort', select('Effort', efforts.map(e => [e, e]), cur.effort, v => change('effort', v), busy), dflt);
     }
     if (claude || s.tool === 'codex') {
@@ -132,6 +138,7 @@
     Object.assign(ui, { asked: false, closed: false, sel: 0, saving: false, sheetSig: '', list: [] });
     $('#chat-menu').hidden = true;
     $('#chat-menu').textContent = '';
+    $('#chat-input').setAttribute('aria-expanded', 'false');
     if ($('#chat-settings').open) $('#chat-settings').close();
   }
 
@@ -141,13 +148,15 @@
     const input = $('#chat-input');
     input.addEventListener('input', () => {
       ui.closed = false;
+      ui.sel = 0;
       const s = getState();
-      if (s && !s.menu && !ui.asked && input.value === '/') askMenu();
+      if (s && !s.menu && !ui.asked && /^\/\S*$/.test(input.value)) askMenu();
       renderList(s);
     });
     input.addEventListener('keydown', e => {
-      if (!ui.list.length) return;
+      if (e.isComposing || $('#chat-menu').hidden) return;
       const k = e.key;
+      if (!ui.list.length && k !== 'Escape') return; // Loading…: only Escape acts
       if (!['ArrowUp', 'ArrowDown', 'Enter', 'Tab', 'Escape'].includes(k)) return;
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -155,8 +164,10 @@
       else if (k === 'Enter' || k === 'Tab') complete(ui.list[ui.sel]);
       else { ui.sel = (ui.sel + (k === 'ArrowDown' ? 1 : -1) + ui.list.length) % ui.list.length; renderList(getState()); }
     }, true);
+    input.addEventListener('blur', () => { ui.closed = true; renderList(getState()); });
     $('#chat-chip').addEventListener('click', () => {
       ui.sheetSig = '';
+      ui.sentReply = getState()?.setReply ?? null;
       $('#chat-settings').showModal();
       askMenu();
       render(getState());
@@ -164,5 +175,5 @@
     $('#chat-settings-close').addEventListener('click', () => $('#chat-settings').close());
   }
 
-  g.cdashMenu = { wire, render, reset, filter };
+  g.cdashMenu = { wire, render, reset, filter, withPlaceholder };
 })(typeof globalThis === 'undefined' ? this : globalThis);
