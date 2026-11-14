@@ -54,6 +54,17 @@ pub enum EngineMsg {
     Ended,
 }
 
+/// How far the tool took a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sent {
+    /// Typed in; only the record will show whether it was taken.
+    Unconfirmed,
+    /// The tool itself accepted it.
+    Confirmed,
+    /// The engine handled it itself (a command): no prompt will ever show it.
+    Done,
+}
+
 /// What the user chose on an ask card.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Answer {
@@ -67,8 +78,7 @@ pub struct Answer {
 
 /// The input side of a session.
 pub trait Engine: Send + Sync + 'static {
-    /// `Ok(true)` when the tool itself confirmed it accepted the message.
-    fn send(&self, text: &str, steer: bool, cid: &str) -> impl Future<Output = Result<bool, String>> + Send;
+    fn send(&self, text: &str, steer: bool, cid: &str) -> impl Future<Output = Result<Sent, String>> + Send;
     fn stop(&self) -> impl Future<Output = Result<(), String>> + Send;
     /// Empty an input box a stopped prompt was handed back into.
     fn clear_input(&self, _text: &str) -> impl Future<Output = ()> + Send {
@@ -504,7 +514,7 @@ impl<E: Engine> Actor<E> {
             }
             ClientFrame::Set { what, value } => {
                 let r = self.engine.set(&what, &value).await;
-                self.log.push(format!("chat set {} {what}", self.name));
+                self.log.push(format!("chat set {} {what:?}", self.name));
                 let mut v = json!({"t":"set","ok":r.is_ok()});
                 if let Err(e) = r {
                     v["error"] = json!(e);
@@ -555,8 +565,7 @@ impl<E: Engine> Actor<E> {
     async fn deliver(&mut self, cid: &str, text: &str, steer: bool) -> Value {
         match self.engine.send(text, steer, cid).await {
             Err(e) => ack(cid, "refused", Some(&e)),
-            // A command the engine ran itself: no prompt will ever show it.
-            Ok(true) if text.starts_with('/') => {
+            Ok(Sent::Done) => {
                 self.log.push(format!("chat send {}", self.name));
                 ack(cid, "done", None)
             }
@@ -566,7 +575,7 @@ impl<E: Engine> Actor<E> {
                     text: text.to_string(),
                     at: Instant::now(),
                     uuid: None,
-                    exempt: confirmed,
+                    exempt: confirmed == Sent::Confirmed,
                 });
                 self.log.push(format!("chat send {}", self.name));
                 ack(cid, "sent", None)
@@ -696,13 +705,14 @@ mod tests {
     #[derive(Clone)]
     struct FakeEngine {
         calls: Arc<Mutex<Vec<String>>>,
-        accepts: bool,
+        /// What every send answers.
+        sent: Sent,
         slow: Option<Duration>,
         /// The last event number the source still has.
         has: u64,
     }
     impl Engine for FakeEngine {
-        async fn send(&self, text: &str, steer: bool, _cid: &str) -> Result<bool, String> {
+        async fn send(&self, text: &str, steer: bool, _cid: &str) -> Result<Sent, String> {
             match self.slow {
                 Some(d) => {
                     self.calls.lock().unwrap().push(format!("begin:{text}"));
@@ -711,7 +721,7 @@ mod tests {
                 }
                 None => self.calls.lock().unwrap().push(format!("send:{text}:{steer}")),
             }
-            Ok(self.accepts)
+            Ok(self.sent)
         }
         async fn stop(&self) -> Result<(), String> {
             self.calls.lock().unwrap().push("stop".into());
@@ -740,14 +750,14 @@ mod tests {
 
     fn build(
         slow: Option<Duration>,
-        accepts: bool,
+        sent: Sent,
         notes: Option<Sink>,
         ready: bool,
         has: u64,
     ) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         let calls = Calls::default();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let engine = FakeEngine { calls: calls.clone(), accepts, slow, has };
+        let engine = FakeEngine { calls: calls.clone(), sent, slow, has };
         let log = Arc::new(crate::host::log::LogBuffer::new());
         let hub = Hub::spawn_with("claude", engine, rx, log, "cdash-a".into(), notes);
         if ready {
@@ -756,11 +766,14 @@ mod tests {
         (hub, tx, calls)
     }
     fn rig_with(slow: Option<Duration>) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(slow, false, None, true, u64::MAX)
+        build(slow, Sent::Unconfirmed, None, true, u64::MAX)
     }
     /// A rig whose engine confirms what it accepts, as Codex and OpenCode do.
     fn rig_accepting() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(None, true, None, true, u64::MAX)
+        build(None, Sent::Confirmed, None, true, u64::MAX)
+    }
+    fn rig_sending(sent: Sent) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
+        build(None, sent, None, true, u64::MAX)
     }
     fn rig_noting(ready: bool) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Arc<Ctx>, broadcast::Receiver<Note>) {
         let ctx = crate::chat::claude::tests::ctx_with_path(
@@ -769,7 +782,7 @@ mod tests {
         );
         let notes = ctx.notes.subscribe();
         let sink = Sink { ctx: Arc::clone(&ctx), project: "proj".into() };
-        let (hub, tx, _) = build(None, false, Some(sink), ready, u64::MAX);
+        let (hub, tx, _) = build(None, Sent::Unconfirmed, Some(sink), ready, u64::MAX);
         (hub, tx, ctx, notes)
     }
     fn note_kinds(rx: &mut broadcast::Receiver<Note>) -> Vec<&'static str> {
@@ -783,7 +796,7 @@ mod tests {
     }
     /// The fake re-reads history as `{"type":"user","n":k}`, up to number `has`.
     fn rig_history_to(has: u64) -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
-        build(None, false, None, true, has)
+        build(None, Sent::Unconfirmed, None, true, has)
     }
     fn rig_history() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_history_to(u64::MAX)
@@ -1220,7 +1233,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Watched(Arc<AtomicUsize>);
         impl Engine for Watched {
-            async fn send(&self, _: &str, _: bool, _: &str) -> Result<bool, String> { Ok(false) }
+            async fn send(&self, _: &str, _: bool, _: &str) -> Result<Sent, String> { Ok(Sent::Unconfirmed) }
             async fn stop(&self) -> Result<(), String> { Ok(()) }
             async fn watchers(&self, n: usize) { self.0.store(n, Ordering::Relaxed); }
         }
@@ -1277,9 +1290,16 @@ mod tests {
     }
     #[tokio::test]
     async fn a_command_the_engine_ran_itself_is_done_and_leaves_nothing_pending() {
-        let (hub, _tx, calls) = rig_accepting();
+        let (hub, _tx, calls) = rig_sending(Sent::Done);
         assert_eq!(reply(hub.command(send("c1", "/compact")).await)["status"], "done");
         hub.command(ClientFrame::Stop).await;
         assert_eq!(*calls.lock().unwrap(), ["send:/compact:false"], "nothing pending: Stop interrupts nothing");
+    }
+    #[tokio::test]
+    async fn a_confirmed_path_that_starts_with_a_slash_is_sent_and_stays_pending() {
+        let (hub, _tx, calls) = rig_sending(Sent::Confirmed);
+        assert_eq!(reply(hub.command(send("c1", "/mnt/x")).await)["status"], "sent");
+        hub.command(ClientFrame::Stop).await;
+        assert_eq!(*calls.lock().unwrap(), ["send:/mnt/x:false", "stop"], "still pending: Stop reaches the engine");
     }
 }

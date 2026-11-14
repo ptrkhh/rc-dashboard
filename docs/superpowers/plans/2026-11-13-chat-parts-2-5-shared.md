@@ -99,7 +99,7 @@ support them keep compiling.
 | `answer(&self, id: &str, a: &Answer) -> Result<(), String>` (default `Err("not supported")`) | Part 2 |
 | `set(&self, what: &str, value: &Value) -> Result<(), String>` (default `Err`) | Part 2 |
 | `menu(&self) -> Value` (default `json!({})`) | Part 2 |
-| `send(&self, text: &str, steer: bool, cid: &str, files: &[Attachment]) -> Result<bool, String>`: the signature change, applied to every engine and fake | Part 3 |
+| `send(&self, text: &str, steer: bool, cid: &str, files: &[Attachment]) -> Result<Sent, String>` (`Sent` is `Unconfirmed`, `Confirmed` or `Done`, from Part 2 Task 1): the signature change, applied to every engine and fake | Part 3 |
 | `rewind(&self, uuid: &str, files: bool) -> Result<String, String>`: `Ok` carries the prompt text for the composer (default `Err`) | Part 5 |
 | `rewind_undo(&self) -> Result<(), String>` (default `Err`) | Part 5 |
 | `aside(&self, id: &str, text: &str) -> Result<tokio::sync::mpsc::Receiver<AsideChunk>, String>` (default `Err`) | Part 5 |

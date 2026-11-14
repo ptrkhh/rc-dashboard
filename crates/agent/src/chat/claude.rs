@@ -1,7 +1,7 @@
 //! The Claude engine: tails the session transcript and the session state
 //! file, and types through tmux.
 
-use super::hub::{Engine, EngineMsg};
+use super::hub::{Engine, EngineMsg, Sent};
 use super::tap::Tap;
 use super::tmux_io;
 use crate::collect::ctx::Ctx;
@@ -102,9 +102,9 @@ struct Shared {
 }
 
 impl Engine for ClaudeEngine {
-    async fn send(&self, text: &str, _steer: bool, _cid: &str) -> Result<bool, String> {
+    async fn send(&self, text: &str, _steer: bool, _cid: &str) -> Result<Sent, String> {
         // A paste cannot be confirmed by the TUI; the transcript confirms it.
-        tmux_io::paste(&self.runner, &self.name, text).await.map(|()| false)
+        tmux_io::paste(&self.runner, &self.name, text).await.map(|()| Sent::Unconfirmed)
     }
 
     async fn stop(&self) -> Result<(), String> {

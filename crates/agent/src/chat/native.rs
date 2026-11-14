@@ -2,7 +2,7 @@
 //! The supervisor (`chat-feed.mjs`) numbers events and replays from a
 //! position, so this side only remembers the last position and epoch it saw.
 
-use super::hub::{Engine, EngineMsg};
+use super::hub::{Engine, EngineMsg, Sent};
 use crate::host::log::LogBuffer;
 use serde::Serialize;
 use serde_json::Value;
@@ -35,7 +35,7 @@ struct SendFrame<'a> {
     steer: bool,
 }
 
-type Acks = Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>;
+type Acks = Mutex<HashMap<String, oneshot::Sender<Result<Sent, String>>>>;
 
 struct Shared {
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
@@ -58,7 +58,7 @@ impl NativeEngine {
 }
 
 impl Engine for NativeEngine {
-    async fn send(&self, text: &str, steer: bool, cid: &str) -> Result<bool, String> {
+    async fn send(&self, text: &str, steer: bool, cid: &str) -> Result<Sent, String> {
         let (tx, rx) = oneshot::channel();
         self.shared.acks.lock().unwrap_or_else(|e| e.into_inner()).insert(cid.to_string(), tx);
         let line = serde_json::to_string(&SendFrame { t: "send", cid, text, steer }).map_err(|e| e.to_string())?;
@@ -68,8 +68,7 @@ impl Engine for NativeEngine {
         }
         match tokio::time::timeout(ACK_WAIT, rx).await {
             // The supervisor's own API confirmed it: the hub need not wait for the record.
-            Ok(Ok(Ok(()))) => Ok(true),
-            Ok(Ok(Err(e))) => Err(e),
+            Ok(Ok(r)) => r,
             Ok(Err(_)) => Err("not connected".into()),
             Err(_) => {
                 self.shared.acks.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
@@ -187,7 +186,7 @@ async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, lo
                     let cid = v["cid"].as_str().unwrap_or_default();
                     let waiter = shared.acks.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
                     if let Some(w) = waiter {
-                        let result = if v["ok"] == true { Ok(()) } else { Err(v["error"].as_str().unwrap_or("not sent").to_string()) };
+                        let result = if v["ok"] == true { Ok(if v["done"] == true { Sent::Done } else { Sent::Confirmed }) } else { Err(v["error"].as_str().unwrap_or("not sent").to_string()) };
                         let _ = w.send(result);
                     }
                     continue;
@@ -282,7 +281,12 @@ mod tests {
         assert_eq!(sup.read_line().await, r#"{"t":"send","cid":"c1","text":"hi","steer":true}"#);
         sup.write_line(r#"{"t":"ack","cid":"c1","ok":true}"#).await;
         let (sent, engine) = sending.await.unwrap();
-        assert_eq!(sent, Ok(true), "the supervisor confirmed it");
+        assert_eq!(sent, Ok(Sent::Confirmed), "the supervisor confirmed it");
+        let doing = tokio::spawn(async move { (engine.send("/compact", false, "c3").await, engine) });
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"ack","cid":"c3","ok":true,"done":true}"#).await;
+        let (done, engine) = doing.await.unwrap();
+        assert_eq!(done, Ok(Sent::Done), "the supervisor ran it itself");
         let failing = tokio::spawn(async move { (engine.send("no", false, "c2").await, engine) });
         sup.read_line().await;
         sup.write_line(r#"{"t":"ack","cid":"c2","ok":false,"error":"no turn"}"#).await;
