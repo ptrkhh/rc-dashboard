@@ -277,7 +277,7 @@ test('one failed history read neither leaves chat connecting forever nor freezes
   await f.wait(() => f.native()?.chat_sock);
   const c = await client(f.native().chat_sock, { after: 0, epoch: null });
   await until(() => c.lines.some(l => l.t === 'ready'));
-  await until(() => c.lines.filter(l => l.t === 'ev').length >= 2, 10000);
+  await until(() => c.lines.filter(l => l.t === 'ev').length >= 2);
   assert.deepEqual(c.lines.filter(l => l.t === 'ev').map(l => l.ev.message.content[0].text), ['hello', 'hi there']);
   c.close();
 });
