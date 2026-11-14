@@ -515,7 +515,7 @@ test('chat scripts load before app.js and the chat markup exists', () => {
   for (const f of ['chat/md.js', 'chat/store.js', 'chat/view.js']) {
     assert.ok(at(`<script src="${f}"></script>`) > 0 && at(`<script src="${f}"></script>`) < at('<script src="app.js"></script>'), f);
   }
-  for (const id of ['chat', 'chat-log', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet'])
+  for (const id of ['chat', 'chat-log', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'notify-toggle'])
     assert.ok(html.includes(`id="${id}"`), id);
   assert.ok(/id="chat"[^>]*\shidden/.test(html), 'chat starts hidden');
 });
@@ -617,4 +617,57 @@ test('an untouched page stops reporting focus after two idle minutes', async (t)
   assert.deepEqual(seen, []);
   t.mock.timers.tick(1_100);
   assert.deepEqual(seen, [false]);
+});
+
+function notifyHelpers(extra = {}) {
+  const src = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const slice = src.slice(src.indexOf('function notifyBlocked('), src.indexOf('/* notify wiring */'));
+  const opened = [], toasts = [];
+  const ctx = { atob, URLSearchParams, listed: true, lastRunning: [], opened, toasts,
+    openChat: (s, p) => opened.push([s, p]), toast: m => toasts.push(m), ...extra };
+  runInNewContext(slice, ctx);
+  return ctx;
+}
+test('the switch says why it cannot work here', () => {
+  const { notifyBlocked } = notifyHelpers();
+  const env = o => ({ tauri: false, secure: true, push: true, permission: 'default', ...o });
+  assert.equal(notifyBlocked(env({ secure: false })), 'needs HTTPS or 127.0.0.1');
+  assert.equal(notifyBlocked(env({ push: false })), 'this browser cannot receive push notifications');
+  assert.equal(notifyBlocked(env({ permission: 'denied' })), 'notifications are blocked for this site');
+  assert.equal(notifyBlocked(env({})), '');
+  assert.equal(notifyBlocked(env({ tauri: true, secure: false, push: false })), '', 'the apps use their own channel');
+});
+const plain = o => JSON.parse(JSON.stringify(o)); // objects from the vm context have another prototype
+test('a tapped notification opens its chat, or says the session has ended', () => {
+  const c = notifyHelpers({ lastRunning: [{ name: 'cdash-a', chat: true }] });
+  assert.deepEqual(plain(c.chatFromQuery('?chat=cdash-a&title=proj')), { s: 'cdash-a', p: 'proj' });
+  assert.deepEqual(plain(c.chatFromQuery('?chat=cdash-a&title=a%26b%23c%20d')), { s: 'cdash-a', p: 'a&b#c d' });
+  assert.equal(c.chatFromQuery('?x=1'), null);
+  c.noteOpen('cdash-a', 'proj');
+  c.noteOpen('cdash-gone', 'old');
+  assert.deepEqual(c.opened, [['cdash-a', 'proj']]);
+  assert.deepEqual(c.toasts, ['That session has ended']);
+});
+test('a tap before the first session list waits for it', () => {
+  const c = notifyHelpers({ listed: false, lastRunning: [{ name: 'cdash-a', chat: true }] });
+  c.noteOpen('cdash-a', 'proj');
+  assert.deepEqual(c.opened, []);
+  assert.deepEqual(c.toasts, []);
+  c.listed = true;
+  c.flushOpen();
+  c.flushOpen();
+  assert.deepEqual(c.opened, [['cdash-a', 'proj']], 'opened once, after the list arrived');
+});
+test('a browser subscription follows the agent key and is registered again on each load', async () => {
+  const { syncPush } = notifyHelpers();
+  const posted = [];
+  const sub = k => ({ options: { applicationServerKey: Uint8Array.from([k]).buffer }, toJSON: () => ({ endpoint: 'https://p/' + k }),
+    unsubscribe: async () => { pm.current = null; return true; } });
+  const pm = { current: null, getSubscription: async () => pm.current,
+    subscribe: async o => (pm.current = sub(new Uint8Array(o.applicationServerKey)[0])) };
+  assert.equal(await syncPush(pm, 'AQ', s => posted.push(s)), false, 'not subscribed: nothing to sync');
+  pm.current = sub(1);
+  assert.equal(await syncPush(pm, 'AQ', s => posted.push(s)), true);
+  assert.equal(await syncPush(pm, 'Ag', s => posted.push(s)), true);
+  assert.deepEqual(posted.map(s => s.endpoint), ['https://p/1', 'https://p/2']);
 });

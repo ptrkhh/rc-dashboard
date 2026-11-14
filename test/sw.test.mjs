@@ -83,4 +83,8 @@ test('a tap asks an open dashboard to open the chat, or opens one that will', as
   await tap();
   assert.deepEqual(posted, [{ t: 'open-chat', s: 'cdash-a', p: 'proj' }]);
   assert.equal(note.closed, true);
+  note.data = { s: 'cdash-a', p: 'a&b #c' };
+  w.clients.length = 0;
+  await tap();
+  assert.equal(w.opened.at(-1), '/?chat=cdash-a&title=a%26b%20%23c');
 });

@@ -36,7 +36,7 @@ self.addEventListener('push', e => {
   try { n = e.data && e.data.json(); } catch {}       // unreadable payload: fall through to the generic note
   const known = n && typeof n === 'object' && n.s && n.p;
   e.waitUntil(known
-    ? self.registration.showNotification(n.p, { body: TEXT[n.k] || 'Open the dashboard', tag: n.s, data: { s: n.s, p: n.p }, icon: 'icon-192.png', renotify: true })
+    ? self.registration.showNotification(n.p, { body: (Object.hasOwn(TEXT, n.k) && TEXT[n.k]) || 'Open the dashboard', tag: n.s, data: { s: n.s, p: n.p }, icon: 'icon-192.png', renotify: true })
     : self.registration.showNotification('RC Dashboard', { body: 'Open the dashboard', tag: 'cdash', icon: 'icon-192.png', renotify: true }));
 });
 self.addEventListener('notificationclick', e => {

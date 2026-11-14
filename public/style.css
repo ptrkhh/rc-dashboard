@@ -809,3 +809,5 @@ button, input, select { font: inherit; }
   body.chat-open .cb-select { flex: 1 1 auto; }
   body.chat-open .cb-launch { flex: 1 1 100%; padding: 12px; }
 }
+#notify-toggle[aria-checked="true"] { color: var(--accent); }
+#notify-toggle:disabled { opacity: .5; cursor: not-allowed; }
