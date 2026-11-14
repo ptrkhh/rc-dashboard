@@ -26,24 +26,34 @@ pub struct Tail {
     path: PathBuf,
     offset: u64,
     carry: Vec<u8>,
+    at_end: bool,
 }
 
 impl Tail {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, offset: 0, carry: Vec::new() }
+        Self { path, offset: 0, carry: Vec::new(), at_end: false }
+    }
+
+    /// True when the last poll read to the file's length, or found no file.
+    pub fn at_end(&self) -> bool {
+        self.at_end
     }
 
     pub async fn poll(&mut self) -> std::io::Result<Vec<String>> {
         let len = match tokio::fs::metadata(&self.path).await {
             Ok(m) => m.len(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.at_end = true;
+                return Ok(Vec::new());
+            }
             Err(e) => return Err(e),
         };
         if len < self.offset {
             self.offset = 0;
             self.carry.clear();
         }
-        if len == self.offset {
+        self.at_end = len == self.offset;
+        if self.at_end {
             return Ok(Vec::new());
         }
         let mut f = tokio::fs::File::open(&self.path).await?;
@@ -51,6 +61,7 @@ impl Tail {
         let mut buf = Vec::new();
         f.take(READ_MAX.min(len - self.offset)).read_to_end(&mut buf).await?;
         self.offset += buf.len() as u64;
+        self.at_end = self.offset == len;
         self.carry.extend_from_slice(&buf);
         let Some(last) = self.carry.iter().rposition(|&b| b == b'\n') else { return Ok(Vec::new()) };
         let rest = self.carry.split_off(last + 1);
@@ -136,7 +147,7 @@ async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>)
                     }
                 }
             }
-            if idle_read && !c.ready {
+            if idle_read && c.tail.at_end() && !c.ready {
                 c.ready = true;
                 if tx.send(EngineMsg::Ready).await.is_err() {
                     return;
@@ -317,5 +328,28 @@ pub(crate) mod tests {
         assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: true, .. }));
         make_tmux_fail(&dir);                                      // rewrite the stub so has-session exits 1
         assert!(matches!(next_of(&mut rx, |m| matches!(m, EngineMsg::Ended)).await, EngineMsg::Ended));
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_stops_inside_a_huge_line_is_not_the_end_of_the_file() {
+        let f = tempfile_path("tail-end");
+        std::fs::write(&f, format!("{}\nsmall\n", "x".repeat(9 * 1024 * 1024))).unwrap();
+        let mut t = Tail::new(f.clone());
+        assert!(t.poll().await.unwrap().is_empty());
+        assert!(!t.at_end(), "4 MB read, 5 MB to go");
+        let mut got = Vec::new();
+        for _ in 0..8 { if t.at_end() { break; } got.extend(t.poll().await.unwrap()); }
+        assert!(t.at_end());
+        assert_eq!(got.last().map(String::as_str), Some("small"));
+    }
+
+    #[tokio::test]
+    async fn ready_waits_for_the_end_of_a_transcript_with_a_huge_line() {
+        let (ctx, dir) = fixture_ctx("huge");
+        let blob = format!(r#"{{"type":"api-request-blob","body":"{}"}}"#, "x".repeat(9 * 1024 * 1024));
+        write_transcript(&dir, "sid-1", &format!("{}{blob}\n{}", fixture_lines(1..10), fixture_lines(13..14)));
+        let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        let got = collect_until_ready(&mut rx).await;
+        assert_eq!(got.iter().filter(|m| matches!(m, EngineMsg::Ev(_))).count(), 6, "the prompt after the blob is history");
     }
 }
