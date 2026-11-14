@@ -436,6 +436,39 @@ pub async fn post_logout(
     }
 }
 
+/// A cached chat image by its hash. Only `^[0-9a-f]{64}$` reaches the file
+/// system, and the file is opened with O_NOFOLLOW, so nothing outside
+/// `media_dir` is read even through a planted symlink.
+// ponytail: reads the whole file per request; stream it if large originals are viewed often.
+pub async fn get_chat_media(axum::extract::Path(reference): axum::extract::Path<String>) -> Response {
+    use std::os::unix::fs::OpenOptionsExt;
+    use tokio::io::AsyncReadExt;
+    if reference.len() != 64 || !reference.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    for (mime, ext) in crate::chat::media::IMAGES {
+        let path = crate::chat::media::media_dir().join(format!("{reference}.{ext}"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW);
+        let Ok(file) = tokio::fs::OpenOptions::from(opts).open(path).await else { continue };
+        let mut body = Vec::new();
+        if !file.metadata().await.is_ok_and(|m| m.is_file()) || tokio::io::BufReader::new(file).read_to_end(&mut body).await.is_err() {
+            continue;
+        }
+        return (
+            [
+                ("content-type", mime),
+                ("x-content-type-options", "nosniff"),
+                ("content-security-policy", "default-src 'none'"),
+                ("cache-control", "private, max-age=31536000, immutable"),
+            ],
+            body,
+        )
+            .into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::http::serve::serve;
@@ -447,6 +480,45 @@ mod tests {
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
         std::fs::write(dir.join("history.jsonl"), "").unwrap();
         dir
+    }
+
+    async fn raw_status(addr: std::net::SocketAddr, path: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out.split(' ').nth(1).unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_media_is_served_only_by_hash_and_only_as_an_image() {
+        let b = serve(cfg_for(tempdir("media"))).await.unwrap();
+        let png = [crate::chat::media::tests::PNG, b"route"].concat();
+        let r = crate::chat::media::stash(&png, "image/png").unwrap();
+        let res = reqwest::get(format!("http://{}/api/chat/media/{r}", b.addr)).await.unwrap();
+        assert_eq!(res.status(), 200);
+        for (h, v) in [("content-type", "image/png"), ("x-content-type-options", "nosniff"),
+            ("content-security-policy", "default-src 'none'"), ("cache-control", "private, max-age=31536000, immutable")] {
+            assert_eq!(res.headers()[h], v, "{h}");
+        }
+        assert_eq!(res.bytes().await.unwrap().as_ref(), png.as_slice());
+        for bad in ["..".to_string(), "%2e%2e".into(), r.to_uppercase(), r[..63].into(), format!("{r}0"), "..%2f..%2fetc%2fpasswd".into()] {
+            assert_eq!(raw_status(b.addr, &format!("/api/chat/media/{bad}")).await, 400, "{bad}");
+        }
+        assert_eq!(raw_status(b.addr, &format!("/api/chat/media/{}", "0".repeat(64))).await, 404);
+    }
+
+    #[tokio::test]
+    async fn chat_media_never_follows_a_symlink_out_of_the_cache() {
+        let b = serve(cfg_for(tempdir("media-link"))).await.unwrap();
+        let secret = tempdir("media-secret").join("secret.png");
+        std::fs::write(&secret, b"secret").unwrap();
+        let r = "1".repeat(64);
+        let dir = crate::chat::media::media_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join(format!("{r}.png"))).unwrap();
+        assert_eq!(raw_status(b.addr, &format!("/api/chat/media/{r}")).await, 404);
     }
 
     #[tokio::test]

@@ -43,6 +43,7 @@ crate::guarded_routes! {
     get "/api/hostinfo" => routes::get_hostinfo,
     get "/api/term" => routes::get_term,
     get "/api/chat" => routes::get_chat,
+    get "/api/chat/media/{ref}" => routes::get_chat_media,
     get "/api/models" => routes::get_models,
     get "/api/notify" => routes::get_notify,
     get "/api/push/key" => routes::get_push_key,
