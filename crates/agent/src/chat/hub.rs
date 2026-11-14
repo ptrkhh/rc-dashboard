@@ -31,7 +31,7 @@ const TICK: Duration = Duration::from_millis(250);
 pub enum EngineMsg {
     Ev(Value),
     Delta { id: String, text: String },
-    Status { working: bool, waiting: bool },
+    Status { working: bool, waiting: bool, waiting_for: Option<String> },
     /// History has been replayed; subscribers may be answered.
     Ready,
     /// The conversation in the pane changed; positions restart at 1.
@@ -89,6 +89,7 @@ impl Hub {
             queue: Queue::default(),
             working: false,
             waiting: false,
+            waiting_for: None,
             ended: false,
             unreadable: false,
             ready: false,
@@ -177,6 +178,7 @@ struct Actor<E> {
     queue: Queue,
     working: bool,
     waiting: bool,
+    waiting_for: Option<String>,
     ended: bool,
     unreadable: bool,
     ready: bool,
@@ -230,7 +232,7 @@ impl<E: Engine> Actor<E> {
 
     fn state(&self) -> Value {
         let held: Vec<Value> = self.queue.list().iter().map(|h| json!({"id":h.id,"text":h.text})).collect();
-        json!({"t":"state","working":self.working,"waiting":self.waiting,"ended":self.ended,"unreadable":self.unreadable,"held":held})
+        json!({"t":"state","working":self.working,"waiting":self.waiting,"waiting_for":self.waiting_for,"ended":self.ended,"unreadable":self.unreadable,"held":held})
     }
 
     fn publish_state(&mut self) {
@@ -276,9 +278,10 @@ impl<E: Engine> Actor<E> {
                 self.event(ev)
             }
             EngineMsg::Delta { id, text } => self.broadcast(json!({"t":"delta","id":id,"text":text})),
-            EngineMsg::Status { working, waiting } => {
+            EngineMsg::Status { working, waiting, waiting_for } => {
                 self.working = working;
                 self.waiting = waiting;
+                self.waiting_for = waiting_for;
             }
             EngineMsg::Ready => {
                 self.ready = true;
@@ -531,7 +534,7 @@ mod tests {
         build(None, true)
     }
     fn engine_status(working: bool, waiting: bool) -> EngineMsg {
-        EngineMsg::Status { working, waiting }
+        EngineMsg::Status { working, waiting, waiting_for: None }
     }
     fn rig() -> (Hub, tokio::sync::mpsc::Sender<EngineMsg>, Calls) {
         rig_with(None)
@@ -626,7 +629,7 @@ mod tests {
         hub.command(send("c3", "third")).await;
         tx.send(EngineMsg::Ev(answer("k1"))).await.unwrap();
         tx.send(EngineMsg::Ev(json!({"type":"result","subtype":"success"}))).await.unwrap();
-        tx.send(EngineMsg::Status { working: false, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
         settle().await;
         assert_eq!(*calls.lock().unwrap(), ["send:first:false", "send:second:false"], "one per turn");
     }
@@ -635,12 +638,12 @@ mod tests {
         let (hub, tx, calls) = rig();
         let mut sub = hub.subscribe(None, None).await.unwrap();
         hub.command(send("c1", "first")).await;
-        tx.send(EngineMsg::Status { working: true, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
         settle().await;
         hub.command(send("c2", "second")).await;
         hub.command(ClientFrame::Stop).await;
-        tx.send(EngineMsg::Status { working: false, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
         tokio::time::sleep(STOP_SETTLE + Duration::from_millis(300)).await;
         assert_eq!(*calls.lock().unwrap(), ["send:first:false", "stop", "clear:first"]);
         let f = frames(&mut sub);
@@ -654,13 +657,13 @@ mod tests {
     #[tokio::test]
     async fn an_interrupt_from_any_door_stops_the_queue_and_send_now_steers() {
         let (hub, tx, calls) = rig();
-        tx.send(EngineMsg::Status { working: true, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
         settle().await;
         hub.command(send("c1", "held one")).await;
         hub.command(send("c2", "held two")).await;
         hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h2".into() }).await;
         tx.send(EngineMsg::Ev(json!({"type":"result","subtype":"interrupted"}))).await.unwrap();
-        tx.send(EngineMsg::Status { working: false, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
         settle().await;
         assert_eq!(*calls.lock().unwrap(), ["send:held two:true"], "steered at once; the other one stays held");
         hub.command(ClientFrame::Held { op: HeldOp::Remove, id: "h1".into() }).await;
@@ -683,13 +686,22 @@ mod tests {
         assert!(frames(&mut sub).iter().any(|f| f["t"] == "ack" && f["cid"] == "c3" && f["status"] == "unconfirmed"));
     }
     #[tokio::test]
+    async fn the_state_frame_says_what_the_session_waits_for() {
+        let (hub, tx, _) = rig();
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(sub.backlog.last().unwrap()).unwrap()["waiting_for"], Value::Null);
+        tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: Some("dialog open".into()) }).await.unwrap();
+        settle().await;
+        assert_eq!(frames(&mut sub).last().unwrap()["waiting_for"], "dialog open");
+    }
+    #[tokio::test]
     async fn waiting_and_ended_sessions_refuse_sends_and_ended_reports_held_messages_as_not_sent() {
         let (hub, tx, calls) = rig();
         let mut sub = hub.subscribe(None, None).await.unwrap();
-        tx.send(EngineMsg::Status { working: true, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
         settle().await;
         hub.command(send("c1", "held")).await;
-        tx.send(EngineMsg::Status { working: false, waiting: true }).await.unwrap();
+        tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: None }).await.unwrap();
         settle().await;
         assert_eq!(ack_of(hub.command(send("c2", "x")).await)["status"], "refused");
         assert!(calls.lock().unwrap().is_empty(), "nothing is typed into a dialog");
@@ -740,10 +752,10 @@ mod tests {
     async fn send_now_never_types_into_a_dialog_or_an_unreadable_session() {
         let (hub, tx, calls) = rig();
         let mut sub = hub.subscribe(None, None).await.unwrap();
-        tx.send(EngineMsg::Status { working: true, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
         settle().await;
         hub.command(send("c1", "held")).await;
-        tx.send(EngineMsg::Status { working: false, waiting: true }).await.unwrap();
+        tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: None }).await.unwrap();
         settle().await;
         hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h1".into() }).await;
         tx.send(EngineMsg::Unreadable).await.unwrap();
@@ -759,7 +771,7 @@ mod tests {
     async fn a_message_claude_queued_carries_its_client_id() {
         let (hub, tx, _) = rig();
         let mut sub = hub.subscribe(None, None).await.unwrap();
-        tx.send(EngineMsg::Status { working: true, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
         settle().await;
         hub.command(send("c1", "later")).await;
         hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h1".into() }).await;
@@ -772,11 +784,11 @@ mod tests {
     async fn nothing_is_pasted_while_a_stopped_prompt_may_still_be_handed_back() {
         let (hub, tx, calls) = rig();
         hub.command(send("c1", "first")).await;
-        tx.send(EngineMsg::Status { working: true, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
         settle().await;
         hub.command(ClientFrame::Stop).await;
-        tx.send(EngineMsg::Status { working: false, waiting: false }).await.unwrap();
+        tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
         settle().await;
         let early = ack_of(hub.command(send("c2", "second")).await);
         assert_eq!((early["status"].as_str(), early["error"].as_str()), (Some("refused"), Some("stopping; send again in a moment")));

@@ -143,6 +143,7 @@ async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, lo
                 Some("state") => EngineMsg::Status {
                     working: v["working"].as_bool().unwrap_or(false),
                     waiting: v["waiting"].as_bool().unwrap_or(false),
+                    waiting_for: None,
                 },
                 Some("ready") => EngineMsg::Ready,
                 Some("delta") => EngineMsg::Delta {
@@ -230,7 +231,7 @@ mod tests {
         sup.write_line(r#"{"t":"ready"}"#).await;
         sup.write_line(r#"{"t":"delta","id":"m1","text":"Hi"}"#).await;
         assert!(matches!(rx.recv().await, Some(EngineMsg::Ev(_))));
-        assert!(matches!(rx.recv().await, Some(EngineMsg::Status { working: true, waiting: false })));
+        assert!(matches!(rx.recv().await, Some(EngineMsg::Status { working: true, waiting: false, waiting_for: None })));
         assert!(matches!(rx.recv().await, Some(EngineMsg::Ready)));
         assert!(matches!(rx.recv().await, Some(EngineMsg::Delta { .. })));
         sup.drop_connection().await;

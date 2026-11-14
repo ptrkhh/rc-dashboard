@@ -113,7 +113,7 @@ async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>)
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut conv: Option<Conv> = None;
-    let mut last: Option<(bool, bool)> = None;
+    let mut last: Option<(bool, bool, Option<String>)> = None;
     let mut blind_sent = false;
     let target = format!("={name}");
     for n in 1u64.. {
@@ -158,10 +158,13 @@ async fn run(ctx: Arc<Ctx>, name: String, pid: i32, tx: mpsc::Sender<EngineMsg>)
                     Some(s) => s == "busy",
                     None => c.tap.turn_open(),
                 };
-                let now = (working, status.as_deref() == Some("waiting"));
-                if last != Some(now) {
+                let waiting = status.as_deref() == Some("waiting");
+                let waiting_for = file.as_ref().and_then(|f| f.waiting_for.clone()).filter(|_| waiting);
+                let now = (working, waiting, waiting_for);
+                if last.as_ref() != Some(&now) {
+                    let (working, waiting, waiting_for) = now.clone();
                     last = Some(now);
-                    if tx.send(EngineMsg::Status { working: now.0, waiting: now.1 }).await.is_err() {
+                    if tx.send(EngineMsg::Status { working, waiting, waiting_for }).await.is_err() {
                         return;
                     }
                 }
@@ -311,9 +314,11 @@ pub(crate) mod tests {
         let (_engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         let got = collect_until_ready(&mut rx).await;              // everything up to and including Ready
         assert_eq!(got.iter().filter(|m| matches!(m, EngineMsg::Ev(_))).count(), 5);
-        assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: true, waiting: false }));
+        assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: true, waiting: false, waiting_for: None }));
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"dialog open"}"#);
-        assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: false, waiting: true }));
+        assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: false, waiting: true, waiting_for: Some(ref w) } if w == "dialog open"));
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy","waitingFor":"dialog open"}"#);
+        assert!(matches!(next_status(&mut rx).await, EngineMsg::Status { working: true, waiting_for: None, .. }), "a stale waitingFor outside waiting is ignored");
         write_transcript(&dir, "sid-2", &fixture_lines(2..3));
         write_session(&dir, r#"{"sessionId":"sid-2","cwd":"/proj","status":"idle"}"#);
         assert!(matches!(next_of(&mut rx, |m| matches!(m, EngineMsg::Reset)).await, EngineMsg::Reset));
