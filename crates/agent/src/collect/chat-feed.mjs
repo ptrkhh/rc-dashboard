@@ -10,6 +10,7 @@ import { createHash, randomBytes } from 'node:crypto';
 const LINE_MAX = 64 * 1024;
 
 // Twins of crates/agent/src/chat/media.rs: with_attached, split_attached, sniff, stash.
+export const MAX_MEDIA = 20 * 1024 * 1024; // media::MAX_UPLOAD
 const IMAGES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
 
 export function withAttached(text, paths) {
@@ -41,7 +42,7 @@ export function sniffImage(b) {
 // absolute dir or the bytes are not an image. A rewrite only refreshes the age.
 export async function stashMedia(dir, bytes) {
   const mime = sniffImage(bytes);
-  if (!mime || !dir || !isAbsolute(dir)) return null;
+  if (!mime || !dir || !isAbsolute(dir) || bytes.length > MAX_MEDIA) return null;
   const ref = createHash('sha256').update(bytes).digest('hex');
   const target = join(dir, `${ref}.${IMAGES[mime]}`);
   const now = new Date();

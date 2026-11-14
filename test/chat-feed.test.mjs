@@ -5,7 +5,7 @@ import { mkdtemp, stat, rm, readdir, utimes } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ChatFeed, withAttached, splitAttached, sniffImage, stashMedia } from '../crates/agent/src/collect/chat-feed.mjs';
+import { ChatFeed, withAttached, splitAttached, sniffImage, stashMedia, MAX_MEDIA } from '../crates/agent/src/collect/chat-feed.mjs';
 
 const user = (uuid, text) => ({ type: 'user', uuid, message: { role: 'user', content: [{ type: 'text', text }] } });
 async function client(path, first) {                              // returns { lines, write, close }
@@ -152,6 +152,7 @@ test('images are stored once by content in a private folder, and nothing else is
   assert.deepEqual(await readdir(dir), [a.ref + '.png'], 'one file, no temp left');
   assert.equal(await stashMedia(dir, Buffer.from('%PDF-1.7')), null);
   assert.equal(await stashMedia(undefined, PNG), null, 'no folder from the agent, no media');
+  assert.equal(await stashMedia(dir, Buffer.concat([PNG, Buffer.alloc(MAX_MEDIA)])), null, 'over 20 MB is not kept');
   assert.equal(sniffImage(Buffer.from('RIFF\0\0\0\0WEBPVP8 ')), 'image/webp');
 });
 test('a send line hands its attachments to the supervisor', async t => {
