@@ -785,6 +785,24 @@ mod tests {
         assert_eq!(ack_of(hub.command(send("c3", "third")).await)["status"], "sent");
         assert_eq!(*calls.lock().unwrap(), ["send:first:false", "stop", "clear:first", "send:third:false"]);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_marker_inside_the_quiet_window_is_not_a_returned_prompt() {
+        let (hub, tx, calls) = rig();
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        hub.command(send("c1", "first")).await;
+        tx.send(engine_status(true, false)).await.unwrap();
+        tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
+        settle().await;
+        hub.command(ClientFrame::Stop).await;
+        tx.send(engine_status(false, false)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(EngineMsg::Ev(json!({"type":"result","subtype":"interrupted"}))).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(*calls.lock().unwrap(), ["send:first:false", "stop"], "the prompt was taken, nothing is cleared");
+        assert!(!frames(&mut sub).iter().any(|f| f["status"] == "returned"), "no returned ack");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_stop_settles_half_a_second_after_the_record_goes_quiet() {
         let (hub, tx, calls) = rig();
@@ -799,6 +817,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(*calls.lock().unwrap(), ["send:first:false", "stop", "clear:first"]);
     }
+
     #[tokio::test(start_paused = true)]
     async fn a_record_that_keeps_growing_settles_at_the_ceiling() {
         let (hub, tx, calls) = rig();
