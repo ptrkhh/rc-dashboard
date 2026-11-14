@@ -449,7 +449,7 @@ pub async fn get_chat_media(axum::extract::Path(reference): axum::extract::Path<
     for (mime, ext) in crate::chat::media::IMAGES {
         let path = crate::chat::media::media_dir().join(format!("{reference}.{ext}"));
         let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).custom_flags(libc::O_NOFOLLOW);
+        opts.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let Ok(file) = tokio::fs::OpenOptions::from(opts).open(path).await else { continue };
         let mut body = Vec::new();
         if !file.metadata().await.is_ok_and(|m| m.is_file()) || tokio::io::BufReader::new(file).read_to_end(&mut body).await.is_err() {
