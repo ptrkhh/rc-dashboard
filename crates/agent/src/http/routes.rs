@@ -194,6 +194,68 @@ pub async fn post_pin(
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
+fn push_failed(e: std::io::Error) -> ApiError {
+    ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("Could not read cdash-push.json: {e}") }
+}
+
+pub async fn get_push_key(State(ctx): State<Arc<Ctx>>) -> Result<Response, ApiError> {
+    let key = crate::chat::push::key(&ctx).await.map_err(push_failed)?;
+    Ok(Json(serde_json::json!({ "key": key })).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct PushKeys {
+    #[serde(default)]
+    pub p256dh: String,
+    #[serde(default)]
+    pub auth: String,
+}
+
+#[derive(Deserialize)]
+pub struct SubscribeBody {
+    #[serde(default)]
+    pub endpoint: String,
+    pub keys: Option<PushKeys>,
+}
+
+pub async fn post_push_subscribe(
+    State(ctx): State<Arc<Ctx>>,
+    Json(body): Json<SubscribeBody>,
+) -> Result<Response, ApiError> {
+    use crate::chat::ece::unb64;
+    let bad = |m: &str| ApiError { status: StatusCode::BAD_REQUEST, message: m.to_string() };
+    let keys = body.keys.ok_or_else(|| bad("missing keys"))?;
+    if !body.endpoint.starts_with("https://") || body.endpoint.len() > 2048 {
+        return Err(bad("bad endpoint"));
+    }
+    if !unb64(&keys.p256dh).is_some_and(|k| k.len() == 65 && k[0] == 4) {
+        return Err(bad("bad p256dh"));
+    }
+    if unb64(&keys.auth).is_none_or(|k| k.len() != 16) {
+        return Err(bad("bad auth"));
+    }
+    let added = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let sub = crate::chat::push::Sub { endpoint: body.endpoint, p256dh: keys.p256dh, auth: keys.auth, added };
+    crate::chat::push::add(&ctx, sub).await.map_err(push_failed)?;
+    Ok(Json(serde_json::json!({ "ok": true })).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct UnsubscribeBody {
+    #[serde(default)]
+    pub endpoint: String,
+}
+
+pub async fn post_push_unsubscribe(
+    State(ctx): State<Arc<Ctx>>,
+    Json(body): Json<UnsubscribeBody>,
+) -> Result<Response, ApiError> {
+    crate::chat::push::remove(&ctx, &body.endpoint).await.map_err(push_failed)?;
+    Ok(Json(serde_json::json!({ "ok": true })).into_response())
+}
+
 pub async fn post_launch(
     State(ctx): State<Arc<Ctx>>,
     Json(body): Json<LaunchBody>,
@@ -404,6 +466,49 @@ mod tests {
         assert_eq!(saved.len(), 2);
         assert!(saved.contains(&"01234567-1234-1234-1234-0123456789ab".into()));
         assert!(saved.contains(&"01234567-1234-1234-1234-0123456789ac".into()));
+    }
+
+    async fn post(b: &crate::http::serve::Bound, path: &str, body: &str) -> u16 {
+        http_post(&format!("http://{}{path}", b.addr), body).await.0
+    }
+
+    #[tokio::test]
+    async fn the_push_key_is_made_once_kept_private_and_names_no_one() {
+        let dir = tempdir("push-key");
+        let b = serve(cfg_for(dir.clone())).await.unwrap();
+        let url = format!("http://{}/api/push/key", b.addr);
+        let (k1, k2) = (reqwest_get(&url).await, reqwest_get(&url).await);
+        assert_eq!(k1, k2);
+        let key: serde_json::Value = serde_json::from_str(&k1).unwrap();
+        assert_eq!(crate::chat::ece::unb64(key["key"].as_str().unwrap()).unwrap().len(), 65);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(dir.join("cdash-push.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!std::fs::read_to_string(dir.join("cdash-push.json")).unwrap().contains('@'));
+    }
+
+    #[tokio::test]
+    async fn subscriptions_are_checked_kept_once_per_device_and_removed() {
+        let b = serve(cfg_for(tempdir("push-subs"))).await.unwrap();
+        let (p, a) = (crate::chat::ece::b64(&[4u8; 65]), crate::chat::ece::b64(&[1u8; 16]));
+        let sub = |ep: &str, key: &str| format!(r#"{{"endpoint":"{ep}","keys":{{"p256dh":"{key}","auth":"{a}"}}}}"#);
+        assert_eq!(post(&b, "/api/push/subscribe", &sub("http://push.example/x", &p)).await, 400, "push services are https");
+        assert_eq!(post(&b, "/api/push/subscribe", &sub("https://push.example/x", "AAAA")).await, 400, "not a P-256 point");
+        assert_eq!(post(&b, "/api/push/subscribe", &sub("https://push.example/x", &p)).await, 200);
+        assert_eq!(post(&b, "/api/push/subscribe", &sub("https://push.example/x", &p)).await, 200);
+        assert_eq!(crate::chat::push::subscriptions(&b.ctx).await.len(), 1);
+        assert_eq!(post(&b, "/api/push/unsubscribe", r#"{"endpoint":"https://push.example/x"}"#).await, 200);
+        assert!(crate::chat::push::subscriptions(&b.ctx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_push_file_is_reported_and_left_alone() {
+        let dir = tempdir("push-corrupt");
+        std::fs::write(dir.join("cdash-push.json"), "{not json").unwrap();
+        let b = serve(cfg_for(dir.clone())).await.unwrap();
+        let (status, body) = http_get(&format!("http://{}/api/push/key", b.addr)).await;
+        assert_eq!(status, 500);
+        assert!(body.contains("cdash-push.json"));
+        assert_eq!(std::fs::read_to_string(dir.join("cdash-push.json")).unwrap(), "{not json", "a new key would orphan every device");
     }
 
     #[tokio::test]

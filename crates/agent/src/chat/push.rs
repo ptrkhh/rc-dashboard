@@ -1,6 +1,10 @@
-//! Web Push: the VAPID identity (RFC 8292).
+//! Web Push: the VAPID identity (RFC 8292) and the subscription store.
 
 use super::ece::b64;
+use crate::collect::ctx::Ctx;
+use crate::collect::fsio::write_atomic_private;
+use serde::{Deserialize, Serialize};
+use std::io;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
@@ -49,6 +53,87 @@ impl Vapid {
 
     pub fn authorization(&self, endpoint: &str, now: u64) -> Result<String, String> {
         Ok(format!("vapid t={}, k={}", self.jwt(endpoint, now)?, self.public_b64()))
+    }
+}
+
+/// One browser or app registration (`PushSubscription.toJSON()` fields).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Sub {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub added: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Store {
+    vapid: String,
+    subs: Vec<Sub>,
+}
+
+/// Held across every read-modify-write of `cdash-push.json`.
+static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn file(ctx: &Ctx) -> std::path::PathBuf {
+    ctx.claude_dir.join("cdash-push.json")
+}
+
+/// The stored state, or a fresh one (new key, no subscriptions) when the file
+/// is missing. An unreadable or unparsable file is an error, never replaced:
+/// a new key would orphan every subscribed device. Caller holds `LOCK`.
+async fn load(ctx: &Ctx) -> io::Result<(Store, Vapid)> {
+    let text = match tokio::fs::read_to_string(file(ctx)).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let v = Vapid::generate().map_err(io::Error::other)?;
+            let store = Store { vapid: v.pkcs8_b64(), subs: vec![] };
+            save(ctx, &store).await?;
+            return Ok((store, v));
+        }
+        Err(e) => return Err(e),
+    };
+    let store: Store = serde_json::from_str(&text).map_err(io::Error::other)?;
+    let v = Vapid::from_pkcs8_b64(&store.vapid).map_err(io::Error::other)?;
+    Ok((store, v))
+}
+
+async fn save(ctx: &Ctx, store: &Store) -> io::Result<()> {
+    write_atomic_private(&file(ctx), &serde_json::to_string(store).map_err(io::Error::other)?).await
+}
+
+/// The signing key, made on first use. Shared by `key` and `send`.
+pub async fn vapid(ctx: &Ctx) -> io::Result<Vapid> {
+    let _g = LOCK.lock().await;
+    Ok(load(ctx).await?.1)
+}
+
+/// The public key a client subscribes with.
+pub async fn key(ctx: &Ctx) -> io::Result<String> {
+    Ok(vapid(ctx).await?.public_b64())
+}
+
+/// Upsert by endpoint: one entry per device.
+pub async fn add(ctx: &Ctx, sub: Sub) -> io::Result<()> {
+    let _g = LOCK.lock().await;
+    let (mut store, _) = load(ctx).await?;
+    store.subs.retain(|s| s.endpoint != sub.endpoint);
+    store.subs.push(sub);
+    save(ctx, &store).await
+}
+
+pub async fn remove(ctx: &Ctx, endpoint: &str) -> io::Result<()> {
+    let _g = LOCK.lock().await;
+    let (mut store, _) = load(ctx).await?;
+    store.subs.retain(|s| s.endpoint != endpoint);
+    save(ctx, &store).await
+}
+
+/// Empty when the file is missing or unreadable.
+pub async fn subscriptions(ctx: &Ctx) -> Vec<Sub> {
+    let _g = LOCK.lock().await;
+    match tokio::fs::read_to_string(file(ctx)).await {
+        Ok(t) => serde_json::from_str::<Store>(&t).map(|s| s.subs).unwrap_or_default(),
+        Err(_) => vec![],
     }
 }
 
