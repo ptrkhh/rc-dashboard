@@ -161,6 +161,7 @@ The desktop and Android apps’ saved remote profiles currently support **auth: 
 |---|---|---|
 | **PORT** | 23274 | Listening port. Set to 0 to choose an available port. |
 | **CDASH_BIND** | 127.0.0.1 | Listen address. Network access requires an explicit bind address. |
+| **CDASH_HOOK_PORT** | 23275 | Loopback port where Claude Code sessions send questions and plan approvals to chat. If another agent holds it, new sessions answer in Terminal. |
 | **CLAUDE_DIR** | ~/.claude | Claude configuration and project directory. |
 | **DISK_EXTRA** | — | Optional second disk mount to report, such as /mnt/d. |
 | **ANTHROPIC_BASE_URL** | https://api.anthropic.com | HTTPS base URL for Claude usage lookup. |

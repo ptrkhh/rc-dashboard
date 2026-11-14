@@ -5,6 +5,7 @@
 pub mod asks;
 pub mod claude;
 pub mod ece;
+pub mod hook;
 pub mod hub;
 pub mod native;
 pub mod notify;

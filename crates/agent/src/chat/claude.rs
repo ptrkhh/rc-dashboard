@@ -101,9 +101,21 @@ pub struct Live {
     pub plan: Option<bool>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The loop's wake-up, so a card shows without waiting out a parked tick.
+    wake: Arc<Notify>,
 }
 
 pub type LiveRef = Arc<Mutex<Live>>;
+
+impl Live {
+    /// Holds a hook request as a card; the receiver yields the decision.
+    pub fn hold(&mut self, req: &Value, now: std::time::Instant) -> Option<tokio::sync::oneshot::Receiver<Value>> {
+        self.plan = Some(req["permission_mode"] == "plan");
+        let rx = self.cards.add(req, now)?;
+        self.wake.notify_one();
+        Some(rx)
+    }
+}
 
 fn lock(live: &LiveRef) -> std::sync::MutexGuard<'_, Live> {
     live.lock().unwrap_or_else(|e| e.into_inner())
@@ -122,7 +134,7 @@ pub fn model_effort(line: &str) -> Option<(String, Option<String>)> {
 struct Shared {
     /// Clients attached to the hub; the loop parks while none are.
     watchers: AtomicUsize,
-    wake: Notify,
+    wake: Arc<Notify>,
     /// Transcript polls the loop made.
     #[cfg(test)]
     polls: AtomicUsize,
@@ -202,7 +214,7 @@ pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Rece
     let (tx, rx) = mpsc::channel(256);
     let transcript = Arc::new(Mutex::new(None));
     let shared = Arc::new(Shared::default());
-    let live = LiveRef::default();
+    let live = Arc::new(Mutex::new(Live { wake: Arc::clone(&shared.wake), ..Live::default() }));
     let engine = ClaudeEngine {
         ctx: Arc::clone(&ctx),
         pid,
@@ -627,6 +639,20 @@ pub(crate) mod tests {
             r#"{"type":"assistant","uuid":"k9","isSidechain":true,"effort":"max","message":{"id":"s9","model":"claude-fable-5-2","role":"assistant","content":[{"type":"text","text":"sub"}]}}"#, "\n"));
         let EngineMsg::Settings(s) = next_of(&mut rx, |m| matches!(m, EngineMsg::Settings(s) if s["model"] == "claude-haiku-5-5")).await else { unreachable!() };
         assert_eq!(s, json!({"model":"claude-haiku-5-5","effort":"low","plan":null,"agent":null,"variant":null}), "a subagent's reply is not the session's model");
+    }
+    #[tokio::test]
+    async fn a_card_held_while_the_loop_is_parked_is_published_at_once() {
+        let (ctx, dir) = fixture_ctx("park-card");
+        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        tokio::time::sleep(Duration::from_millis(500)).await; // the pass after Ready parks
+        assert_eq!(polls_in(&engine, 1200).await, 0, "parked");
+        let _hook = engine.live().lock().unwrap().hold(&plan_request("p1", "# P"), std::time::Instant::now()).unwrap();
+        let shown = tokio::time::timeout(Duration::from_millis(150), next_of(&mut rx, |m| matches!(m, EngineMsg::Asks(a) if a.len() == 1))).await;
+        assert!(shown.is_ok(), "not up to a slow wait later");
+        let EngineMsg::Settings(s) = next_of(&mut rx, |m| matches!(m, EngineMsg::Settings(_))).await else { unreachable!() };
+        assert_eq!(s["plan"], true, "the request's permission mode");
     }
     #[tokio::test]
     async fn a_chat_answer_resolves_the_held_hook_and_an_approved_plan_leaves_plan_mode() {

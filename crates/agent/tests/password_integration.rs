@@ -40,6 +40,7 @@ fn password_cfg(dir: PathBuf, guards: Vec<GuardKind>, token: Option<String>) -> 
             AuthConfig::build(guards, token, "X-Forwarded-Email".into(), vec![]).unwrap(),
         ),
         password: Some(PasswordState::new(policy, DEFAULT_PENDING_MAX)),
+        hook_port: None,
     }
 }
 

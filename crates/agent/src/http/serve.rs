@@ -18,6 +18,9 @@ use std::sync::Arc;
 /// random client socket, and clear of 3000/5000/8000/8080/8888, where every
 /// other dev server already lives. `PORT` overrides it.
 pub const DEFAULT_PORT: u16 = 23274;
+/// The next number up: where Claude's permission hook posts. Loopback only,
+/// and fixed, because panes outlive the agent. `CDASH_HOOK_PORT` overrides it.
+pub const DEFAULT_HOOK_PORT: u16 = 23275;
 
 pub struct Config {
     pub bind: IpAddr,
@@ -28,6 +31,8 @@ pub struct Config {
     /// Present exactly when `CDASH_AUTH` includes `password`. Built at boot so
     /// a misconfiguration is refused before anything listens.
     pub password: Option<crate::auth::login::PasswordState>,
+    /// Where the hook listener binds on 127.0.0.1; `None` runs none.
+    pub hook_port: Option<u16>,
 }
 
 crate::guarded_routes! {
@@ -103,6 +108,10 @@ impl Config {
                 .unwrap_or_else(|_| PathBuf::from(&home).join(".claude")),
             disk_extra: std::env::var("DISK_EXTRA").ok().filter(|s| !s.is_empty()),
             auth: Arc::new(auth),
+            hook_port: match std::env::var("CDASH_HOOK_PORT") {
+                Err(_) => Some(DEFAULT_HOOK_PORT),
+                Ok(p) => Some(p.parse().map_err(|_| format!("CDASH_HOOK_PORT: not a port number: {p:?}"))?),
+            },
         })
     }
 }
@@ -214,16 +223,22 @@ pub struct Bound {
     pub ctx: Arc<Ctx>,
     stop: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
+    /// The hook listener's serving task, while it runs.
+    hook: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Bound {
-    /// Fire the graceful-shutdown trigger and wait for the serving task to
-    /// drain and exit, after which the port is released. The standalone binary
-    /// never calls this; it exists so an in-process embedder can tear the
-    /// server down.
+    /// Fire the graceful-shutdown trigger and wait for the serving tasks to
+    /// drain and exit, after which both ports are released. Held hooks are
+    /// answered empty on the trigger, so this stays prompt. The standalone
+    /// binary never calls this; it exists so an in-process embedder can tear
+    /// the server down.
     pub async fn stop(self) {
         let _ = self.stop.send(true);
         let _ = self.task.await;
+        if let Some(hook) = self.hook {
+            let _ = hook.await;
+        }
     }
 
     /// Whether the serving task has ended. An embedder that caches `addr` needs
@@ -314,8 +329,26 @@ pub async fn serve(cfg: Config) -> std::io::Result<Bound> {
     let listener = tokio::net::TcpListener::bind((cfg.bind, cfg.port)).await?;
     let addr = listener.local_addr()?;
 
+    // A taken hook port is not a boot error: Claude then launches without the hook.
+    let hook_listener = match cfg.hook_port {
+        Some(port) => Some(tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await.map_err(|e| (port, e))),
+        None => None,
+    };
+
     let h = host::init::init().await;
-    let ctx = Arc::new(Ctx::new(h, cfg.claude_dir, cfg.disk_extra));
+    let mut ctx = Ctx::new(h, cfg.claude_dir, cfg.disk_extra);
+    let hook_listener = match hook_listener {
+        Some(Ok(l)) => {
+            ctx.hook_port = Some(l.local_addr()?.port());
+            Some(l)
+        }
+        Some(Err((port, e))) => {
+            ctx.host.log.push(format!("hook listener off: 127.0.0.1:{port}: {e}; Claude sessions launch without the hook"));
+            None
+        }
+        None => None,
+    };
+    let ctx = Arc::new(ctx);
     if let Some(pw) = cfg.password.clone() {
         let _ = ctx.password.set(pw);
     }
@@ -327,6 +360,18 @@ pub async fn serve(cfg: Config) -> std::io::Result<Bound> {
     let app = router(Arc::clone(&ctx), Arc::clone(&cfg.auth), cfg.password.clone(), cf)
         .layer(axum::Extension(stop_rx.clone()));
     crate::chat::notify::spawn(Arc::clone(&ctx), stop_rx.clone());
+    let hook = hook_listener.map(|l| {
+        let app = crate::chat::hook::router(Arc::clone(&ctx)).layer(axum::Extension(stop_rx.clone()));
+        let mut stop_rx = stop_rx.clone();
+        tokio::spawn(async move {
+            // `ConnectInfo`: the hook route serves loopback peers only.
+            let _ = axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>())
+                .with_graceful_shutdown(async move {
+                    let _ = stop_rx.changed().await;
+                })
+                .await;
+        })
+    });
     let task = tokio::spawn(async move {
         // `ConnectInfo` needs the peer address, which the trusted-proxy guard
         // checks against its allowlist.
@@ -337,7 +382,7 @@ pub async fn serve(cfg: Config) -> std::io::Result<Bound> {
             .await;
     });
 
-    Ok(Bound { addr, ctx, stop: stop_tx, task })
+    Ok(Bound { addr, ctx, stop: stop_tx, task, hook })
 }
 
 #[cfg(test)]
@@ -389,6 +434,7 @@ pub(crate) mod tests {
                 .expect("none is always buildable"),
             ),
             password: None,
+            hook_port: None,
         }
     }
 
@@ -439,6 +485,25 @@ pub(crate) mod tests {
             panic!("binding a held port must fail");
         };
         assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn the_hook_listener_has_its_own_port_and_a_taken_port_is_logged_not_fatal() {
+        let mut cfg = cfg_for(tempdir("hook-on"));
+        cfg.hook_port = Some(0);
+        let b = serve(cfg).await.unwrap();
+        let port = b.ctx.hook_port.expect("bound");
+        assert_eq!(http_post(&format!("http://127.0.0.1:{port}/hook/claude?pane=bad"), "{}").await.0, 400);
+        assert_ne!(http_post(&format!("http://{}/hook/claude?pane=bad", b.addr), "{}").await.0, 400, "not on the dashboard's port");
+        b.stop().await;
+        // What a desktop restart does right after stop.
+        tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("stop released the hook port");
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = cfg_for(tempdir("hook-taken"));
+        cfg.hook_port = Some(held.local_addr().unwrap().port());
+        let b = serve(cfg).await.expect("a taken hook port is not a boot error");
+        assert_eq!(b.ctx.hook_port, None);
+        assert!(b.ctx.host.log.lines().iter().any(|l| l.contains("hook listener off")));
     }
 
     #[tokio::test]

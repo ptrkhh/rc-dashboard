@@ -10,7 +10,7 @@ async fn opencode_routes_are_guarded_and_reject_bad_inputs_before_spawn() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sessions")).unwrap();
     let auth = AuthConfig::build(vec![GuardKind::Bearer], Some("fixture-token".into()), "X-Forwarded-Email".into(), vec![]).unwrap();
-    let server = serve(Config { bind: "127.0.0.1".parse().unwrap(), port: 0, claude_dir: dir.clone(), disk_extra: None, auth: Arc::new(auth), password: None }).await.unwrap();
+    let server = serve(Config { bind: "127.0.0.1".parse().unwrap(), port: 0, claude_dir: dir.clone(), disk_extra: None, auth: Arc::new(auth), password: None, hook_port: None }).await.unwrap();
     let addr = server.addr.to_string();
     let unauthorized = common::send(&addr, "GET", "/api/models?dir=relative", &[], None).await;
     assert_eq!(unauthorized.status().as_u16(), 401);

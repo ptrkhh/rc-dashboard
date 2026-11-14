@@ -23,6 +23,7 @@ fn cfg(dir: PathBuf, auth: AuthConfig) -> Config {
         disk_extra: None,
         auth: Arc::new(auth),
         password: None,
+        hook_port: None,
     }
 }
 

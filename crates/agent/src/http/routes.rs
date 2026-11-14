@@ -200,21 +200,24 @@ fn push_failed(e: std::io::Error) -> ApiError {
 
 /// One `data:` line per note. Ends when the server stops, so `Bound::stop`
 /// never waits on an open stream. A lagged receiver skips ahead.
+/// Resolves when `serve`'s stop signal fires; never without one (a router
+/// served on its own, as tests do).
+pub(crate) async fn stopped(stop: Option<axum::Extension<tokio::sync::watch::Receiver<bool>>>) {
+    match stop {
+        Some(axum::Extension(mut rx)) => {
+            let _ = rx.wait_for(|s| *s).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn get_notify(
     State(ctx): State<Arc<Ctx>>,
     stop: Option<axum::Extension<tokio::sync::watch::Receiver<bool>>>,
 ) -> axum::response::sse::Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
     use axum::response::sse::{Event, KeepAlive};
     use tokio::sync::broadcast::error::RecvError;
-    let stopped = async move {
-        match stop {
-            Some(axum::Extension(mut rx)) => {
-                let _ = rx.wait_for(|s| *s).await;
-            }
-            None => std::future::pending().await,
-        }
-    };
-    let stream = futures_util::stream::unfold((ctx.notes.subscribe(), Box::pin(stopped)), |(mut rx, mut stopped)| async move {
+    let stream = futures_util::stream::unfold((ctx.notes.subscribe(), Box::pin(stopped(stop))), |(mut rx, mut stopped)| async move {
         loop {
             tokio::select! {
                 _ = &mut stopped => return None,

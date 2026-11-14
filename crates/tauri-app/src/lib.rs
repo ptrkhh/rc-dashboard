@@ -55,6 +55,8 @@ fn server_config() -> cdash_agent::http::serve::Config {
                 .expect("none is always buildable"),
         ),
         password: None,
+        // Fixed, unlike the dashboard's port: panes outlive the app.
+        hook_port: Some(cdash_agent::http::serve::DEFAULT_HOOK_PORT),
     }
 }
 
