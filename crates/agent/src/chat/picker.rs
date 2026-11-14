@@ -233,20 +233,38 @@ pub async fn switch_plan(ctx: &Arc<Ctx>, name: &str, pid: i32, on: bool) -> Resu
     if mode == target { Ok(()) } else { Err(STUCK.into()) }
 }
 
+/// A picker command pasted but not submitted, still in the input box.
+pub type Leftover = Mutex<Option<String>>;
+
+/// Clears a picker command left in the input box, once no dialog is open
+/// (a turn's input box takes the clear). The flag stays until it worked.
+pub async fn clear_leftover(ctx: &Ctx, name: &str, pid: i32, leftover: &Leftover) {
+    let Some(text) = leftover.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+    let status = session_file_for(&ctx.claude_dir, pid).await.and_then(|f| f.status);
+    if !matches!(status.as_deref(), Some("idle" | "shell" | "busy")) {
+        return;
+    }
+    match tmux_io::clear_input(&ctx.runner, name, &text).await {
+        Ok(()) => *leftover.lock().unwrap_or_else(|e| e.into_inner()) = None,
+        Err(e) => ctx.host.log.push(format!("chat clear failed {name}: {e}")),
+    }
+}
+
 /// Types `/<cmd> <value>` and answers only the confirmation that command
 /// raises, after reading it on screen. Ok means Claude took the value: no
-/// dialog and idle after the watch, or its confirmation pressed.
-pub async fn type_setting(ctx: &Arc<Ctx>, name: &str, pid: i32, cmd: &str, value: &str) -> Result<(), String> {
+/// dialog and idle after the watch, or its confirmation pressed. Text it
+/// could not submit or clear is put in `leftover`.
+pub async fn type_setting(ctx: &Arc<Ctx>, name: &str, pid: i32, cmd: &str, value: &str, leftover: &Leftover) -> Result<(), String> {
     let title = CONFIRMS.iter().find(|(c, _)| *c == cmd).map(|(_, t)| *t);
     let text = format!("/{cmd} {value}");
     idle(ctx, pid).await?;
+    clear_leftover(ctx, name, pid, leftover).await;
     tmux_io::paste_text(&ctx.runner, name, &text).await?;
     tokio::time::sleep(tmux_io::PASTE_PAUSE).await;
     if let Err(e) = idle(ctx, pid).await {
-        // A turn's input box takes the clear; a dialog gets no key.
-        if e != WAITING {
-            tmux_io::clear_input(&ctx.runner, name, &text).await?;
-        }
+        // Behind a dialog the text waits; the next send or picker clears it.
+        *leftover.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+        clear_leftover(ctx, name, pid, leftover).await;
         return Err(e);
     }
     tmux_io::key(&ctx.runner, name, "Enter").await?;
@@ -479,11 +497,11 @@ esac
     #[tokio::test]
     async fn model_and_effort_are_typed_and_only_their_own_confirmation_is_accepted() {
         let (ctx, dir) = confirm_ctx("yes", " Switch model?\n ❯ 1. Yes\n   2. No\n");
-        type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await.unwrap();
+        type_setting(&ctx, "cdash-a", 4242, "model", "haiku", &Leftover::default()).await.unwrap();
         let keys = sent_keys(&dir);
         assert_eq!(keys, ["send-keys -t =cdash-a: Enter", "send-keys -t =cdash-a: Enter"], "Enter after the paste, Enter on Yes");
         let (ctx, dir) = confirm_ctx("other", " Background work is running\n ❯ 1. Exit and stop tasks\n");
-        assert!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await.is_err());
+        assert!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku", &Leftover::default()).await.is_err());
         assert_eq!(sent_keys(&dir), ["send-keys -t =cdash-a: Enter", "send-keys -t =cdash-a: Escape"]);
     }
     #[tokio::test]
@@ -505,7 +523,7 @@ esac
     async fn a_question_opened_during_the_watch_gets_no_key() {
         let (ctx, dir) = confirm_ctx("question", " Which file?\n ❯ 1. Yes\n");
         std::fs::write(dir.join("waiting.json"), r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"input needed"}"#).unwrap();
-        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await, Err("Answer the open question first".into()));
+        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku", &Leftover::default()).await, Err("Answer the open question first".into()));
         assert_eq!(sent_keys(&dir), ["send-keys -t =cdash-a: Enter"], "only the command's own Enter");
     }
     #[tokio::test]
@@ -513,17 +531,17 @@ esac
         let idle = r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#;
         let (ctx, dir) = confirm_ctx("no-dialog", "");
         std::fs::write(dir.join("waiting.json"), idle).unwrap();
-        type_setting(&ctx, "cdash-a", 4242, "effort", "high").await.unwrap();
+        type_setting(&ctx, "cdash-a", 4242, "effort", "high", &Leftover::default()).await.unwrap();
         assert_eq!(sent_keys(&dir), ["send-keys -t =cdash-a: Enter"]);
         let (ctx, dir) = confirm_ctx("busy-end", "");
         std::fs::write(dir.join("waiting.json"), idle.replace("idle", "busy")).unwrap();
-        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "effort", "high").await, Err("Claude did not confirm /effort; check Terminal".into()));
+        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "effort", "high", &Leftover::default()).await, Err("Claude did not confirm /effort; check Terminal".into()));
     }
     #[tokio::test]
     async fn a_turn_starting_during_the_paste_gets_no_enter_and_the_box_is_cleared() {
         let (ctx, dir) = confirm_ctx("late-busy", "");
         std::fs::write(dir.join("pasted.json"), r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy"}"#).unwrap();
-        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku").await, Err("Stop the turn or wait for it to finish".into()));
+        assert_eq!(type_setting(&ctx, "cdash-a", 4242, "model", "haiku", &Leftover::default()).await, Err("Stop the turn or wait for it to finish".into()));
         let keys = sent_keys(&dir);
         assert_eq!(keys.len(), 1);
         assert!(keys[0].starts_with("send-keys -t =cdash-a: C-u"), "{keys:?}");

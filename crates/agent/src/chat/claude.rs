@@ -135,6 +135,8 @@ struct Shared {
     /// Clients attached to the hub; the loop parks while none are.
     watchers: AtomicUsize,
     wake: Arc<Notify>,
+    /// A picker command left in the input box behind a dialog.
+    leftover: picker::Leftover,
     /// Transcript polls the loop made.
     #[cfg(test)]
     polls: AtomicUsize,
@@ -144,7 +146,10 @@ impl Engine for ClaudeEngine {
     async fn send(&self, text: &str, _steer: bool, _cid: &str) -> Result<Sent, String> {
         match picker::route(text) {
             // A paste cannot be confirmed by the TUI; the transcript confirms it.
-            picker::Route::Paste => tmux_io::paste(&self.ctx.runner, &self.name, text).await.map(|()| Sent::Unconfirmed),
+            picker::Route::Paste => {
+                picker::clear_leftover(&self.ctx, &self.name, self.pid, &self.shared.leftover).await;
+                tmux_io::paste(&self.ctx.runner, &self.name, text).await.map(|()| Sent::Unconfirmed)
+            }
             // The engine ran it itself: no prompt will ever show it.
             picker::Route::Set(what, v) => self.set(what, &v).await.map(|()| Sent::Done),
             picker::Route::Refuse(why) => Err(why),
@@ -175,12 +180,12 @@ impl Engine for ClaudeEngine {
                 let alias = value.as_str().ok_or(NOT_LISTED)?;
                 let models = self.listed().await["models"].take();
                 let entry = models.as_array().and_then(|m| m.iter().find(|e| e["value"] == alias)).ok_or(NOT_LISTED)?;
-                picker::type_setting(ctx, name, pid, "model", alias).await?;
+                picker::type_setting(ctx, name, pid, "model", alias, &self.shared.leftover).await?;
                 lock(&self.live).model = entry["model"].as_str().map(String::from);
             }
             "effort" => {
                 let effort = value.as_str().filter(|e| picker::EFFORTS.contains(e)).ok_or("not an effort level")?;
-                picker::type_setting(ctx, name, pid, "effort", effort).await?;
+                picker::type_setting(ctx, name, pid, "effort", effort, &self.shared.leftover).await?;
                 lock(&self.live).effort = Some(effort.to_string());
             }
             _ => return Err("not supported".into()),
@@ -532,6 +537,32 @@ pub(crate) mod tests {
         assert_eq!(engine.set("agent", &json!("build")).await, Err("not supported".into()));
         assert_eq!(engine.set("model", &json!("haiku")).await, Err("Stop the turn or wait for it to finish".into()));
         assert!(!std::fs::read_to_string(dir.join("tmux-args")).unwrap_or_default().contains("send-keys"));
+    }
+
+    #[tokio::test]
+    async fn a_picker_command_left_behind_a_dialog_is_cleared_before_the_next_send() {
+        let (ctx, dir) = fixture_ctx("leftover");
+        let idle = r#"{"sessionId":"sid-1","cwd":"/proj-left","status":"idle"}"#;
+        write_session(&dir, idle);
+        picker::seed(std::path::Path::new("/proj-left"), serde_json::from_str(include_str!("testdata/initialize.json")).unwrap());
+        // The first paste opens a dialog (shell builtins only: PATH is the stub's folder).
+        let script = format!(
+            "#!/bin/sh\nD='{}'\nprintf '%s\\n' \"$*\" >> \"$D/tmux-args\"\ncase \"$*\" in paste-buffer*) if [ ! -e \"$D/opened\" ]; then : > \"$D/opened\"; printf '%s' '{}' > \"$D/sessions/4242.json\"; fi ;; esac\n",
+            dir.display(),
+            idle.replace(r#""status":"idle""#, r#""status":"waiting","waitingFor":"dialog open""#)
+        );
+        crate::chat::tmux_io::tests::install_stub(&dir, "tmux", &script);
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        assert_eq!(engine.set("model", &json!("haiku")).await, Err("Answer the open question first".into()));
+        write_session(&dir, idle); // the dialog was answered in Terminal
+        engine.send("hello", false, "c1").await.unwrap();
+        let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap();
+        let keys: Vec<&str> = args.lines().filter(|l| l.starts_with("send-keys") || l.starts_with("paste-buffer")).collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        assert!(keys[0].starts_with("paste-buffer"), "the picker's paste; no key into the dialog");
+        assert!(keys[1].starts_with("send-keys -t =cdash-a: C-u"), "the leftover is cleared first");
+        assert_eq!(keys[2..], ["paste-buffer -p -d -b cdash-chat-cdash-a -t =cdash-a:", "send-keys -t =cdash-a: Enter"]);
     }
 
     async fn next_msg(rx: &mut mpsc::Receiver<EngineMsg>) -> EngineMsg {
