@@ -567,6 +567,7 @@ dependencies = [
  "sha2 0.10.9",
  "tauri",
  "tauri-build",
+ "tauri-plugin-cdash-watch",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tauri-plugin-store",
@@ -4502,6 +4503,15 @@ dependencies = [
  "serde_json",
  "tauri-utils",
  "walkdir",
+]
+
+[[package]]
+name = "tauri-plugin-cdash-watch"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
 ]
 
 [[package]]

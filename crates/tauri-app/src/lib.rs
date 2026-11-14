@@ -324,8 +324,21 @@ fn current_base(app: &tauri::AppHandle, state: &ServerState) -> Result<String, S
     base_url(inproc, active.as_ref()).ok_or_else(|| "server not running".to_string())
 }
 
-/// Desktop: system notifications for agent notes. Elsewhere the commands exist
-/// (the page calls them) but do nothing yet.
+/// Runs `f` on the Android watch plugin off the async runtime: a plugin call
+/// blocks until Kotlin answers, and `start` waits on the user's answers to the
+/// permission and battery dialogs.
+#[cfg(target_os = "android")]
+async fn on_watch<T: Send + 'static>(
+    app: tauri::AppHandle,
+    f: impl FnOnce(&tauri_plugin_cdash_watch::Watch<tauri::Wry>) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    use tauri_plugin_cdash_watch::WatchExt;
+    tauri::async_runtime::spawn_blocking(move || f(app.watch())).await.map_err(|e| e.to_string())?
+}
+
+/// System notifications for agent notes: a watcher task on desktop, a
+/// foreground service on Android. Elsewhere the commands exist (the page calls
+/// them) but do nothing.
 #[tauri::command]
 async fn notify_set(app: tauri::AppHandle, on: bool) -> Result<(), String> {
     #[cfg(desktop)]
@@ -348,7 +361,16 @@ async fn notify_set(app: tauri::AppHandle, on: bool) -> Result<(), String> {
         state.start(app.clone());
         Ok(())
     }
-    #[cfg(not(desktop))]
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        if !on {
+            return on_watch(app, |w| w.stop()).await;
+        }
+        let base = current_base(&app, &app.state::<ServerState>())?;
+        on_watch(app, move |w| w.start(&base)).await
+    }
+    #[cfg(not(any(desktop, target_os = "android")))]
     {
         let _ = (app, on);
         Err("notifications are not available here".into())
@@ -356,7 +378,7 @@ async fn notify_set(app: tauri::AppHandle, on: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn notify_clear(_app: tauri::AppHandle, _name: String) -> Result<(), String> {
+async fn notify_clear(_app: tauri::AppHandle, _name: String) -> Result<(), String> {
     #[cfg(desktop)]
     {
         use tauri::Manager;
@@ -365,12 +387,17 @@ fn notify_clear(_app: tauri::AppHandle, _name: String) -> Result<(), String> {
         _app.state::<notify::NotifyState>().clear(id);
         _app.notification().remove_active(vec![id]).map_err(|e| e.to_string())?;
     }
+    #[cfg(target_os = "android")]
+    on_watch(_app, move |w| w.clear(&_name)).await?;
     Ok(())
 }
 
 /// A tap that launched the app (Android). A desktop tap reaches the open window directly.
 #[tauri::command]
-fn notify_take_open() -> Option<serde_json::Value> {
+async fn notify_take_open(_app: tauri::AppHandle) -> Option<serde_json::Value> {
+    #[cfg(target_os = "android")]
+    return on_watch(_app, |w| w.take_open()).await.ok().flatten();
+    #[cfg(not(target_os = "android"))]
     None
 }
 
@@ -647,6 +674,8 @@ pub fn run() {
     let builder = tauri::Builder::default();
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_notification::init()).manage(notify::NotifyState::default());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_cdash_watch::init());
     builder
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_opener::init())

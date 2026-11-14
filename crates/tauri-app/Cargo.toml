@@ -38,6 +38,10 @@ tauri-plugin-notification = "2.6"
 # The watcher sleeps between reconnects; tauri's runtime is tokio but does not re-export `time`.
 tokio = { version = "1", features = ["time"] }
 
+# Android notifications: a foreground service holding the agent's note stream.
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-cdash-watch = { path = "../tauri-plugin-cdash-watch" }
+
 # "test" only unifies into dev/test builds; release binaries never see it.
 # The test-only tokio features (runtime, macros) live here; the desktop
 # dependency above adds `time` for the notification watcher.
