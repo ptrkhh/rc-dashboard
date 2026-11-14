@@ -3,11 +3,59 @@
 // send and stop routed back to the supervisor. The agent is the only client.
 // Never writes to stdout or stderr: stdout is the native TUI's terminal.
 import { createServer } from 'node:net';
-import { chmod, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { chmod, mkdir, open, rename, rm, utimes } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
 
 const LINE_MAX = 64 * 1024;
+
+// Twins of crates/agent/src/chat/media.rs: with_attached, split_attached, sniff, stash.
+const IMAGES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+
+export function withAttached(text, paths) {
+  return [...(text ? [text] : []), ...paths.map(p => `Attached: ${p}`)].join('\n');
+}
+
+export function splitAttached(text) {
+  let rest = text;
+  const files = [];
+  for (;;) {
+    const line = rest.slice(rest.lastIndexOf('\n') + 1);
+    if (!line.startsWith('Attached: /') || !line.includes('/cdash/uploads/')) break;
+    files.push({ kind: 'file', name: line.slice(line.lastIndexOf('/') + 1) });
+    rest = rest.length > line.length ? rest.slice(0, rest.length - line.length - 1) : '';
+  }
+  return { text: rest.trimEnd(), files: files.reverse() };
+}
+
+export function sniffImage(b) {
+  const at = (hex, i = 0) => b.length >= i + hex.length / 2 && Buffer.from(b.subarray(i, i + hex.length / 2)).toString('hex') === hex;
+  if (at('89504e470d0a1a0a')) return 'image/png';
+  if (at('ffd8ff')) return 'image/jpeg';
+  if (at('474946383761') || at('474946383961')) return 'image/gif';
+  if (at('52494646') && at('57454250', 8)) return 'image/webp';
+  return null;
+}
+
+// Store an image once under its hash in dir (CDASH_MEDIA_DIR); null when there is no
+// absolute dir or the bytes are not an image. A rewrite only refreshes the age.
+export async function stashMedia(dir, bytes) {
+  const mime = sniffImage(bytes);
+  if (!mime || !dir || !isAbsolute(dir)) return null;
+  const ref = createHash('sha256').update(bytes).digest('hex');
+  const target = join(dir, `${ref}.${IMAGES[mime]}`);
+  const now = new Date();
+  try { await utimes(target, now, now); return { ref, mime }; } catch (e) { if (e?.code !== 'ENOENT') throw e; }
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await chmod(dir, 0o700);
+  const tmp = `${target}.${process.pid}-${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    const f = await open(tmp, 'wx', 0o600);
+    try { await f.writeFile(bytes); await f.chmod(0o600); } finally { await f.close(); }
+    await rename(tmp, target);
+  } catch (e) { await rm(tmp, { force: true }); throw e; }
+  return { ref, mime };
+}
 
 export class ChatFeed {
   #send; #stop; #ops; #opTimeout;
@@ -194,7 +242,7 @@ export class ChatFeed {
     if (m.t !== 'send' || typeof m.text !== 'string') return;
     let ack;
     try {
-      const r = await this.#send(m.text, { steer: !!m.steer, cid: m.cid });
+      const r = await this.#send(m.text, { steer: !!m.steer, cid: m.cid, files: Array.isArray(m.files) ? m.files.filter(f => typeof f?.path === 'string') : [] });
       ack = { t: 'ack', cid: m.cid, ok: true, ...(r?.done ? { done: true } : {}) };
     } catch (e) {
       ack = { t: 'ack', cid: m.cid, ok: false, error: String(e?.message ?? e) };

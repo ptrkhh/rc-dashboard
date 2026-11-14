@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createConnection } from 'node:net';
-import { mkdtemp, stat, rm } from 'node:fs/promises';
+import { mkdtemp, stat, rm, readdir, utimes } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ChatFeed } from '../crates/agent/src/collect/chat-feed.mjs';
+import { ChatFeed, withAttached, splitAttached, sniffImage, stashMedia } from '../crates/agent/src/collect/chat-feed.mjs';
 
 const user = (uuid, text) => ({ type: 'user', uuid, message: { role: 'user', content: [{ type: 'text', text }] } });
 async function client(path, first) {                              // returns { lines, write, close }
@@ -124,5 +125,44 @@ test('a hanging op does not delay send or stop, and times out once; inherited na
   assert.ok(!a.lines.some(l => l.rid === 1), 'the op is still pending');
   await until(() => a.lines.some(l => l.rid === 1));
   assert.deepEqual(a.lines.filter(l => l.t === 'res'), [{ t: 'res', rid: 2, ok: false, error: 'not supported' }, { t: 'res', rid: 1, ok: false, error: 'timed out' }]);
+  a.close();
+});
+
+const PNG = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('feed')]);
+test('upload lines round-trip and nothing else is touched', () => {
+  const up = '/home/u/.cache/cdash/uploads/cdash-a/0123456789abcdef';
+  const sent = withAttached('look at these', [`${up}/r.pdf`, `${up}/notes 1.txt`]);
+  assert.equal(sent, `look at these\nAttached: ${up}/r.pdf\nAttached: ${up}/notes 1.txt`);
+  assert.deepEqual(splitAttached(sent), { text: 'look at these', files: [{ kind: 'file', name: 'r.pdf' }, { kind: 'file', name: 'notes 1.txt' }] });
+  assert.deepEqual(splitAttached(withAttached('', [`${up}/r.pdf`])), { text: '', files: [{ kind: 'file', name: 'r.pdf' }] });
+  for (const kept of ['Attached: /etc/passwd', 'Attached: rel/cdash/uploads/x', `Attached: ${up}/a.txt\nthen more`])
+    assert.deepEqual(splitAttached(kept), { text: kept, files: [] });
+});
+test('images are stored once by content in a private folder, and nothing else is', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'cdash-media-')); t.after(() => rm(root, { recursive: true, force: true }));
+  const dir = join(root, 'cdash', 'media');
+  const a = await stashMedia(dir, PNG);
+  assert.deepEqual(a, { ref: createHash('sha256').update(PNG).digest('hex'), mime: 'image/png' });
+  const file = join(dir, a.ref + '.png');
+  assert.deepEqual([(await stat(file)).mode & 0o777, (await stat(dir)).mode & 0o777], [0o600, 0o700]);
+  const past = new Date(Date.now() - 86_400_000);
+  await utimes(file, past, past);
+  await stashMedia(dir, PNG);
+  assert.ok((await stat(file)).mtimeMs > past.getTime() + 60_000, 'a rewrite refreshes its age');
+  assert.deepEqual(await readdir(dir), [a.ref + '.png'], 'one file, no temp left');
+  assert.equal(await stashMedia(dir, Buffer.from('%PDF-1.7')), null);
+  assert.equal(await stashMedia(undefined, PNG), null, 'no folder from the agent, no media');
+  assert.equal(sniffImage(Buffer.from('RIFF\0\0\0\0WEBPVP8 ')), 'image/webp');
+});
+test('a send line hands its attachments to the supervisor', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cdash-feed-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const got = [];
+  const feed = new ChatFeed({ send: async (text, o) => { got.push(o.files); }, stop: async () => {} }); t.after(() => feed.close());
+  const a = await client(await feed.listen(dir), { after: 0, epoch: null });
+  const f = { path: '/u/up/a.png', kind: 'image', mime: 'image/png', name: 'a.png', size: 8 };
+  a.write({ t: 'send', cid: 'c1', text: 'x', steer: false, files: [f, { kind: 'file' }] });
+  a.write({ t: 'send', cid: 'c2', text: 'y', steer: false });
+  await until(() => got.length === 2);
+  assert.deepEqual(got, [[f], []]);
   a.close();
 });
