@@ -233,6 +233,7 @@ test('edit diffs and their counts come from each tool\'s own record', () => {
   assert.deepEqual(n(S.editDiff({ name: 'Write', input: { file_path: '/p/n.txt', content: 'x\ny' } })), [2, 0]);
   const codex = S.editDiff({ name: 'Edit', input: { changes: [{ path: 'a.rs', kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-old\n+new\n' }, { path: 'b.rs', kind: { type: 'add' }, diff: 'one\ntwo\n' }] } });
   assert.deepEqual([...n(codex), codex.files.length], [3, 1, 2]);
+  assert.deepEqual(codex.files.map(n), [[1, 1], [2, 0]], 'each file carries its own counts');
   assert.deepEqual(n(S.editDiff({ name: 'edit', input: { path: 'a.ts' }, diff: [{ file: 'a.ts', additions: 1, deletions: 1, patch: '--- a.ts\n+++ a.ts\n@@ -1 +1 @@\n-x\n+y\n' }] })), [1, 1]);
   assert.equal(S.editDiff({ name: 'Read', input: { file_path: '/p/x' } }), null);
   const rows = S.rows(feed([hello(), ev(1, use('a', 't1', 'Edit', { file_path: '/p/x.js', old_string: 'a\nb', new_string: 'a\nB' })), ev(2, done('b', 't1', 'ok'))]));
@@ -269,6 +270,7 @@ test('editDiff is computed once per input', () => {
 test('patch headers are skipped only before the first hunk; a cut patch keeps its counts', () => {
   const d = S.editDiff({ name: 'edit', input: {}, diff: [{ file: 'a', patch: '--- a\n+++ a\n@@ -1,2 +1 @@\n--- comment\n+x\n' }, { file: 'big', additions: 9, deletions: 4 }] });
   assert.deepEqual([d.add, d.del, d.files.length], [10, 5, 2]);
+  assert.deepEqual(d.files.map(f => [f.add, f.del]), [[1, 1], [9, 4]]);
 });
 test('rewind waits while one of my messages is still sending', () => {
   const idle = { working: false, waiting: false, ended: false, unreadable: false, mine: [{ status: 'sending' }] };

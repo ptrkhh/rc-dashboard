@@ -692,8 +692,7 @@
   function editLines(d) {
     const box = el('div', 'chat-edit');
     for (const f of d.files) {
-      const n = t => f.lines.length ? f.lines.filter(l => l.t === t).length : f[t === '+' ? 'add' : 'del'] ?? 0;
-      box.append(el('div', 'chat-diff-head', (f.path ?? '') + ' +' + n('+') + ' \u2212' + n('-')));
+      box.append(el('div', 'chat-diff-head', (f.path ?? '') + ' +' + (f.add ?? 0) + ' \u2212' + (f.del ?? 0)));
       const lines = el('div', 'chat-diff');
       for (const l of f.lines) lines.append(el('div', DIFF_CLS[l.t] ?? 'diff-ctx', l.t + l.s));
       box.append(lines);

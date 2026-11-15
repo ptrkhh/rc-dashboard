@@ -54,9 +54,12 @@ function fakeDom() {
   });
   const ids = { '#chat-sheet': node('dialog'), '#chat-sheet-title': node('span'), '#chat-sheet-body': node('div'), '#chat-running': node('button') };
   globalThis.document = { querySelector: s => ids[s] ?? null, createElement: node };
+  const frames = [];
+  globalThis.requestAnimationFrame = fn => frames.push(fn);
   const all = n => [n, ...(n.kids || []).flatMap(all)];
   return {
-    sheet: ids['#chat-sheet'], body: ids['#chat-sheet-body'],
+    frames, flush: () => { for (const fn of frames.splice(0)) fn(); },
+    sheet: ids['#chat-sheet'], body: ids['#chat-sheet-body'], running: ids['#chat-running'],
     find: pred => all(ids['#chat-sheet-body']).find(pred),
     button: text => all(ids['#chat-sheet-body']).find(n => n.tag === 'button' && n.textContent === text),
   };
@@ -77,7 +80,11 @@ test('a side answer appends its chunks in order, and closing it mid-answer cance
   C.onFrame(c, { t: 'aside', id: 'other', text: 'x', done: false });
   C.onFrame(c, { t: 'state' });
   C.onFrame(c, { t: 'aside', id, text: 'b**', done: false });
-  assert.equal(dom.find(n => n.className.includes('chat-aside-answer')).innerHTML, globalThis.cdashMd.render('**ab**'));
+  const answer = dom.find(n => n.className.includes('chat-aside-answer'));
+  assert.equal(answer.innerHTML, '', 'chunks wait for the next frame');
+  assert.equal(dom.frames.length, 1, 'one render per frame, however many chunks');
+  dom.flush();
+  assert.equal(answer.innerHTML, globalThis.cdashMd.render('**ab**'));
   dom.sheet.close();
   assert.deepEqual(sent[1], { t: 'aside_cancel', id });
 });
@@ -87,9 +94,12 @@ test('a finished side answer is not cancelled; an error shows as text; Ask anoth
   const { c, sent } = chat({});
   C.openAside(c, 'q');
   const { id } = sent[0];
+  C.onFrame(c, { t: 'aside', id, text: 'part', done: false });
   C.onFrame(c, { t: 'aside', id, text: '', done: true, error: '<b>side question failed</b>' });
+  assert.equal(dom.find(n => n.className.includes('chat-aside-answer')).innerHTML, globalThis.cdashMd.render('part'), 'done renders at once');
+  dom.flush();
   assert.ok(dom.body.textContent.includes('<b>side question failed</b>'));
-  assert.ok(!dom.find(n => n.className.includes('chat-aside-answer')).innerHTML.includes('<b>'));
+  assert.ok(!dom.find(n => n.className.includes('chat-aside-answer')).innerHTML.includes('<b>side'));
   dom.button('Ask another').onclick();
   assert.equal(dom.find(n => n.tag === 'textarea').value, '');
   assert.ok(!dom.body.textContent.includes('side question failed'));
@@ -143,10 +153,60 @@ test('Changes lists each file with its counts, binary ones as binary', async () 
     { path: 'img.png', status: 'modified', additions: null, deletions: null, patch: null }] }) });
   await C.openDiff(c);
   const t = dom.body.textContent;
-  assert.ok(t.includes('a.txt') && t.includes('+2') && t.includes('−1'), t);
+  assert.ok(t.includes('a.txt') && t.includes('+2') && t.includes('\u22121'), t);
   assert.ok(t.includes('img.png') && t.includes('binary'), t);
   assert.ok(t.includes('Over 2 MB of changes'), t);
 });
+
+test('an untracked file without counts is not called binary', async () => {
+  const dom = fakeDom();
+  const { c } = chat({}, { api: async () => ({ folder: '/w', repo: true, truncated: false, files: [
+    { path: 'pipe', status: 'untracked', additions: null, deletions: null, patch: null }] }) });
+  await C.openDiff(c);
+  const t = dom.body.textContent;
+  assert.ok(t.includes('pipe') && t.includes('no lines shown') && !t.includes('binary'), t);
+});
+
+test('Changes loads again when a turn ends while it is open', async () => {
+  const dom = fakeDom();
+  let calls = 0;
+  const { c } = chat({ working: true }, { api: async () => ({ folder: '/w', repo: true, truncated: false, files: [{ path: 'v' + ++calls, status: 'modified', additions: 1, deletions: 0, patch: null }] }) });
+  await C.openDiff(c);
+  C.refresh(c);
+  assert.equal(calls, 1, 'still working: no reload');
+  c.state.working = false;
+  C.refresh(c);
+  await new Promise(r => setImmediate(r));
+  assert.equal(calls, 2);
+  assert.ok(dom.body.textContent.includes('v2'));
+  C.refresh(c);
+  assert.equal(calls, 2, 'once per turn end');
+  dom.sheet.close();
+  c.state.working = true; C.refresh(c); c.state.working = false; C.refresh(c);
+  assert.equal(calls, 2, 'closed: no reload');
+});
+
+test('the running button counts tasks and hides at none', () => {
+  const dom = fakeDom();
+  const { c } = chat({ tasks: [{ id: '1', kind: 'shell', title: 'a' }, { id: '2', kind: 'agent', title: 'b' }] });
+  C.refresh(c);
+  assert.deepEqual([dom.running.hidden, dom.running.textContent], [false, '2 running']);
+  c.state.tasks = [];
+  C.refresh(c);
+  assert.equal(dom.running.hidden, true);
+});
+
+test('a socket lost mid-answer ends the answer, and closing then sends no cancel', () => {
+  const dom = fakeDom();
+  const { c, sent } = chat({});
+  C.openAside(c, 'q');
+  C.onFrame(c, { t: 'aside', id: sent[0].id, text: 'half', done: false });
+  C.lost(c);
+  assert.ok(dom.body.textContent.includes('Connection lost. Ask again.'));
+  dom.sheet.close();
+  assert.equal(sent.length, 1);
+});
+
 
 test('the running list reads each task, odd starts included', () => {
   const dom = fakeDom();
@@ -168,4 +228,14 @@ test('usage reads context, session tokens and the tool\'s plan limits', () => {
   assert.ok(t.includes('5h: 25% used'), t);
   assert.ok(!t.includes('Codex'), t);
   assert.ok(!t.includes('Cost'), t);
+});
+
+test('usage shows a dash for a missing count and a raw reset time it cannot read', () => {
+  const dom = fakeDom();
+  const { c } = chat({ tool: 'codex', usage: { context: { used: 5, window: null }, tokens: { input: 1 }, cost: null } },
+    { limits: () => ({ codex: [{ short: 'Codex 5h', pct: 9, resetsAt: 'soon' }] }) });
+  C.openUsage(c);
+  const t = dom.body.textContent;
+  assert.ok(t.includes('\u2014') && !t.includes('NaN'), t);
+  assert.ok(t.includes('resets soon'), t);
 });

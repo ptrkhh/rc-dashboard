@@ -80,8 +80,8 @@
     for (const f of d.files) {
       const det = el('details', 'chat-diff-file');
       const sum = el('summary');
-      // No counts: binary, or an untracked file past the cap.
-      const counts = f.additions != null ? '+' + f.additions + ' −' + f.deletions : d.truncated && f.status === 'untracked' ? '' : 'binary';
+      // No counts: git's numstat says binary for a tracked file; an untracked one may be a FIFO, past the cap, or a failed diff.
+      const counts = f.additions != null ? '+' + f.additions + ' −' + f.deletions : f.status !== 'untracked' ? 'binary' : 'no lines shown';
       sum.append(el('span', 'chat-diff-path', String(f.path)), el('span', 'chat-diff-count', counts));
       det.append(sum);
       // Lines are built on first open: a 2 MB patch is many nodes.
@@ -113,7 +113,7 @@
     S.usageSig = sig;
     const body = $('#chat-sheet-body');
     body.textContent = '';
-    const num = n => Number(n).toLocaleString();
+    const num = n => typeof n === 'number' && Number.isFinite(n) ? n.toLocaleString() : '\u2014';
     const section = (title, rows) => {
       const sec = el('section', 'chat-usage');
       sec.append(el('h3', 'chat-usage-title', title));
@@ -136,8 +136,11 @@
       ...(u?.cost != null ? [['Cost', '$' + Number(u.cost).toFixed(2)]] : []),
     ]);
     if (limits.length) section('Plan limits', limits.map(l => ['', l.short + ': ' + l.pct + '% used'
-      + (l.resetsAt ? ' · resets ' + new Date(l.resetsAt).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '')]));
+      + (l.resetsAt ? ' · resets ' + resetAt(l.resetsAt) : '')]));
   }
+
+  // As app.js's fmtReset: a time it cannot read shows as given.
+  const resetAt = iso => { const d = new Date(iso); return isNaN(d) ? String(iso) : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
 
   /* ---------- Running list ---------- */
 
@@ -196,7 +199,7 @@
       const answer = el('div', 'chat-text chat-aside-answer');
       const status = el('p', 'chat-sheet-note', 'Answering…');
       out.append(answer, status);
-      S.aside = { c, id, text: '', done: false, answer, status };
+      S.aside = { c, id, text: '', done: false, answer, status, raf: 0 };
     };
     const go = button('Ask', () => ask(false), 'chat-rewind-go');
     bar.append(button('Ask another', () => openAside(c, '')), go);
@@ -208,10 +211,16 @@
     const a = S.aside;
     if (f?.t !== 'aside' || !a || a.c !== c || f.id !== a.id) return;
     if (typeof f.text === 'string') a.text += f.text;
-    if (f.done) a.done = true;
+    if (f.error) a.error = String(f.error);
+    if (f.done) { a.done = true; drawAside(a); }  // the last chunk shows at once
+    else if (!a.raf) a.raf = requestAnimationFrame(() => { if (!a.done) drawAside(a); });  // chunks come at token speed: one render per frame
+  }
+
+  function drawAside(a) {
+    a.raf = 0;
     a.answer.innerHTML = g.cdashMd.render(a.text);
-    a.status.textContent = f.error ? String(f.error) : a.done ? (a.text ? '' : 'No answer.') : 'Answering…';
-    a.status.className = f.error ? 'chat-sheet-note error' : 'chat-sheet-note';
+    a.status.textContent = a.error || (a.done ? (a.text ? '' : 'No answer.') : 'Answering…');
+    a.status.className = a.error ? 'chat-sheet-note error' : 'chat-sheet-note';
   }
 
   // The socket went: its answer will not arrive.

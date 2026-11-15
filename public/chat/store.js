@@ -206,8 +206,9 @@
     else if (call?.name === 'MultiEdit' && Array.isArray(i.edits)) files = [{ path: i.file_path, lines: i.edits.flatMap(e => lineDiff(e.old_string ?? '', e.new_string ?? '')) }];
     else if (call?.name === 'Write' && typeof i.content === 'string') files = [{ path: i.file_path, lines: mark('+', lines(i.content)) }];
     if (!files?.length) return null;
-    const count = t => files.reduce((n, f) => n + (f.lines.length ? f.lines.filter(l => l.t === t).length : f[t === '+' ? 'add' : 'del'] ?? 0), 0);
-    return { files, add: count('+'), del: count('-') };
+    for (const f of files) if (f.lines.length) { f.add = f.lines.filter(l => l.t === '+').length; f.del = f.lines.filter(l => l.t === '-').length; }
+    const count = k => files.reduce((n, f) => n + (f[k] ?? 0), 0);
+    return { files, add: count('add'), del: count('del') };
   }
 
   // The hub's checklist outlives the backlog; without it, the latest todo event.

@@ -557,6 +557,7 @@ test('Codex facts: usage, running shells and agents, thinking, checklist and tim
   await f.inject({ method: 'thread/status/changed', params: { threadId: 'child-1', status: { type: 'active', activeFlags: [] } } });
   await until(() => c.lines.findLast(l => l.t === 'tasks')?.tasks.length === 2);
   assert.deepEqual(c.lines.findLast(l => l.t === 'tasks').tasks.map(x => [x.id, x.kind, x.title]), [['x1', 'shell', 'npm run dev'], ['child-1', 'agent', 'Scout']]);
+  for (const x of c.lines.findLast(l => l.t === 'tasks').tasks) assert.ok(typeof x.started === 'string' && !isNaN(Date.parse(x.started)), x.started);
   await f.inject({ method: 'item/completed', params: { threadId: sid, turnId: 't2', item: { id: 'x1', type: 'commandExecution', source: 'unifiedExecStartup', command: 'npm run dev', status: 'completed', exitCode: 0 } } });
   await f.inject({ method: 'thread/status/changed', params: { threadId: 'child-1', status: { type: 'idle' } } });
   await until(() => c.lines.findLast(l => l.t === 'tasks').tasks.length === 0);

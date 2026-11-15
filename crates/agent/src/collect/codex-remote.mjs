@@ -803,7 +803,7 @@ async function nativeLauncher(statePath, state, script) {
         if (t) children.set(p.threadId, kid = { agent: t.parentThreadId === state.sid, title: t.agentNickname || t.agentRole || t.name || t.preview || 'agent' }); // a failed read is not cached: the next status change retries
       }
       if (kid?.agent) {
-        if (p.status?.type === 'active') { if (!running.has(p.threadId)) running.set(p.threadId, { id: p.threadId, kind: 'agent', title: kid.title, started: Date.now() }); }
+        if (p.status?.type === 'active') { if (!running.has(p.threadId)) running.set(p.threadId, { id: p.threadId, kind: 'agent', title: kid.title, started: new Date().toISOString() }); }
         else running.delete(p.threadId);
         publishTasks();
       }
@@ -816,7 +816,7 @@ async function nativeLauncher(statePath, state, script) {
       else accept(msg, turn);
     }
     const shell = p.item?.type === 'commandExecution' && p.item.source === 'unifiedExecStartup';
-    if (shell && m.method === 'item/started') { running.set(p.item.id, { id: p.item.id, kind: 'shell', title: p.item.command, started: Date.now() }); publishTasks(); }
+    if (shell && m.method === 'item/started') { running.set(p.item.id, { id: p.item.id, kind: 'shell', title: p.item.command, started: new Date().toISOString() }); publishTasks(); }
     if (shell && m.method === 'item/completed' && running.delete(p.item.id)) publishTasks();
     if (m.method === 'thread/tokenUsage/updated' && p.tokenUsage?.total && p.tokenUsage.last) {
       const { total, last, modelContextWindow } = p.tokenUsage;
