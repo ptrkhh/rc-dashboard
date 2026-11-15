@@ -63,6 +63,8 @@ export class ChatFeed {
   #asks = new Map();
   #settings = null;
   #settingsJson = '';
+  #usage = null;
+  #tasks = [];
   #log = [];
   #uuids = new Set();
   #approvals = new Set();
@@ -98,6 +100,37 @@ export class ChatFeed {
     this.#broadcast({ t: 'settings', settings });
   }
 
+  setUsage(usage) {
+    this.#usage = usage;
+    this.#broadcast({ t: 'usage', usage });
+  }
+
+  setTasks(tasks) {
+    this.#tasks = tasks;
+    this.#broadcast({ t: 'tasks', tasks });
+  }
+
+  // A side answer is live only; long text is split so no line passes LINE_MAX.
+  pushAside(id, text, done, error) {
+    const PART = 16 * 1024; // 16K UTF-16 units is at most 48 KiB of UTF-8, under LINE_MAX
+    const parts = [];
+    for (let i = 0; i < text.length; i += PART) parts.push(text.slice(i, i + PART));
+    if (!parts.length) parts.push('');
+    parts.forEach((part, i) => {
+      const last = i === parts.length - 1;
+      this.#broadcast({ t: 'aside', id, text: part, done: last && done, ...(last && error ? { error } : {}) });
+    });
+  }
+
+  // A new conversation: positions start again, clients are re-attached from the top.
+  reset() {
+    this.epoch = randomBytes(8).toString('hex');
+    this.#log = [];
+    this.#uuids = new Set();
+    this.#ready = false;
+    for (const s of this.#clients) s.write(this.#freshLines(0));
+  }
+
   get head() { return this.#log.length; }
   get log() { return this.#log; }
   get state() { return { working: this.#state.working, waiting: this.#state.waiting || this.#approvals.size > 0 }; }
@@ -112,7 +145,7 @@ export class ChatFeed {
       if (this.#approvals.delete(m.request_id ?? m.response?.request_id)) this.#publishState();
       return;
     }
-    if (!['user', 'assistant', 'result'].includes(m.type)) return;
+    if (!['user', 'assistant', 'result', 'cdash'].includes(m.type)) return;
     if (m.uuid) {
       if (this.#uuids.has(m.uuid)) return;
       this.#uuids.add(m.uuid);
@@ -209,15 +242,22 @@ export class ChatFeed {
 
   #attach(socket, { after, epoch }) {
     const from = epoch === this.epoch && Number.isInteger(after) && after >= 0 ? after : 0;
+    socket.write(this.#freshLines(from));
+    this.#clients.add(socket);
+  }
+
+  // What a new connection gets, from log position `from`.
+  #freshLines(from) {
     const lines = [{ t: 'hello', epoch: this.epoch, head: this.head }];
     for (const e of this.#log.slice(from)) lines.push({ t: 'ev', seq: e.seq, ev: e.ev });
     lines.push({ t: 'state', ...this.state });
     const out = lines.map(l => JSON.stringify(l) + '\n');
     out.push(this.#asksLine() + '\n'); // also when empty: a reconnecting agent drops asks settled meanwhile
     if (this.#settings) out.push(JSON.stringify({ t: 'settings', settings: this.#settings }) + '\n');
+    out.push(JSON.stringify({ t: 'tasks', tasks: this.#tasks }) + '\n'); // also when empty, like asks
+    if (this.#usage) out.push(JSON.stringify({ t: 'usage', usage: this.#usage }) + '\n');
     if (this.#ready) out.push('{"t":"ready"}\n');
-    socket.write(out.join(''));
-    this.#clients.add(socket);
+    return out.join('');
   }
 
   async #op(socket, m) {

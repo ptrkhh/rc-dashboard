@@ -2,7 +2,7 @@
 //! The supervisor (`chat-feed.mjs`) numbers events and replays from a
 //! position, so this side only remembers the last position and epoch it saw.
 
-use super::hub::{Answer, Attachment, Engine, EngineMsg, Sent};
+use super::hub::{Answer, AsideChunk, Attachment, Engine, EngineMsg, Sent};
 use crate::host::log::LogBuffer;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -44,6 +44,8 @@ type Reqs = Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>;
 
 struct Shared {
     reqs: Reqs,
+    /// Side questions in flight, by id; `done` or a dropped connection removes them.
+    asides: Mutex<HashMap<String, mpsc::Sender<AsideChunk>>>,
     next_rid: AtomicU64,
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
     acks: Acks,
@@ -123,6 +125,30 @@ impl Engine for NativeEngine {
         self.request("menu", json!({})).await.unwrap_or_else(|_| json!({}))
     }
 
+    async fn rewind(&self, uuid: &str, files: bool) -> Result<String, String> {
+        let data = self.request("rewind", json!({"uuid": uuid, "files": files})).await?;
+        Ok(data["text"].as_str().unwrap_or_default().to_string())
+    }
+
+    async fn rewind_undo(&self) -> Result<(), String> {
+        self.request("rewind_undo", json!({})).await.map(|_| ())
+    }
+
+    async fn aside(&self, id: &str, text: &str) -> Result<mpsc::Receiver<AsideChunk>, String> {
+        let (tx, rx) = mpsc::channel(64);
+        self.shared.asides.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), tx);
+        if let Err(e) = self.request("aside", json!({"id": id, "text": text})).await {
+            self.shared.asides.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+            return Err(e);
+        }
+        Ok(rx)
+    }
+
+    async fn aside_cancel(&self, id: &str) {
+        self.shared.asides.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        let _ = self.request("aside_cancel", json!({"id": id})).await;
+    }
+
     /// A second connection that resumes after `from - 1`; the supervisor's
     /// replay ends with its `state` line. The hub bounds how long it waits.
     async fn history(&self, from: u64, to: u64) -> Result<Vec<Value>, String> {
@@ -156,7 +182,7 @@ pub fn start(sock: PathBuf, log: Arc<LogBuffer>, name: String) -> (NativeEngine,
     // Roomy: the hub reads this channel while it waits on an ack the reader
     // routes, and Codex streams deltas.
     let (tx, rx) = mpsc::channel(4096);
-    let shared = Arc::new(Shared { reqs: Mutex::new(HashMap::new()), next_rid: AtomicU64::new(1), writer: tokio::sync::Mutex::new(None), acks: Mutex::new(HashMap::new()), epoch: Mutex::new(None) });
+    let shared = Arc::new(Shared { reqs: Mutex::new(HashMap::new()), asides: Mutex::new(HashMap::new()), next_rid: AtomicU64::new(1), writer: tokio::sync::Mutex::new(None), acks: Mutex::new(HashMap::new()), epoch: Mutex::new(None) });
     tokio::spawn(run(sock.clone(), Arc::clone(&shared), tx, log, name));
     (NativeEngine { shared, sock }, rx)
 }
@@ -221,6 +247,21 @@ async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, lo
                 },
                 Some("asks") => EngineMsg::Asks(v["asks"].as_array().cloned().unwrap_or_default()),
                 Some("settings") => EngineMsg::Settings(v["settings"].take()),
+                Some("usage") => EngineMsg::Usage(v["usage"].take()),
+                Some("tasks") => EngineMsg::Tasks(v["tasks"].as_array().cloned().unwrap_or_default()),
+                Some("aside") => {
+                    let id = v["id"].as_str().unwrap_or_default();
+                    let done = v["done"] == true;
+                    let sender = {
+                        let mut asides = shared.asides.lock().unwrap_or_else(|e| e.into_inner());
+                        if done { asides.remove(id) } else { asides.get(id).cloned() }
+                    };
+                    if let Some(tx) = sender {
+                        let chunk = AsideChunk { text: v["text"].as_str().unwrap_or_default().to_string(), done, error: v["error"].as_str().map(str::to_string) };
+                        let _ = tx.send(chunk).await;
+                    }
+                    continue;
+                }
                 Some("res") => {
                     let waiter = v["rid"].as_u64().and_then(|rid| shared.reqs.lock().unwrap_or_else(|e| e.into_inner()).remove(&rid));
                     if let Some(w) = waiter {
@@ -253,6 +294,8 @@ async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, lo
         // Waiters for acks on the dropped connection learn it at once.
         shared.acks.lock().unwrap_or_else(|e| e.into_inner()).clear();
         shared.reqs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Dropping the senders ends pending side answers (the socket reads that as a failure).
+        shared.asides.lock().unwrap_or_else(|e| e.into_inner()).clear();
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -458,5 +501,80 @@ mod tests {
         assert_eq!(sup.read_line().await, r#"{"t":"send","cid":"c3","text":"look","steer":false,"files":[{"path":"/u/up/a.png","kind":"image","mime":"image/png","name":"a.png","size":8}]}"#);
         sup.write_line(r#"{"t":"ack","cid":"c3","ok":true}"#).await;
         assert_eq!(sending.await.unwrap(), Ok(Sent::Confirmed));
+    }
+    #[tokio::test]
+    async fn usage_tasks_and_side_answers_reach_the_hub_and_the_asker() {
+        let (sock, mut sup) = fake_supervisor("p5");
+        let (engine, mut rx) = start(sock, log(), "cdash-a".into());
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
+        sup.write_line(r#"{"t":"usage","usage":{"cwd":"/w"}}"#).await;
+        sup.write_line(r#"{"t":"tasks","tasks":[{"id":"b1"}]}"#).await;
+        assert!(matches!(rx.recv().await, Some(EngineMsg::Usage(u)) if u["cwd"] == "/w"));
+        assert!(matches!(rx.recv().await, Some(EngineMsg::Tasks(t)) if t.len() == 1));
+        let asking = tokio::spawn(async move { let r = engine.aside("q1", "why?").await; (r, engine) });
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        assert_eq!((req["op"].as_str(), req["id"].as_str(), req["text"].as_str()), (Some("aside"), Some("q1"), Some("why?")));
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":true}).to_string()).await;
+        let (answer, engine) = asking.await.unwrap();
+        let mut answer = answer.unwrap();
+        sup.write_line(r#"{"t":"aside","id":"q1","text":"Be","done":false}"#).await;
+        sup.write_line(r#"{"t":"aside","id":"q1","text":"cause.","done":true}"#).await;
+        assert_eq!(answer.recv().await.unwrap().text, "Be");
+        let last = answer.recv().await.unwrap();
+        assert!(last.done && last.text == "cause." && last.error.is_none());
+        assert!(answer.recv().await.is_none(), "done removed the receiver's sender");
+        // A failed request unregisters; a cancel unregisters and asks the supervisor.
+        let e = Arc::new(engine);
+        let (e2, e3) = (Arc::clone(&e), Arc::clone(&e));
+        let failing = tokio::spawn(async move { e2.aside("q2", "x").await });
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":false,"error":"busy"}).to_string()).await;
+        assert_eq!(failing.await.unwrap().unwrap_err(), "busy");
+        let asking = tokio::spawn(async move { e3.aside("q3", "y").await });
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":true}).to_string()).await;
+        let mut third = asking.await.unwrap().unwrap();
+        let cancelling = { let e = Arc::clone(&e); tokio::spawn(async move { e.aside_cancel("q3").await }) };
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        assert_eq!((req["op"].as_str(), req["id"].as_str()), (Some("aside_cancel"), Some("q3")));
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":true}).to_string()).await;
+        cancelling.await.unwrap();
+        assert!(third.recv().await.is_none(), "cancel drops the sender");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_ends_pending_side_answers() {
+        let (sock, mut sup) = fake_supervisor("p5-drop");
+        let (engine, _rx) = start(sock, log(), "cdash-a".into());
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
+        let asking = tokio::spawn(async move { let r = engine.aside("q1", "why?").await; (r, engine) });
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":true}).to_string()).await;
+        let (answer, _engine) = asking.await.unwrap();
+        let mut answer = answer.unwrap();
+        sup.drop_connection().await;
+        assert!(answer.recv().await.is_none(), "the sender is dropped with the connection");
+    }
+
+    #[tokio::test]
+    async fn rewind_and_undo_are_requests_whose_results_come_back() {
+        let (sock, mut sup) = fake_supervisor("p5-rewind");
+        let (engine, _rx) = start(sock, log(), "cdash-a".into());
+        let engine = Arc::new(engine);
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
+        let e = Arc::clone(&engine);
+        let rewinding = tokio::spawn(async move { e.rewind("u2", true).await });
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        assert_eq!((req["op"].as_str(), req["uuid"].as_str(), &req["files"]), (Some("rewind"), Some("u2"), &json!(true)));
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":true,"data":{"text":"two"}}).to_string()).await;
+        assert_eq!(rewinding.await.unwrap(), Ok("two".to_string()));
+        let undoing = tokio::spawn(async move { engine.rewind_undo().await });
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        assert_eq!(req["op"].as_str(), Some("rewind_undo"));
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":false,"error":"nothing to undo"}).to_string()).await;
+        assert_eq!(undoing.await.unwrap(), Err("nothing to undo".to_string()));
     }
 }
