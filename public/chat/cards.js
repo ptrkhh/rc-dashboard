@@ -107,7 +107,9 @@
       if (!gone) {
         const go = btn('Submit', () => fire(frame(ask, u.picks)), busy || !complete(ask, u.picks));
         u.submit = go;
-        root.append(el('div', 'chat-card-actions')).append(go);
+        const row = el('div', 'chat-card-actions');
+        row.append(go);
+        root.append(row);
       }
     }
     const note = gone ? 'Already answered' : busy ? 'Sending…' : live && !live.ok ? live.error || 'Could not answer' : '';

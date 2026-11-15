@@ -594,6 +594,7 @@
     for (const h of c.state.held) {
       const item = el('div', 'chat-held-item');
       item.append(el('span', 'chat-held-text', h.text));
+      if (Array.isArray(h.files) && h.files.length) item.append(files(h.files.map(f => ({ ...f, ref: undefined })))); // uploads, not media: chips
       for (const [op, label] of [['now', 'Send now'], ['edit', 'Edit'], ['remove', 'Remove']]) {
         const b = el('button', '', label);
         b.type = 'button';

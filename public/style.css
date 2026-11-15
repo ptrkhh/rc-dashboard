@@ -822,6 +822,7 @@ button, input, select { font: inherit; }
 }
 .chat-held-item button:hover { background: var(--accent-weak); }
 .chat-held-item button:disabled { color: var(--text-faint); background: none; cursor: default; }
+.chat-held-item .chat-files { flex: none; justify-content: flex-start; }
 /* Phones: the message gets its own line, the controls sit under it. */
 @media (max-width: 599px) {
   .chat-held-item { flex-wrap: wrap; padding: 8px 4px 2px 12px; }
