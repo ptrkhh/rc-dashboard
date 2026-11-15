@@ -154,6 +154,8 @@ async fn choose(tui: &impl Tui, listed: &[Listed], target: usize, files: bool) -
         }
         tokio::time::sleep(POLL).await;
     };
+    // `(current)` sits below every listed prompt: a count that drifted from the transcript gets no Up.
+    (pos == listed.len()).then_some(())?;
     for j in 1..=listed.len() - target {
         tui.press("Up").await.ok()?;
         let (now, entry) = watch(tui, STEP_WAIT, |s| selector(s).filter(|(p, _)| *p != pos)).await?;
@@ -333,6 +335,8 @@ mod tests {
         drop_up: Option<usize>,
         /// The status leaves `dialog open` after this many Ups (stale or closed).
         lose_status_after: Option<usize>,
+        /// The status leaves `dialog open` when Enter opens the confirm screen.
+        lose_status_on_enter: bool,
         s: Mutex<State>,
     }
 
@@ -359,6 +363,7 @@ mod tests {
                 busy_between: false,
                 drop_up: None,
                 lose_status_after: None,
+                lose_status_on_enter: false,
                 s: Mutex::new(s),
             }
         }
@@ -472,7 +477,12 @@ mod tests {
                         (s.status, s.waiting_for) = ("idle".into(), None);
                     }
                 }
-                (View::Selector, "Enter") if s.cursor < self.entries.len() => s.view = View::Confirm,
+                (View::Selector, "Enter") if s.cursor < self.entries.len() => {
+                    s.view = View::Confirm;
+                    if self.lose_status_on_enter {
+                        (s.status, s.waiting_for) = ("idle".into(), None);
+                    }
+                }
                 (View::Confirm, "Escape") => s.view = View::Selector,
                 (View::Confirm, k) if self.options.iter().any(|(d, _)| d == k) => {
                     s.view = View::Closed;
@@ -600,6 +610,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_list_longer_than_the_transcript_gets_no_up() {
+        let tui = FakeTui::new(&["one", "extra", "two"]);
+        assert_eq!(drive(&tui, &listed(&["one", "two"]), 1, false).await.unwrap_err(), "rewind failed; use Terminal");
+        assert_eq!(tui.presses(), ["Escape", "Escape", "Escape"], "opened, counted, closed");
+        assert!(tui.closed());
+    }
+
+    #[tokio::test]
     async fn a_terminal_draft_is_never_escaped_away() {
         let tui = FakeTui::new(&["one"]).draft("half a thought");
         assert_eq!(drive(&tui, &listed(&["one"]), 0, false).await.unwrap_err(), "Clear the Terminal input first");
@@ -625,6 +643,10 @@ mod tests {
         let tui = FakeTui { lose_status_after: Some(2), ..FakeTui::new(&SPIKE) };
         assert!(drive(&tui, &listed(&SPIKE), 4, false).await.is_err());
         assert_eq!(tui.presses(), ["Escape", "Escape", "Up", "Up", "Escape"]);
+        let at_confirm = FakeTui { lose_status_on_enter: true, ..FakeTui::new(&SPIKE) };
+        assert_eq!(drive(&at_confirm, &listed(&SPIKE), 4, false).await.unwrap_err(), "rewind failed; use Terminal");
+        assert_eq!(at_confirm.presses(), ["Escape", "Escape", "Up", "Up", "Enter", "Escape", "Escape"], "no digit: confirm, then selector, backed out");
+        assert!(at_confirm.closed());
     }
 
     #[tokio::test]
