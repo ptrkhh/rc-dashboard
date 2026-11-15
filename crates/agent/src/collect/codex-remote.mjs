@@ -164,9 +164,12 @@ function toolMessages(item, completed = true) {
   return messages;
 }
 
+// A reasoning item as a thinking message body; null when it has no summary.
+const thinkingOf = item => { const thinking = (item.summary || []).join('\n\n'); return thinking ? [{ type: 'thinking', thinking }] : null; };
+
 const textOnly = async item => ({ content: item.content.filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text })) });
 
-async function replayHistory(codex, threadId, remoteSid, emit, submitted = new Set(), { shapeUser = textOnly } = {}) {
+async function replayHistory(codex, threadId, remoteSid, emit, submitted = new Set(), { shapeUser = textOnly, reasoning = false } = {}) {
   let cursor;
   const seen = new Set();
   do {
@@ -176,6 +179,11 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
     for (const turn of page.data) for (const item of turn.items) {
       for (const payload of toolMessages(item, item.status !== 'inProgress')) {
         await emit({ ...payload, uuid: messageUuid(remoteSid, threadId, turn.id, payload.message.id) }, turn);
+      }
+      const thinking = reasoning && item.type === 'reasoning' && thinkingOf(item);
+      if (thinking) {
+        await emit({ uuid: messageUuid(remoteSid, threadId, turn.id, item.id), type: 'assistant', message: { id: item.id, role: 'assistant', content: thinking } }, turn);
+        continue;
       }
       const role = item.type === 'userMessage' ? 'user' : item.type === 'agentMessage' ? 'assistant' : null;
       if (!role || (role === 'user' && submitted.has(item.clientId))) continue;
@@ -228,12 +236,17 @@ async function chatMessages(m, sid) {
       if (text || files.length) out = [{ type: 'user', message: { id: item.id, role: 'user', content: text ? [{ type: 'text', text }] : [] }, ...(files.length ? { files } : {}) }];
     } else if (item.type === 'agentMessage') {
       out = [{ type: 'assistant', message: { id: item.id, role: 'assistant', content: [{ type: 'text', text: item.text }] } }];
+    } else if (item.type === 'reasoning') {
+      const content = thinkingOf(item);
+      if (content) out = [{ type: 'assistant', message: { id: item.id, role: 'assistant', content } }];
     } else out = toolMessages(item);
+  } else if (m.method === 'turn/plan/updated') {
+    out = [{ type: 'cdash', subtype: 'todo', items: (p.plan || []).map(s => ({ text: s.step, status: s.status === 'inProgress' ? 'in_progress' : s.status })) }];
   } else if (m.method === 'turn/completed') {
     const status = p.turn?.status;
     out = [{ type: 'result', subtype: status === 'interrupted' ? 'interrupted' : status === 'completed' ? 'success' : 'error_during_execution' }];
   }
-  return out.map(msg => ({ ...msg, uuid: messageUuid('cdash-chat', sid, p.turnId ?? p.turn?.id, msg.message?.id ?? 'result') }));
+  return out.map(msg => msg.type === 'cdash' ? msg : ({ ...msg, uuid: messageUuid('cdash-chat', sid, p.turnId ?? p.turn?.id, msg.message?.id ?? 'result') }));
 }
 
 // A prompt's input blocks: text with the other files as `Attached:` lines, then each image as a data URL.
@@ -515,6 +528,9 @@ async function nativeLauncher(statePath, state, script) {
   const { ChatFeed } = await import(new URL('./chat-feed.mjs', import.meta.url));
   const asks = new Map(); // ask id -> { rpcId, questions } for a question, { implement: true } for the plan card
   let lastPlan = null, plan = null, models = null;
+  let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
+  const running = new Map(), children = new Map(); // id -> task; thread id -> { agent, title }
+  const publishTasks = () => feed.setTasks([...running.values()]);
   const publishSettings = () => feed.setSettings({ model: state.model, effort: state.effort, plan, agent: null, variant: null });
   const modelList = async () => models ??= await control.models();
   let skillCache = null, skillsAt = 0;
@@ -542,7 +558,7 @@ async function nativeLauncher(statePath, state, script) {
       prompts.set(msg.uuid, { turnId, text: msg.message.content.find(b => b.type === 'text')?.text ?? '' });
       if (firstOf.get(turnId) !== msg.uuid) msg = { ...msg, src: 'steer' };
     }
-    feed.accept(msg);
+    feed.accept(msg.ts ? msg : { ...msg, ts: new Date(turn?.startedAt ? turn.startedAt * 1000 : Date.now()).toISOString() });
   };
   const ops = {
     rewind: async ({ uuid }) => {
@@ -707,10 +723,31 @@ async function nativeLauncher(statePath, state, script) {
       asks.set(String(m.id), { rpcId: m.id, questions: p.questions || [] });
       feed.putAsk(questionAsk(m));
     }
+    if (m.method === 'thread/status/changed' && !mainThread(m, state.sid)) {
+      let kid = children.get(p.threadId);
+      if (!kid) {
+        const t = (await control.call('thread/read', { threadId: p.threadId, includeTurns: false }).catch(() => ({}))).thread || {};
+        children.set(p.threadId, kid = { agent: t.parentThreadId === state.sid, title: t.agentNickname || t.agentRole || t.name || t.preview || 'agent' });
+      }
+      if (kid.agent) {
+        if (p.status?.type === 'active') { if (!running.has(p.threadId)) running.set(p.threadId, { id: p.threadId, kind: 'agent', title: kid.title, started: Date.now() }); }
+        else running.delete(p.threadId);
+        publishTasks();
+      }
+    }
     if (!mainThread(m, state.sid)) return; // a subagent's turns and items are not this conversation; its questions (above) still are
     if (state.sid) {
       const chat = await chatMessages(m, state.sid);
       for (const msg of chat) if (replayed) replayed.push([msg, p.turn ?? { id: p.turnId }]); else accept(msg, p.turn ?? { id: p.turnId });
+    }
+    const shell = p.item?.type === 'commandExecution' && p.item.source === 'unifiedExecStartup';
+    if (shell && m.method === 'item/started') { running.set(p.item.id, { id: p.item.id, kind: 'shell', title: p.item.command, started: Date.now() }); publishTasks(); }
+    if (shell && m.method === 'item/completed' && running.delete(p.item.id)) publishTasks();
+    if (m.method === 'thread/tokenUsage/updated') {
+      const { total, last, modelContextWindow } = p.tokenUsage;
+      usage = { ...usage, context: { used: last.totalTokens, window: modelContextWindow ?? null },
+        tokens: { input: total.inputTokens, output: total.outputTokens, cache_read: total.cachedInputTokens, cache_write: total.cacheWriteInputTokens ?? 0 } };
+      feed.setUsage(usage);
     }
     if (m.method === 'item/agentMessage/delta') feed.delta(p.itemId, p.delta);
     if (m.method === 'thread/reverted' && p.threadId === state.sid) reread(); // chat's own revert too: it reaches every connection
@@ -732,6 +769,8 @@ async function nativeLauncher(statePath, state, script) {
       state.model = p.threadSettings.model;
       state.effort = p.threadSettings.effort;
       state.model_label = state.model;
+      usage = { ...usage, cwd: p.threadSettings.cwd ?? usage.cwd, model: state.model };
+      feed.setUsage(usage);
       if (p.threadSettings.collaborationMode) plan = p.threadSettings.collaborationMode.mode === 'plan';
       publishSettings();
     } else if (m.method === 'turn/started') state.working = true;
@@ -756,6 +795,8 @@ async function nativeLauncher(statePath, state, script) {
   state.effort = result.reasoningEffort;
   state.working = Boolean(control.turnId);
   publishSettings();
+  usage = { ...usage, cwd: result.thread.cwd ?? state.dir, model: state.model };
+  feed.setUsage(usage);
   // Naming persists an empty thread, so both clients can immediately resume it.
   await control.call('thread/name/set', { threadId: state.sid, name: state.display_name });
   state.chat_sock = await feed.listen(dir);
@@ -767,7 +808,7 @@ async function nativeLauncher(statePath, state, script) {
   const replay = () => {
     const mine = ++gen;
     replayed = [];
-    replayHistory(control, state.sid, 'cdash-chat', (msg, turn) => { if (gen === mine) accept(msg, turn); }, new Set(), { shapeUser: async item => {
+    replayHistory(control, state.sid, 'cdash-chat', (msg, turn) => { if (gen === mine) accept(msg, turn); }, new Set(), { reasoning: true, shapeUser: async item => {
       const p = await chatPrompt(item);
       return { content: p.text ? [{ type: 'text', text: p.text }] : [], ...(p.files.length ? { files: p.files } : {}) };
     } })
@@ -784,7 +825,9 @@ async function nativeLauncher(statePath, state, script) {
   const reread = () => {
     feed.reset();
     firstOf.clear(); prompts.clear();
-    replay(); // Task 10 also drops shell tasks here
+    for (const [id, t] of running) if (t.kind === 'shell') running.delete(id); // a revert kills background terminals
+    publishTasks();
+    replay();
   };
   if (resuming) replay(); else feed.ready();
   let restarting = false, killTimer;

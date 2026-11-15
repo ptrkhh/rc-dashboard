@@ -49,7 +49,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  const send=result=>process.stdout.write(JSON.stringify({id:m.id,result})+'\\n');
  if(m.method==='initialize')send({});
  if(m.method==='account/read')send({account:{type:'apiKey'},requiresOpenaiAuth:false});
- if(['thread/start','thread/resume'].includes(m.method))send({thread:{id:'01234567-1234-1234-1234-0123456789ab'},model:'gpt-check',reasoningEffort:'low'});
+ if(['thread/start','thread/resume'].includes(m.method))send({thread:{id:'01234567-1234-1234-1234-0123456789ab',cwd:process.env.CDASH_CHECK_ROOT},model:'gpt-check',reasoningEffort:'low'});
+ if(m.method==='thread/read')send({thread:{id:m.params.threadId,parentThreadId:'01234567-1234-1234-1234-0123456789ab',agentNickname:'Scout'}});
  if(m.method==='thread/name/set')send({});
  if(m.method==='thread/revert')send({thread:{id:'01234567-1234-1234-1234-0123456789ab',turns:[]}});
  if(m.method==='thread/turns/list'&&process.env.CDASH_CHECK_HISTORY)send(JSON.parse(process.env.CDASH_CHECK_HISTORY));
@@ -532,4 +533,32 @@ test('Codex refuses to rewind while a turn is running', { timeout: 30000 }, asyn
   const r = await res(c, 1);
   assert.deepEqual([r.ok, r.error], [false, 'Stop the turn or wait for it to finish']);
   assert.equal(f.rpc('thread/revert'), undefined);
+});
+
+test('Codex facts: usage, running shells and agents, thinking, checklist and times', { timeout: 20000 }, async t => {
+  const sid = '01234567-1234-1234-1234-0123456789ab';
+  const f = await fixture(t, '', process.platform, true, { history: { data: [{ id: 't1', startedAt: 1789000000, items: [
+    { id: 'u1', type: 'userMessage', content: [{ type: 'text', text: 'hello' }] }, { id: 'r1', type: 'reasoning', summary: ['Thought about it'], content: [] }] }], nextCursor: null } });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const evs = () => c.lines.filter(l => l.t === 'ev').map(l => l.ev);
+  assert.equal(evs()[0].ts, new Date(1789000000 * 1000).toISOString());
+  assert.deepEqual(evs()[1].message.content[0], { type: 'thinking', thinking: 'Thought about it' });
+  await f.inject({ method: 'thread/tokenUsage/updated', params: { threadId: sid, turnId: 't1', tokenUsage: {
+    total: { totalTokens: 900, inputTokens: 700, cachedInputTokens: 100, cacheWriteInputTokens: 0, outputTokens: 200, reasoningOutputTokens: 0 },
+    last: { totalTokens: 300, inputTokens: 250, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 50, reasoningOutputTokens: 0 }, modelContextWindow: 272000 } } });
+  await until(() => c.lines.some(l => l.t === 'usage' && l.usage.context));
+  assert.deepEqual(c.lines.findLast(l => l.t === 'usage').usage, { cwd: f.dir, model: 'gpt-check', context: { used: 300, window: 272000 },
+    tokens: { input: 700, output: 200, cache_read: 100, cache_write: 0 }, cost: null });
+  await f.inject({ method: 'item/started', params: { threadId: sid, turnId: 't2', item: { id: 'x1', type: 'commandExecution', source: 'unifiedExecStartup', command: 'npm run dev', status: 'inProgress' } } });
+  await f.inject({ method: 'thread/status/changed', params: { threadId: 'child-1', status: { type: 'active', activeFlags: [] } } });
+  await until(() => c.lines.findLast(l => l.t === 'tasks')?.tasks.length === 2);
+  assert.deepEqual(c.lines.findLast(l => l.t === 'tasks').tasks.map(x => [x.id, x.kind, x.title]), [['x1', 'shell', 'npm run dev'], ['child-1', 'agent', 'Scout']]);
+  await f.inject({ method: 'item/completed', params: { threadId: sid, turnId: 't2', item: { id: 'x1', type: 'commandExecution', source: 'unifiedExecStartup', command: 'npm run dev', status: 'completed', exitCode: 0 } } });
+  await f.inject({ method: 'thread/status/changed', params: { threadId: 'child-1', status: { type: 'idle' } } });
+  await until(() => c.lines.findLast(l => l.t === 'tasks').tasks.length === 0);
+  await f.inject({ method: 'turn/plan/updated', params: { threadId: sid, turnId: 't2', explanation: null, plan: [{ step: 'Read', status: 'completed' }, { step: 'Fix', status: 'inProgress' }] } });
+  await until(() => evs().some(e => e.subtype === 'todo'));
+  assert.deepEqual(evs().find(e => e.subtype === 'todo').items, [{ text: 'Read', status: 'completed' }, { text: 'Fix', status: 'in_progress' }]);
 });
