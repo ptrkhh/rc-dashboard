@@ -230,14 +230,14 @@ async function refreshModels(g, dir = $('#dir').value.trim()) {
 
 // navigator.clipboard needs a secure context, which a phone on plain-HTTP LAN
 // lacks; execCommand still works there. Last resort: show it for a long-press.
-async function copyText(text) {
-  try { await navigator.clipboard.writeText(text); toast('Session ID copied'); return; } catch {}
+async function copyText(text, label = 'Session ID') {
+  try { await navigator.clipboard.writeText(text); toast(`${label} copied`); return; } catch {}
   const ta = document.createElement('textarea');
   ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
   document.body.append(ta); ta.select();
   const ok = document.execCommand('copy');
   ta.remove();
-  toast(ok ? 'Session ID copied' : `Session ID: ${text}`);
+  toast(ok ? `${label} copied` : `${label}: ${text}`);
 }
 
 function toast(msg) {
@@ -364,6 +364,7 @@ function runningCard(r) {
 let lastRes = [];
 let listed = false; // a session list has arrived (render sets it; `polled` also counts failures)
 let lastRunning = []; // the last poll's running cards, for the chat header's Claude link
+let lastStats = null; // the last poll's stats, for the chat's usage sheet
 let lastPinned = [];
 // A session resumes only with its own provider's models: a Claude transcript and
 // a Codex thread cannot stand in for each other. Everything shown is concrete
@@ -455,6 +456,7 @@ function renderResumable() {
 }
 
 function render(d) {
+  lastStats = d.stats;
   $('#nrun').textContent = d.running.length;
   $('#npin').textContent = d.pinned?.length || 0;
   $('#nres').textContent = d.resumable.length;
@@ -763,6 +765,10 @@ function openChat(name, title) {
     name, title, wsUrl, toast,
     rcLink: lastRunning.find(r => r.name === name)?.rcLink || null,
     openTerm: (n, t) => openTerm(n, t),
+    store,
+    copy: text => copyText(text, 'Text'),
+    api,
+    limits: () => ({ claude: lastStats?.claudeUsage || [], codex: lastStats?.codexUsage || [] }),
   });
   document.body.classList.add('chat-open');
   chatFull = !wide.matches;

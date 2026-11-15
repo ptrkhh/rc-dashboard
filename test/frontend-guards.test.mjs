@@ -142,7 +142,7 @@ test('cards offer the session ID for copying once one exists', () => {
 test('copy reports success and shows the ID when the clipboard APIs fail', async () => {
   const app = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
   const code = app.slice(app.indexOf('async function copyText('), app.indexOf('function toast('));
-  const run = async (write, exec) => {
+  const run = async (write, exec, args = ['sid-123']) => {
     let toastMsg;
     const field = { style: {}, select() {}, remove() {} };
     const context = {
@@ -151,12 +151,20 @@ test('copy reports success and shows the ID when the clipboard APIs fail', async
       toast: msg => { toastMsg = msg; },
     };
     runInNewContext(`${code}; this.copy = copyText;`, context);
-    await context.copy('sid-123');
+    await context.copy(...args);
     return toastMsg;
   };
   assert.equal(await run(async () => {}, false), 'Session ID copied');
   assert.equal(await run(async () => { throw Error('denied'); }, true), 'Session ID copied');
   assert.equal(await run(async () => { throw Error('denied'); }, false), 'Session ID: sid-123');
+  assert.equal(await run(async () => {}, false, ['x', 'Text']), 'Text copied');
+  assert.equal(await run(async () => { throw Error('denied'); }, false, ['x', 'Text']), 'Text: x');
+});
+
+test('chat gets the store, copy, api and limits', () => {
+  const app = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const open = app.slice(app.indexOf('function openChat('), app.indexOf('function closeChat('));
+  for (const s of ['store,', 'copy:', 'api,', 'limits:']) assert.ok(open.includes(s), s);
 });
 
 test('external sessions without a link explain how to enable Remote Control instead of waiting forever', () => {
@@ -515,7 +523,7 @@ test('chat scripts load before app.js and the chat markup exists', () => {
   for (const f of ['chat/md.js', 'chat/store.js', 'chat/cards.js', 'chat/menu.js', 'chat/attach.js', 'chat/view.js']) {
     assert.ok(at(`<script src="${f}"></script>`) > 0 && at(`<script src="${f}"></script>`) < at('<script src="app.js"></script>'), f);
   }
-  for (const id of ['chat', 'chat-log', 'chat-cards', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'chat-chip', 'chat-menu', 'chat-settings', 'notify-toggle', 'chat-attach', 'chat-file', 'chat-atts', 'chat-viewer', 'chat-viewer-img'])
+  for (const id of ['chat', 'chat-log', 'chat-cards', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'chat-chip', 'chat-menu', 'chat-settings', 'notify-toggle', 'chat-attach', 'chat-file', 'chat-atts', 'chat-viewer', 'chat-viewer-img', 'chat-todo', 'chat-hint'])
     assert.ok(html.includes(`id="${id}"`), id);
   assert.ok(/id="chat"[^>]*\shidden/.test(html), 'chat starts hidden');
   assert.ok(at('<script src="chat/attach.js"></script>') < at('<script src="chat/view.js"></script>'));
@@ -537,6 +545,8 @@ test('the chat view never builds markup from conversation text', () => {
     assert.ok(uses.length > 0 && uses.every(u => /cdashMd\.render\(|=\s*''/.test(u)), f + uses.join('\n'));
     assert.ok(!/insertAdjacentHTML|document\.write|eval\(/.test(view));
   }
+  // Drafts go through app.js's guarded store, never straight to storage.
+  assert.ok(!readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8').includes('localStorage'));
 });
 test('the menu shows tool-supplied names as text only', () => {
   assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|eval\(/.test(readFileSync(new URL('../public/chat/menu.js', import.meta.url), 'utf8')));

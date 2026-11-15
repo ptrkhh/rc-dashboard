@@ -158,12 +158,14 @@
     <a id="chat-rc" class="chat-bar-btn" target="_blank" rel="noopener noreferrer" aria-label="Open in Claude" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg><span class="chat-bar-label">Open in Claude</span></a>
   </div>
   <div id="chat-banner" class="chat-banner" role="status" hidden></div>
+  <div id="chat-todo" class="chat-todo" hidden></div>
   <div id="chat-log" class="chat-log" aria-live="polite"></div>
   <button id="chat-jump" class="chat-jump" type="button" hidden>Jump to latest</button>
   <div id="chat-cards" class="chat-cards"></div>
   <div id="chat-held" class="chat-held"></div>
   <div id="chat-menu" class="chat-menu" role="listbox" hidden></div>
   <div id="chat-atts" class="chat-atts" hidden></div>
+  <div id="chat-hint" class="chat-hint" role="status" hidden></div>
   <form id="chat-form" class="chat-form">
     <button id="chat-attach" class="chat-attach" type="button" aria-label="Attach files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
     <input id="chat-file" type="file" multiple hidden>

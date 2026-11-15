@@ -48,6 +48,22 @@
       const v = e.target.closest('[data-view]');
       if (v && c) cdashAttach.view(v.dataset.view);
     });
+    log.addEventListener('click', e => {
+      if (!c) return;
+      const t = e.target;
+      const code = t.closest('[data-copy-code]');
+      if (code) { c.opts.copy(code.previousSibling.textContent); return; }
+      const think = t.closest('[data-think]');
+      if (think) { const k = think.dataset.think; if (!c.opened.delete(k)) c.opened.add(k); schedule(); return; }
+      if (t.closest('[data-undo]')) { sendFrame({ t: 'rewind_undo' }); return; }
+      const rowEl = t.closest('[data-row]');
+      const row = rowEl && (c.rows || []).find(r => r.key === rowEl.dataset.row);
+      if (!row) return;
+      const act = t.closest('[data-act]')?.dataset.act;
+      if (act === 'copy') c.opts.copy(row.text);
+      else if (act === 'rewind') { if (cdashChatStore.canRewind(c.state, row)) showRewind(row); }
+      else if (!t.closest('button, a, input') && !getSelection().toString()) { c.acted = c.acted === row.key ? null : row.key; schedule(); }
+    });
     cdashMenu.wire(sendFrame, () => c?.state ?? null);
     $('#chat-sheet-close').addEventListener('click', () => $('#chat-sheet').close());
     log.addEventListener('click', e => {
@@ -86,6 +102,8 @@
       if (u.pending() || (!text && !ready.length)) return;
       if (submitText(text, ready)) {
         input.value = '';
+        saveDraft();
+        c.hint = '';
         // remove(), not clear(): an upload removed mid-flight still holds the queue until the agent answers it.
         for (const i of [...u.items]) u.remove(i.key);
         grow();
@@ -99,7 +117,7 @@
         $('#chat-form').requestSubmit();
       }
     });
-    input.addEventListener('input', () => { grow(); if (c) renderComposer(); });
+    input.addEventListener('input', () => { grow(); if (c) { saveDraft(); renderComposer(); } });
     cdashAttach.wire(() => c?.uploads ?? null, schedule);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden && c && !c.ws && !c.done) { clearTimeout(c.retryTimer); connect(); }
@@ -115,6 +133,7 @@
       opts, state: cdashChatStore.initial(), ws: null, nodes: new Map(), raf: 0,
       attempt: 0, retryTimer: 0, done: false, follow: true, paging: false, paged: false,
       link: 'Connecting…', since: 0, clock: 0,
+      acted: null, opened: new Set(), todoOpen: false, hint: '',  // row with its action line, open Thinking rows
     };
     $('#chat-title').textContent = opts.title || opts.name;
     const rc = $('#chat-rc');
@@ -124,6 +143,8 @@
     $('#chat-log').textContent = '';
     $('#chat-jump').hidden = true;
     $('#chat').hidden = false;
+    $('#chat-input').value = opts.store.get(draftKey()) || '';
+    grow();
     c.clock = setInterval(() => { if (c?.state.working) renderStatus(); }, 1000);
     const x = c;
     // Read the socket per call: a reconnect replaces x.ws.
@@ -174,6 +195,7 @@
       let f;
       try { f = JSON.parse(e.data); } catch { return; }
       if (f.t === 'uploaded') { x.uploads.onFrame(f); return; }
+      if (f.t === 'rewound') { rewound(f); return; }
       if (f.t === 'hello') { x.attempt = 0; x.link = ''; ws.send(JSON.stringify({ t: 'focus', on: focusNow() })); }
       if (f.t === 'page') { x.paging = false; x.paged = true; }
       const wasWorking = x.state.working;
@@ -237,9 +259,61 @@
   function toBox(text) {
     const input = $('#chat-input');
     input.value = input.value ? input.value + '\n' + text : text;
+    saveDraft();
     grow();
     input.focus();
     renderComposer();
+  }
+
+  const draftKey = () => 'cdash-draft:' + c.opts.name;
+  // Attachments are not kept: only the text.
+  function saveDraft() {
+    const v = $('#chat-input').value;
+    if (v.trim()) c.opts.store.set(draftKey(), v); else c.opts.store.remove(draftKey());
+  }
+
+  // The answer to a rewind or an undo. It comes before the cut's reload, which leaves the box alone.
+  function rewound(f) {
+    const sheet = $('#chat-sheet');
+    if (!f.ok) {
+      c.opts.toast?.(f.error || 'Rewind failed');
+      const go = $('#chat-sheet-body .chat-rewind-go');
+      if (go) go.disabled = false;
+      return;
+    }
+    if (sheet.open && sheet.dataset.kind === 'rewind') sheet.close();
+    if (f.text) toBox(f.text);
+    const n = f.attachments || 0;
+    if (f.uuid) c.hint = n > 0 ? 'This prompt had ' + n + (n === 1 ? ' attachment' : ' attachments') + '; attach them again' : '';
+    schedule();
+  }
+
+  function showRewind(row) {
+    const sheet = $('#chat-sheet');
+    if (sheet.open) return;
+    sheet.dataset.kind = 'rewind';
+    $('#chat-sheet-title').textContent = 'Rewind to here?';
+    const body = $('#chat-sheet-body');
+    body.textContent = '';
+    body.append(el('p', 'chat-rewind-text', 'The conversation goes back to before this message. Its text returns to the composer.'));
+    let files = null;
+    if (c.state.tool === 'codex') body.append(el('p', 'chat-rewind-text', 'Files stay as they are.'));
+    else {
+      const label = el('label', 'chat-rewind-files');
+      files = el('input');
+      files.type = 'checkbox';
+      label.append(files, ' Also restore files');
+      body.append(label);
+    }
+    const bar = el('div', 'chat-rewind-actions');
+    const cancel = el('button', '', 'Cancel');
+    const go = el('button', 'chat-rewind-go', 'Rewind');
+    cancel.type = go.type = 'button';
+    cancel.onclick = () => sheet.close();
+    go.onclick = () => { if (sendFrame({ t: 'rewind', uuid: row.uuid, files: !!files?.checked })) go.disabled = true; };
+    bar.append(cancel, go);
+    body.append(bar);
+    sheet.showModal();
   }
 
   function grow() {
@@ -264,6 +338,30 @@
     if (r.kind === 'text') {
       const n = el('div', 'chat-text' + (r.streaming ? ' streaming' : ''));
       n.innerHTML = cdashMd.render(r.text);
+      return codeCopy(n);
+    }
+    if (r.kind === 'thinking') {
+      const n = el('div', 'chat-thinking');
+      const open = c.opened.has(r.key);
+      const b = el('button', 'chat-thinking-btn', 'Thinking');
+      b.type = 'button';
+      b.dataset.think = r.key;
+      b.setAttribute('aria-expanded', open);
+      n.append(b);
+      if (open) {
+        const body = el('div', 'chat-text chat-thinking-body');
+        body.innerHTML = cdashMd.render(r.text);
+        n.append(codeCopy(body));
+      }
+      return n;
+    }
+    if (r.kind === 'day') return el('div', 'chat-note chat-day', new Date(r.ts).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }));
+    if (r.kind === 'staged') {
+      const n = el('div', 'chat-note chat-staged');
+      const undo = el('button', '', 'Undo');
+      undo.type = 'button';
+      undo.dataset.undo = '';
+      n.append(el('span', '', r.count + (r.count === 1 ? ' message' : ' messages') + ' rewound'), undo);
       return n;
     }
     if (r.kind === 'user') {
@@ -336,6 +434,29 @@
     return box;
   }
 
+  // A Copy button beside each code block, outside the pre so it stays put while the code scrolls.
+  function codeCopy(n) {
+    for (const pre of n.querySelectorAll('pre')) {
+      const box = el('div', 'chat-code');
+      const b = el('button', 'chat-code-copy', 'Copy');
+      b.type = 'button';
+      b.dataset.copyCode = '';
+      pre.replaceWith(box);
+      box.append(pre, b);
+    }
+    return n;
+  }
+
+  // Under a tapped message: its time, Copy, and Rewind to here where the store allows it.
+  function actions(r) {
+    const a = el('div', 'chat-actions');
+    if (r.ts) a.append(el('span', 'chat-time', new Date(r.ts).toLocaleTimeString()));
+    const add = (label, act) => { const b = el('button', '', label); b.type = 'button'; b.dataset.act = act; a.append(b); };
+    add('Copy', 'copy');
+    if (cdashChatStore.canRewind(c.state, r)) add('Rewind to here', 'rewind');
+    return a;
+  }
+
   // "Ran `npm test`": the command shows as code, without the backticks.
   function labelled(node, text) {
     const m = /^(.*?)`(.*)`$/s.exec(text);
@@ -357,13 +478,14 @@
     let prev = null;
     for (const r of rows) {
       keep.add(r.key);
-      const sig = r.sig;
+      const acted = x.acted === r.key;
+      const sig = r.sig + (acted ? '|a' + cdashChatStore.canRewind(x.state, r) : '') + (x.opened.has(r.key) ? '|o' : '');
       let n = x.nodes.get(r.key);
       if (!n) {
-        n = { el: build(r), sig };
+        n = { el: decorate(r, acted), sig };
         x.nodes.set(r.key, n);
       } else if (n.sig !== sig) {
-        const fresh = build(r);
+        const fresh = decorate(r, acted);
         n.el.replaceWith(fresh);
         Object.assign(n, { el: fresh, sig });
       }
@@ -374,6 +496,10 @@
     for (const [k, n] of x.nodes) if (!keep.has(k)) { n.el.remove(); x.nodes.delete(k); }
     renderStatus();
     renderBanner();
+    renderTodo();
+    const hint = $('#chat-hint');
+    hint.textContent = x.hint;
+    hint.hidden = !x.hint;
     cdashCards.render($('#chat-cards'), x.state, sendFrame);
     cdashMenu.render(x.state);
     renderHeld();
@@ -387,6 +513,39 @@
     }
     $('#chat-jump').hidden = x.follow;
     askPage(log);
+  }
+
+  function decorate(r, acted) {
+    const n = build(r);
+    if (!['user', 'text', 'thinking'].includes(r.kind)) return n;
+    n.dataset.row = r.key;
+    if (acted) n.append(actions(r));
+    return n;
+  }
+
+  const MARK = { completed: '\u2713', in_progress: '\u2022' };
+  function renderTodo() {
+    const box = $('#chat-todo');
+    const t = cdashChatStore.todo(c.state);
+    const sig = t ? JSON.stringify(t.items) + c.todoOpen : '';
+    if (box.dataset.sig === sig) return;
+    box.dataset.sig = sig;
+    box.textContent = '';
+    box.hidden = !t;
+    if (!t) return;
+    const b = el('button', 'chat-todo-sum', t.done + ' of ' + t.total + ' done');
+    b.type = 'button';
+    b.setAttribute('aria-expanded', c.todoOpen);
+    b.onclick = () => { c.todoOpen = !c.todoOpen; renderTodo(); };
+    box.append(b);
+    if (!c.todoOpen) return;
+    const list = el('ul', 'chat-todo-list');
+    for (const i of t.items) {
+      const li = el('li', i.status === 'completed' ? 'done' : '');
+      li.append(el('span', 'chat-todo-mark', MARK[i.status] ?? '\u25cb'), el('span', '', i.text));
+      list.append(li);
+    }
+    box.append(list);
   }
 
   function renderHeld() {
@@ -466,6 +625,7 @@
   function showTools(key) {
     const row = (c.rows || []).find(r => r.key === key);
     if (!row) return;
+    $('#chat-sheet').dataset.kind = 'tools';
     const body = $('#chat-sheet-body');
     body.textContent = '';
     const title = $('#chat-sheet-title');

@@ -731,6 +731,53 @@ button, input, select { font: inherit; }
 
 .chat-note { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--text-faint); }
 .chat-note::before, .chat-note::after { content: ''; flex: 1; border-top: 1px solid var(--border); }
+.chat-staged button {
+  font: inherit; font-weight: 600; color: var(--accent); cursor: pointer;
+  background: none; border: 0; border-radius: var(--r-sm); padding: 4px 6px;
+}
+.chat-staged button:hover { background: var(--accent-weak); }
+
+/* Under a tapped message: its time, Copy, Rewind to here. */
+.chat-actions { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-muted); }
+.chat-actions button, .chat-code-copy {
+  font: inherit; font-size: 12px; font-weight: 600; color: var(--accent); cursor: pointer;
+  background: none; border: 0; border-radius: var(--r-sm); padding: 4px 6px;
+}
+.chat-actions button:hover, .chat-code-copy:hover { background: var(--accent-weak); }
+.chat-time { padding-right: 4px; }
+.chat-code { position: relative; }
+.chat-code-copy { position: absolute; top: 4px; right: 4px; background: var(--surface-2); }
+
+.chat-thinking { align-self: stretch; display: flex; flex-direction: column; gap: 6px; }
+.chat-thinking-btn {
+  align-self: flex-start; font: inherit; font-size: 13px; font-style: italic; color: var(--text-muted); cursor: pointer;
+  background: none; border: 1px solid var(--border); border-radius: var(--r-pill); padding: 4px 12px;
+}
+.chat-thinking-btn:hover { background: var(--surface); color: var(--text); }
+.chat-thinking-body { color: var(--text-muted); padding-left: 12px; border-left: 2px solid var(--border); }
+
+/* The pinned checklist: "3 of 5 done", tap for the list. */
+.chat-todo { padding: 6px var(--chat-pad); background: var(--surface); border-bottom: 1px solid var(--border); font-size: 13px; }
+.chat-todo[hidden] { display: none; }
+.chat-todo-sum { font: inherit; font-weight: 600; color: var(--text); cursor: pointer; background: none; border: 0; padding: 4px 0; }
+.chat-todo-list { list-style: none; margin: 4px 0 4px; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 40vh; overflow-y: auto; }
+.chat-todo-list li { display: flex; gap: 8px; }
+.chat-todo-list li.done { color: var(--text-muted); text-decoration: line-through; }
+.chat-todo-mark { flex: none; width: 1em; text-align: center; color: var(--accent); }
+
+.chat-hint { padding: 6px var(--chat-pad) 0; font-size: 12px; color: var(--text-muted); }
+.chat-hint[hidden] { display: none; }
+
+.chat-rewind-text { margin: 0; }
+.chat-rewind-files { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.chat-rewind-files input { accent-color: var(--accent); width: 16px; height: 16px; }
+.chat-rewind-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.chat-rewind-actions button {
+  font: inherit; font-weight: 600; padding: 8px 16px; cursor: pointer;
+  color: var(--text); background: none; border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.chat-rewind-actions .chat-rewind-go { background: var(--accent); border-color: transparent; color: var(--accent-contrast); }
+.chat-rewind-actions .chat-rewind-go:disabled { opacity: 0.6; cursor: default; }
 
 /* Sits over the bottom of the log, between it and the held list. */
 .chat-jump {
