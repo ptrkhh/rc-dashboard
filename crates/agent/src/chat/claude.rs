@@ -350,8 +350,11 @@ impl Tui for TmuxTui<'_> {
     }
     /// Cleared now when the box takes keys, else before the next send.
     async fn clear(&self, text: &str) {
-        *self.leftover.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
+        self.leave(text);
         picker::clear_leftover(self.ctx, self.name, self.pid, self.leftover).await;
+    }
+    fn leave(&self, text: &str) {
+        *self.leftover.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
     }
     async fn status(&self) -> (Option<String>, Option<String>) {
         session_file_for(&self.ctx.claude_dir, self.pid).await.map_or((None, None), |f| (f.status, f.waiting_for))
@@ -1095,7 +1098,6 @@ pub(crate) mod tests {
             assert_eq!((p["events"][3]["seq"].as_u64(), p["events"][3]["ev"]["uuid"].as_str()), (Some(4), Some("f0")), "{tag}: the source keeps what the hub kept");
         }
     }
-    /// The fixture's first record, which shows no event.
     #[tokio::test]
     async fn rewind_targets_a_listed_prompt_and_keys_go_only_to_an_idle_session() {
         let (ctx, dir) = fixture_ctx("rewind");
@@ -1112,6 +1114,7 @@ pub(crate) mod tests {
         assert!(!std::fs::read_to_string(dir.join("tmux-args")).unwrap_or_default().contains("send-keys"));
     }
 
+    /// The fixture's first record, which shows no event.
     const ROOT: &str = "b2d9530c-cfa3-452a-8335-e1f1ef9c5d5a";
     #[tokio::test]
     async fn the_engine_reports_usage_once_ready_with_the_session_folder_as_fallback() {
