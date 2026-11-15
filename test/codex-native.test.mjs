@@ -61,7 +61,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  if(m.method==='model/list')send({data:[{model:'gpt-check',displayName:'GPT Check',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'high'}],defaultReasoningEffort:'low'},{model:'gpt-mini',displayName:'GPT Mini',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'}],defaultReasoningEffort:'low'}],nextCursor:null});
  if(m.method==='skills/list')send({data:[{cwd:'/p',errors:[],skills:[{name:'lint',description:'Run lint',enabled:true,path:'/p/.codex/skills/lint/SKILL.md',scope:'repo'}]}]});
  if(m.method==='turn/start')send({turn:{id:m.params.threadId==='side-1'?'st1':'t3',status:'inProgress'}});
- if(m.method==='thread/fork')send({thread:{id:'side-1'}});
+ if(m.method==='thread/fork'){const go=()=>fs.existsSync(process.env.CDASH_CHECK_ROOT+'/hold-fork')?setTimeout(go,30):send({thread:{id:'side-1'}});go();}
  if(['thread/inject_items','thread/unsubscribe'].includes(m.method))send({});
 });
 `, { mode: 0o700 });
@@ -598,11 +598,18 @@ test('a Codex side question forks read-only, streams the answer aside, and clean
   await f.inject({ method: 'turn/started', params: { threadId: 'side-1', turn: { id: 'st1' } } });
   await f.inject({ method: 'item/agentMessage/delta', params: { threadId: 'side-1', turnId: 'st1', itemId: 's', delta: 'You asked' } });
   await f.inject({ method: 'item/completed', params: { threadId: 'side-1', turnId: 'st1', item: { id: 's', type: 'agentMessage', text: 'You asked', phase: 'final' } } });
+  await f.inject({ method: 'item/agentMessage/delta', params: { threadId: 'side-1', turnId: 'st1', itemId: 's2', delta: 'Also this' } });
   await f.inject({ method: 'turn/completed', params: { threadId: 'side-1', turn: { id: 'st1', status: 'completed' } } });
   await until(() => c.lines.some(l => l.t === 'aside' && l.done));
-  assert.deepEqual(c.lines.filter(l => l.t === 'aside'), [{ t: 'aside', id: 'q1', text: 'You asked', done: false }, { t: 'aside', id: 'q1', text: '', done: true }]);
+  assert.deepEqual(c.lines.filter(l => l.t === 'aside'), [{ t: 'aside', id: 'q1', text: 'You asked', done: false },
+    { t: 'aside', id: 'q1', text: '\n\nAlso this', done: false }, { t: 'aside', id: 'q1', text: '', done: true }], 'a new message is a new paragraph, as Claude joins text blocks');
   await until(() => f.rpc('thread/unsubscribe'));
   assert.deepEqual(f.rpc('thread/unsubscribe').params, { threadId: 'side-1' });
+  // a finished side's late notifications are still the side's: dropped, never read as a subagent
+  await f.inject({ method: 'thread/status/changed', params: { threadId: 'side-1', status: { type: 'active', activeFlags: [] } } });
+  await f.inject({ method: 'thread/tokenUsage/updated', params: { threadId: SID, tokenUsage: { total: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 }, last: { totalTokens: 7 }, modelContextWindow: 100 } } });
+  await until(() => c.lines.some(l => l.t === 'usage' && l.usage.context?.used === 7)); // handled in order, so the status above was too
+  assert.equal(f.rpc('thread/read'), undefined, 'a side thread is never read as a subagent');
   assert.ok(!c.lines.some(l => l.t === 'ev' || l.t === 'delta'), 'the side answer never reaches the conversation');
   assert.ok(!c.lines.some(l => l.t === 'state' && l.working), 'a side turn is not the main turn');
   assert.ok(!c.lines.some(l => l.t === 'tasks' && l.tasks.length), 'a side question is not a running agent');
@@ -613,6 +620,12 @@ test('a Codex side question forks read-only, streams the answer aside, and clean
   // a second question cancelled mid-turn
   c.write({ t: 'req', rid: 2, op: 'aside', id: 'q2', text: 'and then?' });
   assert.equal((await res(c, 2)).ok, true);
+  await until(() => f.rpc('turn/start')?.params.input[0].text === 'and then?');
+  // a side thread's server request is refused: no main waiting state, no card
+  await f.inject({ id: 88, method: 'item/tool/requestUserInput', params: { threadId: 'side-1', turnId: 'st1', itemId: 'q', questions: [] } });
+  await until(() => readFileSync(join(f.dir, 'wire.jsonl'), 'utf8').includes('"id":88,"error"'), 3000); // refused, not left hanging
+  assert.ok(!c.lines.some(l => l.t === 'state' && l.waiting), 'a side request never makes the main session wait');
+  assert.equal(asksNow(c).length, 0);
   c.write({ t: 'req', rid: 3, op: 'aside_cancel', id: 'q2' });
   assert.equal((await res(c, 3)).ok, true);
   await until(() => f.rpc('turn/interrupt'));
@@ -623,5 +636,26 @@ test('a Codex side question forks read-only, streams the answer aside, and clean
   await f.inject({ method: 'thread/tokenUsage/updated', params: { threadId: SID, tokenUsage: { total: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 }, last: { totalTokens: 9 }, modelContextWindow: 100 } } });
   await until(() => c.lines.some(l => l.t === 'usage' && l.usage.context?.used === 9));
   assert.ok(!c.lines.some(l => l.t === 'aside' && l.id === 'q2'), 'a cancelled question sends nothing more');
+  c.close();
+});
+
+test('a Codex side question answers at once, and a cancel during a slow fork closes the fork before any turn', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  await writeFile(join(f.dir, 'hold-fork'), '');
+  c.write({ t: 'req', rid: 1, op: 'aside', id: 'q1', text: 'slow?' });
+  await until(() => c.lines.some(l => l.t === 'res' && l.rid === 1), 3000); // not after the feed's 10 s op timeout
+  assert.equal((await res(c, 1)).ok, true);
+  await until(() => f.rpc('thread/fork'));
+  c.write({ t: 'req', rid: 2, op: 'aside_cancel', id: 'q1' });
+  assert.equal((await res(c, 2)).ok, true);
+  await rm(join(f.dir, 'hold-fork'));
+  await until(() => f.rpc('thread/unsubscribe'));
+  assert.deepEqual(f.rpc('thread/unsubscribe').params, { threadId: 'side-1' });
+  assert.equal(f.rpc('thread/inject_items'), undefined);
+  assert.equal(f.rpc('turn/start'), undefined, 'a cancelled side question never starts a turn');
+  assert.ok(!c.lines.some(l => l.t === 'aside'), 'a cancelled question sends nothing');
   c.close();
 });

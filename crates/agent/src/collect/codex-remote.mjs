@@ -546,9 +546,32 @@ async function nativeLauncher(statePath, state, script) {
   let lastPlan = null, plan = null, models = null;
   let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
   const running = new Map(), children = new Map(); // id -> task; thread id -> { agent, title }
-  const sides = new Map(); // side thread id -> { id: question id, turnId }
-  const closeSide = (child, turnId) => (turnId ? control.call('turn/interrupt', { threadId: child, turnId }).catch(() => {}) : Promise.resolve())
-    .then(() => control.call('thread/unsubscribe', { threadId: child })).catch(() => {});
+  // A side question: { id, child, turnId, item, cancelled, closed }. `asking` holds it by question id from the
+  // moment it is asked; `sides` by its thread, kept once closed so the thread's late notifications are still dropped.
+  // ponytail: `sides` keeps one small entry per side question for the session's life.
+  const asking = new Map(), sides = new Map();
+  const closeSide = (side, interrupt = true) => {
+    side.closed = true;
+    const { child, turnId } = side;
+    (interrupt && turnId ? control.call('turn/interrupt', { threadId: child, turnId }).catch(() => {}) : Promise.resolve())
+      .then(() => control.call('thread/unsubscribe', { threadId: child })).catch(() => {});
+  };
+  const startSide = async (side, text) => {
+    try {
+      side.child = (await control.call('thread/fork', { threadId: state.sid, ephemeral: true, excludeTurns: true, model: state.model,
+        config: { model_reasoning_effort: state.effort }, sandbox: 'read-only', approvalPolicy: 'never' })).thread.id;
+      sides.set(side.child, side);
+      if (side.cancelled) return closeSide(side);
+      await control.call('thread/inject_items', { threadId: side.child, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: SIDE_BOUNDARY }] }] });
+      if (side.cancelled) return closeSide(side);
+      side.turnId = (await control.call('turn/start', { threadId: side.child, input: [{ type: 'text', text, text_elements: [] }] })).turn.id;
+      if (side.cancelled) closeSide(side); // cancelled while the turn started: interrupt it too
+    } catch (e) {
+      if (side.child) closeSide(side);
+      if (asking.get(side.id) === side) asking.delete(side.id);
+      if (!side.cancelled) feed.pushAside(side.id, '', true, e.message);
+    }
+  };
   const publishTasks = () => feed.setTasks([...running.values()]);
   const publishSettings = () => feed.setSettings({ model: state.model, effort: state.effort, plan, agent: null, variant: null });
   const modelList = async () => models ??= await control.models();
@@ -625,19 +648,18 @@ async function nativeLauncher(statePath, state, script) {
       publishSettings();
     },
     // A side question, as Codex's own /side: an ephemeral read-only fork that never touches the conversation.
-    aside: async ({ id, text }) => {
-      const child = (await control.call('thread/fork', { threadId: state.sid, ephemeral: true, excludeTurns: true, model: state.model,
-        config: { model_reasoning_effort: state.effort }, sandbox: 'read-only', approvalPolicy: 'never' })).thread.id;
+    // It answers at once; the fork, the boundary and the turn run behind, so a slow fork stays cancellable.
+    aside: ({ id, text }) => {
       const side = { id };
-      sides.set(child, side);
-      try {
-        await control.call('thread/inject_items', { threadId: child, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: SIDE_BOUNDARY }] }] });
-        side.turnId = (await control.call('turn/start', { threadId: child, input: [{ type: 'text', text, text_elements: [] }] })).turn.id;
-      } catch (e) { sides.delete(child); closeSide(child); throw e; }
-      if (sides.get(child) !== side) closeSide(child, side.turnId); // cancelled while it started
+      asking.set(id, side);
+      void startSide(side, text);
     },
     aside_cancel: ({ id }) => {
-      for (const [child, side] of sides) if (side.id === id) { sides.delete(child); closeSide(child, side.turnId); }
+      const side = asking.get(id);
+      if (!side) return;
+      asking.delete(id);
+      side.cancelled = true;
+      if (side.child) closeSide(side);
     },
     menu: async () => {
       const list = await modelList();
@@ -748,6 +770,22 @@ async function nativeLauncher(statePath, state, script) {
   };
   control = new Codex(async m => {
     const p = m.params || {};
+    const side = sides.get(p.threadId); // first: a side thread is never the conversation, a running agent or a card
+    if (side) {
+      if (m.id != null && m.method) control.send({ id: m.id, error: { code: -32000, message: 'a side question cannot ask' } });
+      if (side.closed) return;
+      if (m.method === 'item/agentMessage/delta') {
+        const gap = side.item && side.item !== p.itemId ? '\n\n' : ''; // a new message is a new paragraph, as Claude joins text blocks
+        side.item = p.itemId;
+        feed.pushAside(side.id, gap + p.delta, false);
+      }
+      if (m.method === 'turn/completed') {
+        if (asking.get(side.id) === side) asking.delete(side.id);
+        feed.pushAside(side.id, '', true, p.turn.status === 'completed' ? undefined : p.turn.error?.message || 'side question failed');
+        closeSide(side, false);
+      }
+      return;
+    }
     if (m.id != null && m.method) feed.setState({ waiting: true }); // a server request: an approval or a question
     if (m.method === 'serverRequest/resolved') {
       feed.setState({ waiting: false });
@@ -757,16 +795,6 @@ async function nativeLauncher(statePath, state, script) {
     if (m.method === 'item/tool/requestUserInput') {
       asks.set(String(m.id), { rpcId: m.id, questions: p.questions || [] });
       feed.putAsk(questionAsk(m));
-    }
-    const side = sides.get(p.threadId); // first: a side thread is never a running agent (or the conversation)
-    if (side) {
-      if (m.method === 'item/agentMessage/delta') feed.pushAside(side.id, p.delta, false);
-      if (m.method === 'turn/completed') {
-        sides.delete(p.threadId);
-        feed.pushAside(side.id, '', true, p.turn.status === 'completed' ? undefined : p.turn.error?.message || 'side question failed');
-        closeSide(p.threadId);
-      }
-      return;
     }
     if (m.method === 'thread/status/changed' && !mainThread(m, state.sid)) {
       let kid = children.get(p.threadId);
