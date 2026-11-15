@@ -137,6 +137,7 @@ async fn pump(
                             continue;
                         }
                         if let ClientFrame::Aside { id, text } = frame {
+                            // ponytail: a run that already answered may still be exiting (up to 5 s) beside the new one; harmless.
                             if let Some((old, _)) = aside.take() {
                                 hub.aside_cancel(old).await;
                             }
@@ -409,7 +410,7 @@ mod tests {
         assert!(log.contains("chat aside cdash-a") && !log.contains(" hi") && !log.contains("tests."), "{log}");
     }
     #[tokio::test]
-    async fn cancelling_or_closing_the_socket_kills_the_side_question() {
+    async fn a_new_question_cancelling_or_closing_the_socket_kills_the_side_question() {
         use crate::chat::claude::aside_tests::stub_claude;
         let (b, dir) = chat_server("aside-kill").await;
         write_session(&dir, &format!(r#"{{"sessionId":"sid-1","cwd":"{}","status":"idle"}}"#, dir.display()));
@@ -418,18 +419,19 @@ mod tests {
         stub_claude(&dir, &format!("while :; do echo x >> '{}'; sleep 0.05; done", tick.display()));
         let mut ws = connect(b.addr, "name=cdash-a", None).await.unwrap();
         next_of(&mut ws, "state").await;
-        let pids = || b.ctx.own_pids.lock().unwrap().len();
-        for (id, close) in [("q1", r#"{"t":"aside_cancel","id":"q1"}"#), ("q2", "")] {
-            ws.send(WsMsg::Text(format!(r#"{{"t":"aside","id":"{id}","text":"why?"}}"#).into())).await.unwrap();
-            eventually("the side question runs", || pids() == 1).await;
-            if close.is_empty() {
-                drop(ws);
-                eventually("closing the socket kills it", || pids() == 0).await;
-                break;
-            }
-            ws.send(WsMsg::Text(close.into())).await.unwrap();
-            eventually("cancel kills it", || pids() == 0).await;
-        }
+        let pids = || b.ctx.own_pids.lock().unwrap().clone();
+        let ask = |id: &str| WsMsg::Text(format!(r#"{{"t":"aside","id":"{id}","text":"why?"}}"#).into());
+        ws.send(ask("q0")).await.unwrap();
+        eventually("the first side question runs", || pids().len() == 1).await;
+        let first = pids();
+        ws.send(ask("q1")).await.unwrap();
+        eventually("a second question kills the first", || pids().len() == 1 && pids().is_disjoint(&first)).await;
+        ws.send(WsMsg::Text(r#"{"t":"aside_cancel","id":"q1"}"#.into())).await.unwrap();
+        eventually("cancel kills it", || pids().is_empty()).await;
+        ws.send(ask("q2")).await.unwrap();
+        eventually("the third side question runs", || pids().len() == 1).await;
+        drop(ws);
+        eventually("closing the socket kills it", || pids().is_empty()).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let size = || std::fs::metadata(&tick).map_or(0, |m| m.len());
         let after = size();

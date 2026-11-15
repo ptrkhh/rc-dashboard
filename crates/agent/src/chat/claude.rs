@@ -62,7 +62,7 @@ pub fn aside_chunk(line: &str) -> Option<AsideChunk> {
     match v["type"].as_str()? {
         "assistant" => {
             let blocks = v["message"]["content"].as_array()?;
-            let text: String = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+            let text = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n\n");
             (!text.is_empty()).then_some(AsideChunk { text, done: false, error: None })
         }
         "result" => {
@@ -134,6 +134,8 @@ pub struct ClaudeEngine {
     transcript: Arc<Mutex<Option<PathBuf>>>,
     shared: Arc<Shared>,
     chip_wait: Duration,
+    /// `ASIDE_MAX`, shorter in tests.
+    aside_max: Duration,
 }
 
 /// The hook cards and the session's settings, shared by the engine, its loop
@@ -362,35 +364,47 @@ impl Engine for ClaudeEngine {
         let own = picker::OwnPid::new(&self.ctx, child.id().map(|p| p as i32));
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let (tx, rx) = mpsc::channel(16);
+        let max = self.aside_max;
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
+            // `Some(answered)`, `false` when the receiver went away; `None` when the stream ended first.
             let read = async {
                 loop {
                     let line = tokio::select! {
                         l = lines.next_line() => l,
-                        () = tx.closed() => return Ok(false),
+                        () = tx.closed() => return Some(false),
                     };
-                    let Ok(Some(line)) = line else { return Err("no answer") };
+                    let Ok(Some(line)) = line else { return None };
                     if let Some(c) = aside_chunk(&line) {
                         let done = c.done;
                         if tx.send(c).await.is_err() {
-                            return Ok(false);
+                            return Some(false);
                         }
                         if done {
-                            return Ok(true);
+                            return Some(true);
                         }
                     }
                 }
             };
             // ponytail: a killed run can leave its `~/.claude/sessions/<pid>.json`; the collector skips dead pids.
-            match tokio::time::timeout(ASIDE_MAX, read).await.unwrap_or(Err("no answer in 5 minutes")) {
-                Ok(true) => {
-                    let _ = tokio::time::timeout(ASIDE_EXIT, child.wait()).await;
+            // ponytail: an answered run may spend up to `ASIDE_EXIT` exiting while the next question starts a second
+            // one; harmless, it has already answered.
+            let error = match tokio::time::timeout(max, read).await {
+                Ok(Some(answered)) => {
+                    if answered {
+                        let _ = tokio::time::timeout(ASIDE_EXIT, child.wait()).await;
+                    }
+                    None
                 }
-                Ok(false) => {}
-                Err(e) => {
-                    let _ = tx.send(AsideChunk { text: String::new(), done: true, error: Some(e.into()) }).await;
-                }
+                // stderr stays discarded: the exit code says why without echoing anything.
+                Ok(None) => Some(match tokio::time::timeout(ASIDE_EXIT, child.wait()).await.ok().and_then(Result::ok).and_then(|s| s.code()) {
+                    Some(code) => format!("no answer (claude exited {code})"),
+                    None => "no answer".to_string(),
+                }),
+                Err(_) => Some("no answer in 5 minutes".to_string()),
+            };
+            if let Some(e) = error {
+                let _ = tx.send(AsideChunk { text: String::new(), done: true, error: Some(e) }).await;
             }
             drop(child); // `kill_on_drop` ends it if it still runs
             drop(own);
@@ -464,6 +478,7 @@ pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Rece
         transcript: Arc::clone(&transcript),
         shared: Arc::clone(&shared),
         chip_wait: CHIP_WAIT,
+        aside_max: ASIDE_MAX,
     };
     tokio::spawn(async move {
         run(ctx, name, pid, tx, transcript, shared, &live).await;
@@ -1058,6 +1073,7 @@ pub(crate) mod tests {
             transcript: Arc::new(Mutex::new(None)),
             shared,
             chip_wait: wait,
+            aside_max: ASIDE_MAX,
         }
     }
 
@@ -1273,6 +1289,8 @@ pub(crate) mod aside_tests {
     fn stream_json_lines_become_chunks() {
         let c = aside_chunk(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi"}]}}"#).unwrap();
         assert_eq!((c.text.as_str(), c.done, c.error), ("Hi", false, None));
+        let two = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"One"},{"type":"tool_use"},{"type":"text","text":"Two"}]}}"#;
+        assert_eq!(aside_chunk(two).unwrap().text, "One\n\nTwo");
         assert!(aside_chunk(r#"{"type":"result","subtype":"success","is_error":false,"result":"Hi"}"#).is_some_and(|c| c.done && c.text.is_empty() && c.error.is_none()));
         assert!(aside_chunk(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"overloaded"}"#).is_some_and(|c| c.done && c.error.as_deref() == Some("overloaded")));
         assert!(aside_chunk(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#).is_some_and(|c| c.error.as_deref() == Some("side question failed")));
@@ -1295,14 +1313,25 @@ pub(crate) mod aside_tests {
     #[tokio::test]
     async fn a_stream_without_a_result_ends_with_no_answer_and_no_session_refuses() {
         let (ctx, dir) = aside_fixture("aside-cut");
-        stub_claude(&dir, &print_lines(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Half"}]}}"#));
+        stub_claude(&dir, &format!("{}exit 3", print_lines(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Half"}]}}"#)));
         let (engine, _rx) = ready(&ctx).await;
         let mut answer = engine.aside("q1", "why?").await.unwrap();
         assert_eq!(answer.recv().await.unwrap().text, "Half");
         let end = answer.recv().await.unwrap();
-        assert_eq!((end.done, end.error.as_deref()), (true, Some("no answer")));
+        assert_eq!((end.done, end.error.as_deref()), (true, Some("no answer (claude exited 3)")));
         lock(&engine.live).sid = None;
         assert_eq!(engine.aside("q2", "why?").await.err().as_deref(), Some("no session yet"));
+    }
+    #[tokio::test]
+    async fn a_side_question_that_outlives_its_limit_is_killed_and_says_so() {
+        let (ctx, dir) = aside_fixture("aside-slow");
+        stub_claude(&dir, "exec sleep 30");
+        let (mut engine, _rx) = ready(&ctx).await;
+        engine.aside_max = Duration::from_millis(300);
+        let mut answer = engine.aside("q1", "why?").await.unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(10), answer.recv()).await.expect("ends at the limit").unwrap();
+        assert_eq!((end.done, end.error.as_deref()), (true, Some("no answer in 5 minutes")));
+        eventually("the pid is forgotten", || ctx.own_pids.lock().unwrap().is_empty()).await;
     }
     #[tokio::test]
     async fn closing_the_answer_kills_the_process_and_forgets_its_pid() {
