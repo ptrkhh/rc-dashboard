@@ -43,15 +43,16 @@ function messageUuid(remoteSid, nativeSid, messageId, part) {
 function editFiles(files) {
   let room = 16 * 1024;
   return files.filter(f => f && typeof f === 'object').map(f => {
-    const out = { file: f.file ?? f.relativePath ?? f.filePath, additions: f.additions ?? 0, deletions: f.deletions ?? 0 };
-    if (typeof f.patch === 'string' && f.patch.length <= room) { out.patch = f.patch; room -= f.patch.length; }
+    const out = { file: String(f.file ?? f.relativePath ?? f.filePath ?? ''), additions: Number(f.additions) || 0, deletions: Number(f.deletions) || 0 };
+    const patch = f.patch ?? f.diff, size = typeof patch === 'string' ? Buffer.byteLength(patch) : Infinity;
+    if (size <= room) { out.patch = patch; room -= size; }
     return out;
   });
 }
 
 export function historyMessages(row, nativeSid, remoteSid, submitted = new Set(), { chat = false } = {}) {
   const messages = [];
-  const ts = chat && row.time?.created ? { ts: new Date(row.time.created).toISOString() } : {};
+  const ts = chat && row.time?.created != null && Number.isFinite(Number(row.time.created)) ? { ts: new Date(Number(row.time.created)).toISOString() } : {};
   const emit = (part, payload) => messages.push({ ...payload, ...ts, uuid: messageUuid(remoteSid, nativeSid, row.id, part) });
   if (row.type === 'user' && typeof row.text === 'string' && !submitted.has(row.id)) {
     emit('user', { type: 'user', message: { id: row.id, role: 'user', content: [{ type: 'text', text: row.text }] } });
@@ -583,7 +584,7 @@ async function supervise(statePath, name) {
     const publishUsage = patch => { usage = { ...usage, ...patch }; feed.setUsage(usage); };
     const readUsage = async () => {
       const session = (await client.request(sessionPath)).data;
-      modelList ??= await list('/api/model');
+      modelList ??= await list('/api/model').catch(() => null); // a failing model list must not block tokens and cost
       publishUsage({ cwd: session?.location?.directory ?? usage.cwd, ...(session?.tokens && { tokens: tokensOf(session.tokens) }), ...(session?.cost != null && { cost: session.cost }),
         context: lastTokens ? { used: usedOf(lastTokens), window: windowOf(usage.model) } : usage.context });
     };
@@ -593,14 +594,17 @@ async function supervise(statePath, name) {
     const publishTasks = () => feed.setTasks([...shells.values(), ...subagents.values()]);
     const addShell = info => {
       if (info?.id && info.status === 'running' && (info.metadata?.sessionID === state.sid || children.has(info.metadata?.sessionID)))
-        shells.set(info.id, { id: info.id, kind: 'shell', title: info.command, started: new Date(info.time?.started ?? Date.now()).toISOString() });
+        shells.set(info.id, { id: info.id, kind: 'shell', title: info.command, started: new Date(Number.isFinite(Number(info.time?.started)) ? Number(info.time.started) : Date.now()).toISOString() });
     };
     const addAgent = id => subagents.set(id, { id, kind: 'agent', title: children.get(id) ?? id, started: new Date().toISOString() });
     const loadTasks = async () => {
-      for (const c of await list('/api/session?' + new URLSearchParams({ parentID: state.sid }))) children.set(c.id, c.title ?? c.id);
+      const kids = await list('/api/session?' + new URLSearchParams({ parentID: state.sid }));
+      const found = await list('/api/shell');
+      const active = Object.keys((await client.request('/api/session/active')).data ?? {}); // all reads first: a failure keeps the list as it was
+      for (const c of kids) children.set(c.id, c.title ?? c.id);
       shells.clear(); subagents.clear();
-      for (const sh of await list('/api/shell')) addShell(sh);
-      for (const id of Object.keys((await client.request('/api/session/active')).data ?? {})) if (children.has(id)) addAgent(id);
+      for (const sh of found) addShell(sh);
+      for (const id of active) if (children.has(id)) addAgent(id);
       publishTasks();
     };
     const taskEvent = (type, data) => {
@@ -682,7 +686,7 @@ async function supervise(statePath, name) {
       const data = event.data || {};
       taskEvent(event.type, data);
       if (data.sessionID !== state.sid) return;
-      if (event.type === 'session.usage.updated') publishUsage({ tokens: tokensOf(data.tokens ?? {}), cost: data.cost ?? usage.cost });
+      if (event.type === 'session.usage.updated' && data.tokens) publishUsage({ tokens: tokensOf(data.tokens), cost: data.cost ?? usage.cost });
       else if (event.type === 'session.step.ended' && data.tokens) publishUsage({ context: { used: usedOf(data.tokens), window: usage.context?.window ?? windowOf(usage.model) } });
       else if (event.type === 'session.model.selected' && data.model) { const model = `${data.model.providerID}/${data.model.id}`; publishUsage({ model, ...(usage.context && { context: { ...usage.context, window: windowOf(model) } }) }); }
       if (['session.revert.staged', 'session.revert.cleared', 'session.revert.committed'].includes(event.type)) return rebuild();
@@ -692,14 +696,16 @@ async function supervise(statePath, name) {
       else if (event.type === 'session.model.selected') updateModel(state, data.model);
       else return;
       await saveNative();
-    }), () => enqueue(async () => {
+    }), () => {
+      enqueue(async () => {
       const active = (await client.request('/api/session/active')).data;
       const session = (await client.request(`/api/session/${encodeURIComponent(state.sid)}`)).data;
       state.working = Boolean(active?.[state.sid]);
       if (session?.model) updateModel(state, session.model);
       await saveNative();
-      await loadTasks().catch(error => log.write('chat tasks: ' + error.message + '\n').catch(() => {}));
-    }), events.signal);
+      });
+      enqueue(() => loadTasks().catch(error => log.write('chat tasks: ' + error.message + '\n').catch(() => {}))); // its own step: a failed read above cannot skip it
+    }, events.signal);
     tui = spawn('opencode', ['--server', client.url, '--session', state.sid, '--auto'], { cwd: state.dir, env: { ...nativeEnv(), OPENCODE_PASSWORD: client.password }, stdio: 'inherit' });
     tui.once('error', () => stop().then(() => process.exit(1)));
     tui.once('exit', code => { if (!closing) stop().then(() => process.exit(code || 0)); });

@@ -450,7 +450,7 @@ test('a revert staged at start shows the staged row, and a replaced bridge does 
   await f.wait(() => f.native()?.chat_sock);
   const c = await client(f.native().chat_sock, { after: 0, epoch: null });
   await until(() => c.lines.some(l => l.ev?.subtype === 'staged'));
-  await until(() => c.lines.at(-1).t === 'ready');
+  await until(() => c.lines.some((l, i) => l.t === 'ready' && c.lines.slice(0, i).some(x => x.ev?.subtype === 'staged')));
   assert.deepEqual(afterReset(c.lines), ['hello', 'hi there', 'staged']);
   const reads = f.reads();
   await writeFile(join(f.dir, 'fail-msg'), '1');                // the next history read fails: the bridge is replaced
@@ -505,4 +505,21 @@ test('OpenCode facts: usage, running shells and subagents', { timeout: 20000 }, 
   await until(() => c.lines.findLast(l => l.t === 'tasks').tasks.length === 0);
   await f.emit({ type: 'session.usage.updated', data: { sessionID: 'ses_fixture', cost: 0.5, tokens: { input: 20, output: 5, reasoning: 0, cache: { read: 100, write: 20 } } } });
   await until(() => c.lines.findLast(l => l.t === 'usage').usage.cost === 0.5);
+});
+
+test('a live shell and a live child session come and go in the running list', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  const ids = () => c.lines.findLast(l => l.t === 'tasks')?.tasks.map(x => x.id);
+  await until(() => ids()?.join() === 'sh_1');
+  await f.emit({ type: 'shell.created', data: { info: { id: 'sh_2', status: 'running', command: 'make', metadata: { sessionID: 'ses_fixture' }, time: { started: 1789000000000 } } } });
+  await until(() => ids().join() === 'sh_1,sh_2');
+  await f.emit({ type: 'shell.exited', data: { id: 'sh_2', status: 'exited' } });
+  await until(() => ids().join() === 'sh_1');
+  await f.emit({ type: 'session.created', data: { sessionID: 'ses_kid', parentID: 'ses_fixture', title: 'Kid' } });
+  await f.emit({ type: 'session.execution.started', data: { sessionID: 'ses_kid' } });
+  await until(() => ids().join() === 'sh_1,ses_kid');
+  await f.emit({ type: 'session.execution.succeeded', data: { sessionID: 'ses_kid' } });
+  await until(() => ids().join() === 'sh_1');
 });
