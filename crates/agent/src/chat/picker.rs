@@ -188,7 +188,8 @@ pub fn footer_mode(screen: &str) -> Option<&'static str> {
 pub fn confirm_ready(screen: &str, title: &str) -> bool {
     let lines: Vec<&str> = screen.lines().collect();
     let Some(at) = lines.iter().rposition(|l| l.contains(title)) else { return false };
-    lines[at + 1..].iter().any(|l| l.trim_start().starts_with('❯') && l.contains("Yes"))
+    // The dialog's own first option, a few lines under its title: not a `Yes` of some other dialog.
+    lines[at + 1..].iter().take(8).any(|l| l.trim_start().starts_with('❯') && l.contains("1. Yes"))
 }
 
 const WAITING: &str = "Answer the open question first";
@@ -426,6 +427,8 @@ mod tests {
         assert!(!confirm_ready(" Switch model?\n   1. Yes\n ❯ 2. No\n", "Switch model?"));
         assert!(!confirm_ready(" Background work is running\n ❯ 1. Exit and stop tasks\n", "Switch model?"));
         assert!(!confirm_ready(" ❯ 1. Yes\n Switch model?\n", "Switch model?"));
+        let far = format!(" Switch model?\n{} ❯ 1. Yes, delete\n", " text\n".repeat(12));
+        assert!(!confirm_ready(&far, "Switch model?"), "an old title far above another dialog's Yes");
     }
     #[test]
     fn a_footer_quoted_in_the_transcript_is_not_the_footer() {

@@ -707,7 +707,8 @@ impl<E: Engine> Actor<E> {
             }
             ClientFrame::Set { what, value } => {
                 // Claude's picker types `/model x` into the box: same rule as a send.
-                let r = match self.rewind_refusal() {
+                // Codex and OpenCode change settings over their API, mid-turn too.
+                let r = match self.rewind_refusal().filter(|_| self.tool == "claude") {
                     Some(e) => Err(e.to_string()),
                     None => self.engine.set(&what, &value).await,
                 };
@@ -1939,6 +1940,17 @@ mod tests {
         hub.command(send("c1", "hello")).await; // pending: Claude may not show it as working yet
         assert_eq!(reply(hub.command(ClientFrame::Set { what: "model".into(), value: json!("opus") }).await)["ok"], false, "/model would join the prompt");
         assert!(!calls.lock().unwrap().iter().any(|c| c.starts_with("set:")), "{:?}", calls.lock().unwrap());
+    }
+    #[tokio::test]
+    async fn codex_and_opencode_settings_change_mid_turn() {
+        let calls = Calls::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let engine = FakeEngine { calls: calls.clone(), sent: Sent::Confirmed, slow: None, has: u64::MAX, fail_rewind: false };
+        let hub = Hub::spawn_with("codex", engine, rx, Arc::new(crate::host::log::LogBuffer::new()), "cdash-c".into(), None);
+        tx.send(EngineMsg::Ready).await.unwrap();
+        tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
+        settle(&hub, &tx).await;
+        assert_eq!(reply(hub.command(ClientFrame::Set { what: "model".into(), value: json!("gpt-mini") }).await), json!({"t":"set","ok":true}), "an API call, no keys typed");
     }
     #[tokio::test]
     async fn a_command_the_engine_ran_itself_is_done_and_leaves_nothing_pending() {

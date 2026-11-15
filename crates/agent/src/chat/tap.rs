@@ -297,8 +297,9 @@ impl Tap {
     pub fn listed(&self) -> Vec<Listed> {
         let chain = std::iter::successors(self.last_main.as_deref(), |u| self.nodes.get(*u)?.parent.as_deref());
         let mut out: Vec<Listed> = Vec::new();
-        // A parent cycle in a damaged transcript ends after one pass.
-        for u in chain.take(self.nodes.len()) {
+        // A parent cycle in a damaged transcript ends at the first record seen twice.
+        let mut seen = std::collections::HashSet::new();
+        for u in chain.take_while(|u| seen.insert(*u)) {
             out.extend(self.prompts.get(u).cloned());
             // Walking back, the row pushed last is the first after the boundary.
             if let Some(p) = out.last_mut().filter(|_| self.nodes.get(u).is_some_and(|n| n.boundary)) {
@@ -832,6 +833,24 @@ mod tests {
         let listed: Vec<_> = tap.listed().into_iter().map(|p| (p.uuid, p.text, p.after_compact)).collect();
         let row = |u: &str, t: &str, after| (u.to_string(), t.to_string(), after);
         assert_eq!(listed, [row("p1", "Reply with only: g1", false), row("cc", "/compact", true), row("h1", "Reply with only: h1", false)], "a resumed Claude lists from `/compact` on");
+    }
+    #[test]
+    fn a_parent_cycle_lists_each_prompt_once() {
+        let mut tap = Tap::default();
+        for l in [
+            r#"{"type":"system","subtype":"turn_duration","uuid":"o1","parentUuid":null}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"o2","parentUuid":"o1"}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"o3","parentUuid":"o2"}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"o4","parentUuid":"o3"}"#,
+            r#"{"type":"user","uuid":"a","parentUuid":"b","promptSource":"typed","message":{"role":"user","content":"one"}}"#,
+            r#"{"type":"user","uuid":"b","parentUuid":"a","promptSource":"typed","message":{"role":"user","content":"two"}}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"x1","parentUuid":"b"}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"x2","parentUuid":"x1"}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"x3","parentUuid":"x2"}"#,
+        ] {
+            drop(tap.feed(l));
+        }
+        assert_eq!(tap.listed().len(), 2);
     }
 
     const FACTS: &str = include_str!("testdata/facts.jsonl");
