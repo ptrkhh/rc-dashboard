@@ -19,6 +19,9 @@ struct Rec {
     uuid: Option<String>,
     #[serde(rename = "parentUuid")]
     parent: Option<String>,
+    /// A compact boundary's `null` parent hides the record it follows; this names it.
+    #[serde(rename = "logicalParentUuid")]
+    logical_parent: Option<String>,
     #[serde(rename = "isSidechain", default)]
     sidechain: Option<bool>,
     #[serde(rename = "isMeta", default)]
@@ -49,11 +52,14 @@ struct Rec {
 struct Node {
     parent: Option<String>,
     anchor: Option<String>,
+    /// A compact boundary: a Claude resumed since loaded nothing before it.
+    boundary: bool,
 }
 
 /// A prompt Claude's rewind selector lists (Claude Code 2.1.325): typed and
-/// queued prompts, image prompts, `!` commands and messages absorbed mid-turn,
-/// but not slash commands or task-notification turns.
+/// queued prompts, image prompts, `!` commands, messages absorbed mid-turn and
+/// slash commands recorded as a prompt (`/compact`), but not task-notification
+/// turns or commands recorded as `system` (`/rename`, `/context`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Listed {
     pub uuid: String,
@@ -63,6 +69,8 @@ pub struct Listed {
     pub raw: String,
     pub pasted: bool,
     pub images: bool,
+    /// The first row after a compaction: a Claude resumed since lists nothing before it.
+    pub after_compact: bool,
 }
 
 #[derive(Default)]
@@ -284,11 +292,19 @@ impl Tap {
     }
 
     /// The current branch's listed prompts, oldest first: the parents from the
-    /// last main-chain record, up to an unknown or `null` parent.
+    /// last main-chain record, across compactions (the selector of the Claude
+    /// that compacted lists the prompts before them), up to an unknown or `null` parent.
     pub fn listed(&self) -> Vec<Listed> {
         let chain = std::iter::successors(self.last_main.as_deref(), |u| self.nodes.get(*u)?.parent.as_deref());
+        let mut out: Vec<Listed> = Vec::new();
         // A parent cycle in a damaged transcript ends after one pass.
-        let mut out: Vec<Listed> = chain.take(self.nodes.len()).filter_map(|u| self.prompts.get(u).cloned()).collect();
+        for u in chain.take(self.nodes.len()) {
+            out.extend(self.prompts.get(u).cloned());
+            // Walking back, the row pushed last is the first after the boundary.
+            if let Some(p) = out.last_mut().filter(|_| self.nodes.get(u).is_some_and(|n| n.boundary)) {
+                p.after_compact = true;
+            }
+        }
         out.reverse();
         out
     }
@@ -296,7 +312,7 @@ impl Tap {
     fn list(&mut self, r: &Rec, text: String, raw: &str, images: bool) {
         if let Some(uuid) = &r.uuid {
             let pasted = raw.contains("<pasted_content");
-            self.prompts.insert(uuid.clone(), Listed { uuid: uuid.clone(), text, raw: raw.to_string(), pasted, images });
+            self.prompts.insert(uuid.clone(), Listed { uuid: uuid.clone(), text, raw: raw.to_string(), pasted, images, after_compact: false });
         }
     }
 
@@ -371,7 +387,9 @@ impl Tap {
             self.anchor = Some(u.to_string());
         }
         if let Some(u) = &r.uuid {
-            self.nodes.insert(u.clone(), Node { parent: r.parent.clone(), anchor: self.anchor.clone() });
+            let parent = r.parent.clone().or_else(|| r.logical_parent.clone());
+            let boundary = r.subtype.as_deref() == Some("compact_boundary");
+            self.nodes.insert(u.clone(), Node { parent, anchor: self.anchor.clone(), boundary });
             self.last_main = Some(u.clone());
         }
         for ev in &out {
@@ -422,9 +440,7 @@ impl Tap {
         if raw != ev["message"]["content"] {
             ev["raw"] = json!(raw);
         }
-        if slash.is_none() {
-            self.list(r, prompt.trim().to_string(), raw, images);
-        }
+        self.list(r, prompt.trim().to_string(), raw, images);
         out.push(ev);
         out
     }
@@ -794,7 +810,28 @@ mod tests {
         tap.feed(slash);
         tap.feed(pasted);
         let tail: Vec<_> = tap.listed().into_iter().skip(6).map(|p| (p.uuid, p.text, p.pasted)).collect();
-        assert_eq!(tail, [("p1".to_string(), "log".to_string(), true)], "slash commands are not listed");
+        let row = |u: &str, t: &str, pasted| (u.to_string(), t.to_string(), pasted);
+        assert_eq!(tail, [row("c1", "/review x", false), row("p1", "log", true)], "a slash command recorded as a prompt is a row");
+    }
+
+    #[test]
+    fn the_branch_runs_on_across_a_compaction_and_lists_the_compact_command() {
+        // As 2.1.325 writes a Terminal `/compact`; its selector lists p1, `/compact`, h1.
+        let lines = [
+            r#"{"type":"user","uuid":"p1","parentUuid":"s0","promptSource":"typed","message":{"role":"user","content":"Reply with only: g1"}}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"t1","parentUuid":"p1"}"#,
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"cb","parentUuid":null,"logicalParentUuid":"t1"}"#,
+            r#"{"type":"user","uuid":"cs","parentUuid":"cb","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"This session is being continued"}}"#,
+            r#"{"type":"user","uuid":"cv","parentUuid":"cs","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#,
+            r#"{"type":"user","uuid":"cc","parentUuid":"cv","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}"#,
+            r#"{"type":"user","uuid":"co","parentUuid":"cc","message":{"role":"user","content":"<local-command-stdout>Compacted</local-command-stdout>"}}"#,
+            r#"{"type":"user","uuid":"h1","parentUuid":"co","promptSource":"typed","message":{"role":"user","content":"Reply with only: h1"}}"#,
+        ];
+        let mut tap = Tap::default();
+        lines.iter().for_each(|l| drop(tap.feed(l)));
+        let listed: Vec<_> = tap.listed().into_iter().map(|p| (p.uuid, p.text, p.after_compact)).collect();
+        let row = |u: &str, t: &str, after| (u.to_string(), t.to_string(), after);
+        assert_eq!(listed, [row("p1", "Reply with only: g1", false), row("cc", "/compact", true), row("h1", "Reply with only: h1", false)], "a resumed Claude lists from `/compact` on");
     }
 
     const FACTS: &str = include_str!("testdata/facts.jsonl");

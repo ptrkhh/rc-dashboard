@@ -16,6 +16,7 @@ const IDLE_WAIT: Duration = Duration::from_secs(2);
 const BOX_WAIT: Duration = Duration::from_secs(1);
 const FAILED: &str = "rewind failed; use Terminal";
 const DRAFT: &str = "Clear the Terminal input first";
+const RESUMED: &str = "Claude was resumed after a compaction and cannot rewind to before it";
 const SELECTOR_HEAD: &str = "Restore the code and/or conversation to the point before";
 const CONFIRM_HEAD: &str = "Confirm you want to restore to the point before you sent this message:";
 
@@ -24,6 +25,8 @@ pub trait Tui: Sync {
     /// The pane's visible text.
     fn screen(&self) -> impl Future<Output = String> + Send;
     fn press(&self, key: &str) -> impl Future<Output = Result<(), String>> + Send;
+    /// What is typed on the input box's first line; `None` when no box shows.
+    fn input(&self) -> impl Future<Output = Option<String>> + Send;
     /// Empty the input box Claude put the rewound prompt back into.
     fn clear(&self, text: &str) -> impl Future<Output = ()> + Send;
     /// The box should hold `text` but does not show it yet: clear it before the next send.
@@ -33,6 +36,7 @@ pub trait Tui: Sync {
 }
 
 pub struct Confirm {
+    /// The quoted prompt's lines, as wrapped on screen, without the age line.
     pub quoted: String,
     /// (digit, label), top to bottom.
     pub options: Vec<(String, String)>,
@@ -66,16 +70,17 @@ pub fn selector_entry(screen: &str) -> Option<String> {
     selector(screen).map(|(_, entry)| entry)
 }
 
-/// The input box's first line: the last line starting with `❯`.
-fn input_line(screen: &str) -> Option<&str> {
-    screen.lines().rev().find_map(|l| l.trim_start().strip_prefix('❯')).map(str::trim)
-}
-
 /// The confirm screen: the quoted prompt and the numbered options in view.
 pub fn confirm(screen: &str) -> Option<Confirm> {
     let lines: Vec<&str> = screen.lines().collect();
     let rest = &lines[lines.iter().rposition(|l| l.contains(CONFIRM_HEAD))? + 1..];
-    let quoted = rest.iter().find_map(|l| l.trim().strip_prefix('│'))?.trim().to_string();
+    let first = rest.iter().position(|l| l.trim_start().starts_with('│'))?;
+    let mut quoted: Vec<&str> = rest[first..].iter().map_while(|l| l.trim().strip_prefix('│')).map(str::trim).collect();
+    // The last line is the age, `(2m ago)`.
+    if quoted.last().is_some_and(|l| l.starts_with('(') && l.ends_with(')')) {
+        quoted.pop();
+    }
+    let quoted = quoted.join("\n");
     let option = |l: &&str| {
         let l = l.trim();
         let (digit, label) = l.strip_prefix('❯').unwrap_or(l).trim_start().split_once(". ")?;
@@ -94,7 +99,24 @@ pub fn entry_matches(entry: &str, p: &Listed) -> bool {
         Some(cut) => !cut.is_empty() && (raw.starts_with(cut) || text.starts_with(cut)),
         None => entry == raw || entry == text,
     };
-    by_text || (entry.starts_with("[Pasted text #") && p.pasted) || (entry.starts_with("[Image #") && p.images)
+    by_text || chip(entry, p)
+}
+
+/// The confirm screen's quote shows prompt `p`: its first 500 characters, at
+/// most four lines, wrapped to the pane; or the chip Claude shows instead.
+/// The whole quote is compared, so prompts that share a start are told apart.
+pub fn quote_matches(quote: &str, p: &Listed) -> bool {
+    // Wrapping only breaks lines, so the text compares without whitespace.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    // ponytail: counts chars where Claude counts UTF-16 units; a quote cut inside astral text is refused, never mistaken.
+    let shown = |s: &str| squash(&s.trim().chars().take(500).collect::<String>().lines().take(4).collect::<Vec<_>>().join("\n"));
+    let q = squash(quote);
+    (!q.is_empty() && (q == shown(&p.raw) || q == shown(&p.text))) || chip(quote, p)
+}
+
+/// Claude shows a chip instead of a long paste or an attached image.
+fn chip(shown: &str, p: &Listed) -> bool {
+    (shown.starts_with("[Pasted text #") && p.pasted) || (shown.starts_with("[Image #") && p.images)
 }
 
 /// Rewinds to `listed[target]` through the dialog. `listed` is what the
@@ -103,7 +125,7 @@ pub async fn drive(tui: &impl Tui, listed: &[Listed], target: usize, files: bool
     idle_gate(tui.status().await.0.as_deref())?;
     let want = listed.get(target).ok_or(FAILED)?;
     // Esc on a Terminal draft would wipe it; a box chat cannot see gets no key.
-    match input_line(&tui.screen().await) {
+    match tui.input().await.as_deref() {
         Some("") => {}
         Some(_) => return Err(DRAFT.into()),
         None => return Err(FAILED.into()),
@@ -112,9 +134,9 @@ pub async fn drive(tui: &impl Tui, listed: &[Listed], target: usize, files: bool
     tokio::time::sleep(ESC_GAP).await;
     // A turn or question that started meanwhile gets no second Escape.
     idle_gate(tui.status().await.0.as_deref())?;
-    if choose(tui, listed, target, files).await.is_none() {
+    if let Err(e) = choose(tui, listed, target, files).await {
         back_out(tui).await;
-        return Err(FAILED.into());
+        return Err(e.into());
     }
     // The restore key is pressed: the rewind counts as done.
     let deadline = Instant::now() + IDLE_WAIT;
@@ -123,11 +145,24 @@ pub async fn drive(tui: &impl Tui, listed: &[Listed], target: usize, files: bool
     }
     // Claude can report idle before it refills the box, and Ctrl+U on the
     // still-empty box would be lost. The box may show only the start of the
-    // prompt, so it is matched as a cut entry.
-    let refilled = |s: &str| input_line(s).filter(|l| !l.is_empty() && entry_matches(&format!("{l}…"), want)).map(drop);
-    match watch(tui, BOX_WAIT, refilled).await {
-        Some(()) => tui.clear(&want.raw).await,
-        None => tui.leave(&want.raw),
+    // prompt, so it is matched as a cut entry; a slash command shows its
+    // argument hint after it.
+    let slash = want.text.starts_with('/').then_some(want.text.as_str());
+    let shows = |l: &str| !l.is_empty() && (entry_matches(&format!("{l}…"), want) || slash.is_some_and(|c| l.starts_with(c)));
+    let deadline = Instant::now() + BOX_WAIT;
+    let refilled = loop {
+        if tui.input().await.is_some_and(|l| shows(&l)) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(POLL).await;
+    };
+    if refilled {
+        tui.clear(&want.raw).await;
+    } else {
+        tui.leave(&want.raw);
     }
     Ok(())
 }
@@ -138,24 +173,32 @@ async fn dialog_open(tui: &impl Tui) -> bool {
     status.as_deref() == Some("waiting") && waiting_for.as_deref() == Some("dialog open")
 }
 
-/// Presses the second Escape, walks up to the target and presses its restore
-/// digit. `None` as soon as a screen or the status is not the one expected.
-async fn choose(tui: &impl Tui, listed: &[Listed], target: usize, files: bool) -> Option<()> {
-    tui.press("Escape").await.ok()?;
+/// Presses the second Escape and, once the selector shows, walks to the target.
+async fn choose(tui: &impl Tui, listed: &[Listed], target: usize, files: bool) -> Result<(), &'static str> {
+    tui.press("Escape").await.map_err(|_| FAILED)?;
     let deadline = Instant::now() + OPEN_WAIT;
-    let mut pos = loop {
+    let pos = loop {
         if let Some((pos, entry)) = selector(&tui.screen().await) {
             if entry == "(current)" && dialog_open(tui).await {
                 break pos;
             }
         }
         if Instant::now() >= deadline {
-            return None;
+            return Err(FAILED);
         }
         tokio::time::sleep(POLL).await;
     };
-    // `(current)` sits below every listed prompt: a count that drifted from the transcript gets no Up.
-    (pos == listed.len()).then_some(())?;
+    // `(current)` sits below every row listed. A Claude resumed after a
+    // compaction lists only the rows from it on; any other count drifted
+    // from the transcript and gets no Up.
+    let skip = listed.len().checked_sub(pos).filter(|&s| s == 0 || listed.get(s).is_some_and(|p| p.after_compact)).ok_or(FAILED)?;
+    let target = target.checked_sub(skip).ok_or(RESUMED)?;
+    walk(tui, &listed[skip..], target, pos, files).await.ok_or(FAILED)
+}
+
+/// Walks up from `(current)` at `pos` to the target and presses its restore
+/// digit. `None` as soon as a screen or the status is not the one expected.
+async fn walk(tui: &impl Tui, listed: &[Listed], target: usize, mut pos: usize, files: bool) -> Option<()> {
     for j in 1..=listed.len() - target {
         tui.press("Up").await.ok()?;
         let (now, entry) = watch(tui, STEP_WAIT, |s| selector(s).filter(|(p, _)| *p != pos)).await?;
@@ -168,7 +211,7 @@ async fn choose(tui: &impl Tui, listed: &[Listed], target: usize, files: bool) -
     dialog_open(tui).await.then_some(())?;
     tui.press("Enter").await.ok()?;
     let c = watch(tui, STEP_WAIT, |s| confirm(s).filter(|_| selector(s).is_none())).await?;
-    if !entry_matches(&c.quoted, &listed[target]) {
+    if !quote_matches(&c.quoted, &listed[target]) {
         return None;
     }
     // The digits shift when the prompt changed code, so the option is found by its label.
@@ -275,6 +318,34 @@ mod tests {
    ↓ 5. Summarize up to here
    ⚠ Restored files go back whole, losing later changes by anyone. Bash changes to other files are not undone.
 ";
+    /// A prompt longer than the 80-column pane: the quote wraps (live, 2.1.325).
+    const CONFIRM_WRAPPED: &str = "\
+   Rewind
+
+   Confirm you want to restore to the point before you sent this message:
+
+   │ Reply with only the single word bravo, and do not add anything else at
+   │ all to it, no punctuation, no quotes, nothing more
+   │ (51s ago)
+
+   The conversation goes back to before this message.
+   The code will be unchanged.
+
+   ❯ 1. Restore conversation
+     2. Summarize from here
+";
+    /// A three-line prompt: each line quoted (live, 2.1.325).
+    const CONFIRM_LINES: &str = "\
+   Confirm you want to restore to the point before you sent this message:
+
+   │ Line one of a multiline prompt.
+   │ Line two: reply with only charlie.
+   │ Line three is here too.
+   │ (27s ago)
+
+   ❯ 1. Restore conversation
+";
+    const BRAVO: &str = "Reply with only the single word bravo, and do not add anything else at all to it, no punctuation, no quotes, nothing more";
     const SPIKE: [&str; 6] = [
         "Reply with only: one",
         "! echo two",
@@ -293,7 +364,7 @@ mod tests {
     }
 
     fn listed(lines: &[&str]) -> Vec<Listed> {
-        let p = |(i, l): (usize, &&str)| Listed { uuid: format!("p{i}"), text: l.to_string(), raw: l.to_string(), pasted: false, images: false };
+        let p = |(i, l): (usize, &&str)| Listed { uuid: format!("p{i}"), text: l.to_string(), raw: l.to_string(), pasted: false, images: false, after_compact: false };
         lines.iter().enumerate().map(p).collect()
     }
 
@@ -329,6 +400,10 @@ mod tests {
         quote: Option<String>,
         /// Esc Esc opens nothing.
         no_dialog: bool,
+        /// Dim text Claude shows in the empty box: a placeholder or a suggestion.
+        ghost: Option<String>,
+        /// Grey text after a slash command in the box: its argument hint.
+        hint: Option<String>,
         /// The status turns `busy` after the first Escape.
         busy_between: bool,
         /// This Up (counting from 1) redraws the rows without moving.
@@ -360,6 +435,8 @@ mod tests {
                 options: owned(&NO_CODE),
                 quote: None,
                 no_dialog: false,
+                ghost: None,
+                hint: None,
                 busy_between: false,
                 drop_up: None,
                 lose_status_after: None,
@@ -396,7 +473,11 @@ mod tests {
         fn render(&self, s: &State) -> String {
             let mut out = String::from("   Rewind\n\n");
             match s.view {
-                View::Closed => return format!("❯ {}\n  ⏵⏵ bypass permissions on\n", s.input),
+                View::Closed => {
+                    let dim = self.ghost.as_ref().filter(|_| s.input.is_empty()).map(|g| format!("\x1b[2m{g}\x1b[0m"));
+                    let hint = self.hint.as_ref().filter(|_| s.input.starts_with('/')).map(|h| format!("  \x1b[38;5;246m{h}\x1b[39m"));
+                    return format!("❯\u{a0}{}{}{}\n  ⏵⏵ bypass permissions on\n", s.input, hint.unwrap_or_default(), dim.unwrap_or_default());
+                }
                 View::Selector => {
                     out += "   Restore the code and/or conversation to the point before…\n\n";
                     let rows = self.entries.len() + 1;
@@ -418,7 +499,16 @@ mod tests {
                 }
                 View::Confirm => {
                     let quote = self.quote.clone().unwrap_or_else(|| self.entries[s.cursor].clone());
-                    out += &format!("   Confirm you want to restore to the point before you sent this message:\n   │ {quote}\n   │ (2m ago)\n");
+                    out += "   Confirm you want to restore to the point before you sent this message:\n";
+                    // Wrapped at a word to the pane, as Claude does.
+                    let mut line = String::new();
+                    for w in quote.split(' ') {
+                        if !line.is_empty() && line.chars().count() + 1 + w.chars().count() > 72 {
+                            out += &format!("   │ {}\n", std::mem::take(&mut line));
+                        }
+                        line = if line.is_empty() { w.to_string() } else { format!("{line} {w}") };
+                    }
+                    out += &format!("   │ {line}\n   │ (2m ago)\n");
                     out += "   The conversation goes back to before this message.\n   The code will be unchanged.\n";
                     for (i, (d, l)) in self.options.iter().enumerate() {
                         out += &format!("{}{d}. {l}\n", if i == 0 { "   ❯ " } else { "     " });
@@ -502,6 +592,9 @@ mod tests {
         fn leave(&self, _text: &str) {
             self.s.lock().unwrap().presses.push("leave".into());
         }
+        async fn input(&self) -> Option<String> {
+            crate::chat::tmux_io::input_text(&self.screen().await)
+        }
         async fn status(&self) -> (Option<String>, Option<String>) {
             let s = self.s.lock().unwrap();
             (Some(s.status.clone()), s.waiting_for.clone())
@@ -522,16 +615,33 @@ mod tests {
         let code = confirm(CONFIRM_CODE).unwrap();
         assert_eq!(code.options, owned(&WITH_CODE), "the scrolled `↓ 5.` row is not an option to press");
         assert!(selector_entry("❯ hello").is_none() && confirm(SELECTOR).is_none() && selector_entry(CONFIRM).is_none(), "an input box or the other screen is not mistaken");
+        assert_eq!(confirm(CONFIRM_WRAPPED).unwrap().quoted, format!("{}\n{}", &BRAVO[..70], &BRAVO[71..]), "every quoted line, not the age");
+        assert_eq!(confirm(CONFIRM_LINES).unwrap().quoted, "Line one of a multiline prompt.\nLine two: reply with only charlie.\nLine three is here too.");
+    }
+
+    #[test]
+    fn a_quote_is_the_whole_prompt_as_claude_wraps_it() {
+        let p = |raw: &str| Listed { uuid: "u".into(), text: raw.into(), raw: raw.into(), pasted: false, images: false, after_compact: false };
+        let wrapped = confirm(CONFIRM_WRAPPED).unwrap().quoted;
+        assert!(quote_matches(&wrapped, &p(BRAVO)));
+        assert!(!quote_matches(&wrapped, &p(&format!("{BRAVO} and more"))) && !quote_matches(&wrapped, &p(&BRAVO[..70])), "a prompt that only shares the start is another prompt");
+        assert!(!quote_matches(&BRAVO[..70], &p(BRAVO)), "a first line alone is not the quote");
+        let lines = "Line one of a multiline prompt.\nLine two: reply with only charlie.\nLine three is here too.";
+        assert!(quote_matches(&confirm(CONFIRM_LINES).unwrap().quoted, &p(lines)));
+        let long = "x ".repeat(400);
+        assert!(quote_matches(&long[..500], &p(&long)), "Claude quotes the first 500 characters");
+        assert!(quote_matches("1\n2\n3\n4", &p("1\n2\n3\n4\n5")), "and at most four lines");
+        assert!(quote_matches("[Pasted text #2 +40 lines]", &Listed { pasted: true, ..p("<pasted_content id=\"2\">") }));
     }
 
     #[test]
     fn entries_match_by_first_line_paste_chip_or_image_token() {
-        let p = |raw: &str| Listed { uuid: "u".into(), text: raw.into(), raw: raw.into(), pasted: raw.contains("<pasted_content"), images: raw.contains("[Image #") };
+        let p = |raw: &str| Listed { uuid: "u".into(), text: raw.into(), raw: raw.into(), pasted: raw.contains("<pasted_content"), images: raw.contains("[Image #"), after_compact: false };
         assert!(entry_matches("yes", &p("yes")) && !entry_matches("yes", &p("yes please")));
         assert!(entry_matches("fix the parser so it…", &p("fix the parser so it stops at the end of the line\nand more")));
         assert!(entry_matches("[Pasted text #2 +40 lines]", &p("<pasted_content id=\"2\">\nlog\n</pasted_content id=\"2\">")) && !entry_matches("[Pasted text #2 +40 lines]", &p("log")));
         assert!(entry_matches("[Image #3] what is this", &p("[Image #3] what is this")) && !entry_matches("[Image #3]", &p("no image")));
-        let shell = Listed { uuid: "b".into(), text: "! echo two".into(), raw: "<bash-input>echo two</bash-input>".into(), pasted: false, images: false };
+        let shell = Listed { uuid: "b".into(), text: "! echo two".into(), raw: "<bash-input>echo two</bash-input>".into(), pasted: false, images: false, after_compact: false };
         assert!(entry_matches("! echo two", &shell));
     }
 
@@ -618,6 +728,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_prompt_longer_than_the_pane_is_rewound_and_a_lookalike_is_not() {
+        let tui = FakeTui::new(&["one", BRAVO]);
+        drive(&tui, &listed(&["one", BRAVO]), 1, false).await.unwrap();
+        assert_eq!(tui.presses(), ["Escape", "Escape", "Up", "Enter", "1", "clear"]);
+        let other = format!("{} something else entirely", &BRAVO[..72]);
+        let lookalike = FakeTui::new(&["one", BRAVO]).quoting(&other);
+        assert_eq!(drive(&lookalike, &listed(&["one", BRAVO]), 1, false).await.unwrap_err(), "rewind failed; use Terminal");
+        assert!(lookalike.closed() && !lookalike.presses().iter().any(|k| k == "1"));
+    }
+
+    #[tokio::test]
+    async fn dim_placeholder_or_suggestion_text_in_the_box_is_not_a_draft() {
+        let tui = FakeTui { ghost: Some("add \"two\" to a.txt".into()), ..FakeTui::new(&["one"]) };
+        drive(&tui, &listed(&["one"]), 0, false).await.unwrap();
+        assert_eq!(tui.presses(), ["Escape", "Escape", "Up", "Enter", "1", "clear"]);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_claude_lists_only_what_follows_the_compaction_it_loaded() {
+        // Resumed after `/compact`, 2.1.325 lists `/compact` and h4 only (live).
+        let mut branch = listed(&["alpha", "pelican", "/compact", "h4"]);
+        branch[2].after_compact = true;
+        let tui = FakeTui::new(&["/compact", "h4"]);
+        drive(&tui, &branch, 3, false).await.unwrap();
+        assert_eq!(tui.presses(), ["Escape", "Escape", "Up", "Enter", "1", "clear"]);
+        let before = FakeTui::new(&["/compact", "h4"]);
+        assert_eq!(drive(&before, &branch, 1, false).await.unwrap_err(), "Claude was resumed after a compaction and cannot rewind to before it");
+        assert_eq!(before.presses(), ["Escape", "Escape", "Escape"], "opened, counted, closed");
+        let unmarked = FakeTui::new(&["/compact", "h4"]);
+        assert!(drive(&unmarked, &listed(&["alpha", "pelican", "/compact", "h4"]), 3, false).await.is_err(), "fewer rows without a compaction there is a drift");
+    }
+
+    #[tokio::test]
     async fn a_terminal_draft_is_never_escaped_away() {
         let tui = FakeTui::new(&["one"]).draft("half a thought");
         assert_eq!(drive(&tui, &listed(&["one"]), 0, false).await.unwrap_err(), "Clear the Terminal input first");
@@ -654,6 +797,9 @@ mod tests {
         let late = FakeTui::new(&["one", "two"]).fill_in(Some(3));
         drive(&late, &listed(&["one", "two"]), 1, false).await.unwrap();
         assert_eq!(late.presses().last().unwrap(), "clear", "not Ctrl+U on a box still empty");
+        let hinted = FakeTui { hint: Some("<optional custom summarization instructions>".into()), ..FakeTui::new(&["one", "/compact"]) };
+        drive(&hinted, &listed(&["one", "/compact"]), 1, false).await.unwrap();
+        assert_eq!(hinted.presses().last().unwrap(), "clear", "a slash command shows its argument hint after it (live, 2.1.325)");
         let never = FakeTui::new(&["one", "two"]).fill_in(None);
         drive(&never, &listed(&["one", "two"]), 1, false).await.unwrap();
         assert_eq!(never.presses().last().unwrap(), "leave");

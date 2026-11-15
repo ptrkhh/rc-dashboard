@@ -59,6 +59,59 @@ pub async fn capture(runner: &Runner, name: &str) -> Result<String, String> {
     runner.run_checked("tmux", &["capture-pane", "-p", "-t", &target(name)], "tmux capture-pane").await
 }
 
+/// The pane's text with its colours and attributes as escape sequences.
+pub async fn capture_styled(runner: &Runner, name: &str) -> Result<String, String> {
+    runner.run_checked("tmux", &["capture-pane", "-p", "-e", "-t", &target(name)], "tmux capture-pane").await
+}
+
+/// What is typed on the input box's first line, the last line starting with
+/// `❯`, read from a `capture_styled` screen. Claude draws a fresh session's
+/// placeholder (`Try "…"`) and a prompt suggestion after a turn dim (SGR 2) in
+/// the empty box; plain `capture-pane` cannot tell them from a draft.
+pub fn input_text(styled: &str) -> Option<String> {
+    styled.lines().rev().map(undimmed).find_map(|l| l.trim_start().strip_prefix('❯').map(|t| t.trim().to_string()))
+}
+
+/// A line's text without escape sequences and without its dim runs.
+fn undimmed(line: &str) -> String {
+    let (mut out, mut dim) = (String::new(), false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if !dim {
+                out.push(c);
+            }
+            continue;
+        }
+        if chars.next() != Some('[') {
+            continue;
+        }
+        // A CSI sequence: parameters up to a final byte in `@`..=`~`; only SGR (`m`) matters.
+        let mut params = String::new();
+        let fin = chars.by_ref().find(|c| ('@'..='~').contains(c) || {
+            params.push(*c);
+            false
+        });
+        if fin != Some('m') {
+            continue;
+        }
+        let mut ps = params.split(';');
+        while let Some(p) = ps.next() {
+            match p {
+                "" | "0" | "22" => dim = false,
+                "2" => dim = true,
+                // An extended colour's index or RGB is not an attribute.
+                "38" | "48" | "58" => {
+                    let skip = if ps.next() == Some("2") { 3 } else { 1 };
+                    ps.by_ref().take(skip).for_each(drop);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// How often `attach_image` looks for the new chip.
 pub const CHIP_POLL: Duration = Duration::from_millis(50);
 
@@ -273,6 +326,18 @@ pub(crate) mod tests {
             let p = pane(&runner, "cdash-a").await.unwrap();
             assert_eq!((p.pid, p.bare, p.hook.as_deref()), (4242, bare, hook));
         }
+    }
+    #[test]
+    fn dim_placeholder_and_suggestion_text_is_not_input() {
+        // Captured with `capture-pane -e` on 2.1.325: a fresh session's placeholder, a suggestion after a turn, a draft.
+        let placeholder = "\x1b[39m❯\u{a0}\x1b[2mTry \"edit <filepath> to...\"\x1b[0m\n\x1b[38;5;244m────\n";
+        let suggestion = "\x1b[38;5;246m\x1b[48;5;237m❯ \x1b[38;5;231mReply with only: alpha\x1b[39m\n────\n\x1b[39m❯\u{a0}\x1b[2madd \"two\" to a.txt\x1b[0m\n────\n";
+        assert_eq!(input_text(placeholder).as_deref(), Some(""));
+        assert_eq!(input_text(suggestion).as_deref(), Some(""), "the sent prompt above the box is not the box");
+        assert_eq!(input_text("\x1b[39m❯\u{a0}half a thought\x1b[0m\n").as_deref(), Some("half a thought"));
+        assert_eq!(input_text("❯ typed \x1b[2mghost\x1b[22m more\n").as_deref(), Some("typed  more"), "only the dim run is dropped");
+        assert_eq!(input_text("❯ \x1b[38;5;2mgreen is not dim\x1b[39m").as_deref(), Some("green is not dim"), "a 256-colour index 2 is a colour");
+        assert_eq!(input_text("no box here"), None);
     }
     #[test]
     fn chips_are_counted_in_the_input_box_only() {

@@ -465,6 +465,9 @@ impl Tui for TmuxTui<'_> {
     async fn press(&self, key: &str) -> Result<(), String> {
         tmux_io::key(&self.ctx.runner, self.name, key).await
     }
+    async fn input(&self) -> Option<String> {
+        tmux_io::input_text(&tmux_io::capture_styled(&self.ctx.runner, self.name).await.ok()?)
+    }
     /// Cleared now when the box takes keys, else before the next send.
     async fn clear(&self, text: &str) {
         self.leave(text);

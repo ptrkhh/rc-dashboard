@@ -270,3 +270,36 @@ Enter submitted it.
   prompt verbatim, as on 2.1.323
   (`❯ Use the Edit tool (not bash) to change the line a to c in f.txt, then reply with only: edited`).
   Chat clears it with `tmux_io::clear_input`.
+- **Later checks (2026-11-16, haiku, 80x24 pane).**
+  - **Long and multi-line prompts.** The confirm screen quotes the whole
+    prompt, wrapped to the pane, one `│` line each, then the age line:
+
+    ```
+       │ Reply with only the single word bravo, and do not add anything else at
+       │ all to it, no punctuation, no quotes, nothing more
+       │ (51s ago)
+    ```
+
+    Claude's code quotes the first 500 characters, at most four lines. The
+    selector row still shows the first line cut with `…`. Chat compares the
+    whole quote, whitespace aside (`rewind::quote_matches`).
+  - **Slash commands.** The selector lists every `user` record that is not a
+    tool result, `isMeta`, `isCompactSummary`, `isVisibleInTranscriptOnly` or
+    command/shell output, so a slash command recorded as a prompt
+    (`<command-name>/compact</command-name>`) is a row, shown as `/compact`.
+    `/rename` and `/context` write `system` `local_command` records and are
+    not.
+  - **Compaction.** `/compact` writes `system`/`compact_boundary`
+    (`parentUuid: null`, `logicalParentUuid`: the record before it), the
+    `isCompactSummary` record, an `isMeta` caveat, the `/compact` record and
+    its `<local-command-stdout>`. The Claude that compacted still lists the
+    prompts before it, then `/compact`; a rewind there restores the
+    uncompacted conversation (asked afterwards, it recalled a word given
+    before the compaction). A Claude resumed after a compaction lists only
+    the rows from the last compaction on (`/compact`, then later prompts).
+  - **Dim text in the empty box.** A fresh session shows a placeholder and,
+    after a turn, often a suggestion, both SGR 2 (`capture-pane -e`:
+    `❯`, a no-break space, `ESC[2madd "two" to a.txtESC[0m`). Esc Esc still opens the
+    selector over a suggestion. After a rewind to a slash command the box
+    holds the command and its grey (`38;5;246`, not dim) argument hint:
+    `❯ /compact  <optional custom summarization instructions>`.
