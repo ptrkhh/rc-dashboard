@@ -529,20 +529,26 @@ async function supervise(statePath, name) {
     // The chat as the session shows it now: rows from a staged revert on are
     // hidden and one `staged` row stands for them. RemoteBridge.emitHistory is
     // not used: its `sent` set would skip rows already shown once.
+    let stagedAt = null; // revert.messageID while a revert is staged: every replay hides rows from it on
     const rebuild = async () => {
       held = [];
       try {
-        feed.reset();
-        const at = (await client.request(sessionPath)).data?.revert?.messageID;
+        // read first: a failed read must leave the chat as it is
+        const at = (await client.request(sessionPath)).data?.revert?.messageID ?? null;
         const rows = await client.messages(state.sid);
         const shown = at ? rows.filter(r => r.id < at) : rows; // ids ascend
+        stagedAt = at; promptRows.clear(); feed.reset();
         for (const row of shown) {
           const onlyTools = row.type === 'assistant' && !row.time?.completed;
           await withRowFiles(row, async () => {
-            for (const p of historyMessages(row, state.sid, sink.sid)) if (!onlyTools || ['tool_use', 'tool_result'].includes(p.message?.content?.[0]?.type)) await emit(p);
+            for (const p of historyMessages(row, state.sid, sink.sid)) {
+              if (!onlyTools || ['tool_use', 'tool_result'].includes(p.message?.content?.[0]?.type) || bridge?.sent.has(p.uuid)) await emit(p);
+            }
           });
         }
         if (at) feed.accept({ type: 'cdash', subtype: 'staged', messages: rows.length - shown.length });
+      } catch (error) {
+        log.write('chat rebuild: ' + error.message + '\n').catch(() => {});
       } finally {
         while (held.length) await emit(held.shift());
         held = null;
@@ -550,7 +556,7 @@ async function supervise(statePath, name) {
       }
     };
     class ChatBridge extends RemoteBridge {
-      emitHistory(row, onlyTools) { return withRowFiles(row, () => super.emitHistory(row, onlyTools)); }
+      emitHistory(row, onlyTools) { return stagedAt && row.id >= stagedAt ? undefined : withRowFiles(row, () => super.emitHistory(row, onlyTools)); }
       async nativeEvent(event) {
         const data = event.data || {};
         if (event.type?.startsWith('session.execution.')) lastExecution = event.type;
@@ -602,8 +608,10 @@ async function supervise(statePath, name) {
         if (!closing) setTimeout(startChat, 2000).unref();
       };
       (bridge = new ChatBridge(client, sink, chatState, async () => {})).connect(own.signal, restart)
-        .then(() => feed.ready(), error => restart(error));
+        .then(() => first && stagedAt ? rebuild() : feed.ready(), error => restart(error)).finally(() => { first = false; });
     };
+    let first = true;
+    stagedAt = (await client.request(sessionPath)).data?.revert?.messageID ?? null; // a revert staged before this start
     startChat();
     let updates = Promise.resolve();
     const enqueue = operation => { updates = updates.then(operation).catch(() => {}); };

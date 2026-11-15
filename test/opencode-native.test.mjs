@@ -5,6 +5,7 @@ import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 
 test('project model query uses a private metadata lease and strips Claude credentials', { timeout: 30000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-native-'));
@@ -168,7 +169,7 @@ else {
 
 // A supervisor over a fake OpenCode server that also serves the chat feed's
 // reads (messages, forms, permissions) and records prompts and interrupts.
-async function fixture(t, { flakyMessages = false, withFiles = '', mediaDir = null, rows: testRows = null } = {}) {
+async function fixture(t, { flakyMessages = false, withFiles = '', mediaDir = null, rows: testRows = null, revert: startRevert = null } = {}) {
   const { readFileSync, existsSync } = await import('node:fs');
   const { rename } = await import('node:fs/promises');
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-chat-'));
@@ -181,7 +182,7 @@ const log=x=>fs.appendFileSync(process.env.CDASH_TEST_LOG,JSON.stringify(x)+'\\n
 if(process.argv.includes('--server')) {log({kind:'tui',pid:process.pid}); process.stdin.resume();setInterval(()=>{},1000);}
 else {
  log({kind:'server',pid:process.pid});
- const streams=new Set();let revert=null;
+ const streams=new Set();let revert=process.env.CDASH_TEST_REVERT?{messageID:process.env.CDASH_TEST_REVERT}:null;
  setInterval(()=>{const m=process.env.CDASH_TEST_MARKER;if(fs.existsSync(m)){const e=fs.readFileSync(m,'utf8');fs.unlinkSync(m);for(const s of streams)s.write('data: '+e+'\\n\\n');}},30);
  const send=(res,data)=>res.end(JSON.stringify(data));
  const server=http.createServer(async(req,res)=>{let raw='';for await(const c of req)raw+=c;const body=raw?JSON.parse(raw):null;const path=req.url.split('?')[0];log({kind:'api',method:req.method,path,body});
@@ -190,6 +191,7 @@ else {
  if(path==='/api/session'&&req.method==='POST')return send(res,{data:{id:'ses_fixture'}});
  if(path==='/api/session/ses_fixture/message'&&process.env.CDASH_TEST_FLAKY&&!fs.existsSync(process.env.CDASH_TEST_FLAKY)){fs.writeFileSync(process.env.CDASH_TEST_FLAKY,'1');return send(res,{data:'broken'});}
  if(path==='/api/session/ses_fixture/message'&&fs.existsSync(process.env.CDASH_TEST_FAILMSG)){fs.unlinkSync(process.env.CDASH_TEST_FAILMSG);return send(res,{data:'broken'});}
+ if(path.endsWith('/revert/stage')&&body.messageID==='msg_05'){res.writeHead(409);return res.end();}
  if(path.endsWith('/revert/stage')){revert={messageID:body.messageID};return send(res,{data:revert});}
  if(path.endsWith('/revert')&&req.method==='DELETE'){revert=null;res.writeHead(204);return res.end();}
  const rowFiles=process.env.CDASH_TEST_FILES==='bad'?[{data:'AAAA',mime:'image/png',name:'x.png'},{mime:'image/png'},'junk',null,{data:5,mime:'application/pdf'}]:[{data:'${PNG.toString('base64')}',mime:'image/png',name:'a.png',source:{type:'inline'}},{data:'${PDF.toString('base64')}',mime:'application/pdf',name:'r.pdf',source:{type:'uri',uri:'file:///x/r.pdf'}}];
@@ -211,7 +213,7 @@ else {
 `, { mode: 0o700 });
   await writeFile(join(dir, 'claude'), `#!${process.execPath}\nprocess.exit(1);`, { mode: 0o700 });
   const child = spawn(process.execPath, [resolve('crates/agent/src/collect/opencode-remote.mjs'), '--state', state, '--name', 'cdash-fixture'], {
-    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_MEDIA_DIR: mediaDir ?? join(dir, 'media'), ...(testRows && { CDASH_TEST_ROWS: JSON.stringify(testRows) }), ...(withFiles && { CDASH_TEST_FILES: withFiles === true ? '1' : withFiles }), CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_MEDIA_DIR: mediaDir ?? join(dir, 'media'), ...(startRevert && { CDASH_TEST_REVERT: startRevert }), ...(testRows && { CDASH_TEST_ROWS: JSON.stringify(testRows) }), ...(withFiles && { CDASH_TEST_FILES: withFiles === true ? '1' : withFiles }), CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   let output = '';
   child.stdout.on('data', b => { output += b; });
@@ -230,6 +232,7 @@ else {
     dir, wait, output: () => output,
     native: () => { try { return JSON.parse(readFileSync(join(dir, 'pane.native'), 'utf8')); } catch { return undefined; } },
     posted: suffix => rows().filter(r => r.kind === 'api' && r.method === 'POST' && r.path.endsWith(suffix)).at(-1)?.body,
+    reads: () => rows().filter(r => r.kind === 'api' && r.method === 'GET' && r.path.endsWith('/message')).length,
     deleted: suffix => rows().some(r => r.kind === 'api' && r.method === 'DELETE' && r.path.endsWith(suffix)),
     emit: async event => {
       await wait(() => !existsSync(marker));
@@ -434,5 +437,55 @@ test('OpenCode rewinds: stage from chat, show it as staged with Undo, and follow
   await f.emit({ type: 'session.revert.cleared', data: { sessionID: 'ses_fixture' } });
   await until(() => c.lines.slice(mark).some(l => l.t === 'ready'));
   assert.equal(c.lines.slice(mark).filter(l => l.t === 'ev').length, 4, 'everything is back; no staged row');
+  c.close();
+});
+
+const evTexts = lines => lines.filter(l => l.t === 'ev').map(l => l.ev.subtype ?? l.ev.message.content[0].text);
+const afterReset = lines => evTexts(lines.slice(lines.findLastIndex(l => l.t === 'hello')));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+test('a revert staged at start shows the staged row, and a replaced bridge does not bring the hidden rows back', { timeout: 20000 }, async t => {
+  const f = await fixture(t, { rows: four, revert: 'msg_03' });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.ev?.subtype === 'staged'));
+  await until(() => c.lines.at(-1).t === 'ready');
+  assert.deepEqual(afterReset(c.lines), ['hello', 'hi there', 'staged']);
+  const reads = f.reads();
+  await writeFile(join(f.dir, 'fail-msg'), '1');                // the next history read fails: the bridge is replaced
+  await f.emit({ type: 'session.execution.succeeded', data: { sessionID: f.native().sid } });
+  await until(() => f.reads() >= reads + 2);                     // the failed read, then the new bridge's replay
+  await sleep(300);
+  assert.deepEqual(evTexts(c.lines.slice(c.lines.findLastIndex(l => l.t === 'hello'))).filter(x => x !== 'result'), ['hello', 'hi there', 'staged']);
+  c.close();
+});
+test('a failed read in a rebuild leaves the chat as it was', { timeout: 20000 }, async t => {
+  const f = await fixture(t, { rows: four });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const mark = c.lines.length;
+  await writeFile(join(f.dir, 'fail-msg'), '1');
+  await f.emit({ type: 'session.revert.staged', data: { sessionID: 'ses_fixture', revert: { messageID: 'msg_03' } } });
+  await until(() => !existsSync(join(f.dir, 'fail-msg')));
+  await sleep(300);
+  assert.equal(c.lines.slice(mark).filter(l => l.t === 'hello').length, 0, 'no reset');
+  assert.equal(evTexts(c.lines).length, 4);
+  c.close();
+});
+test('a committed revert rebuilds, a busy session and an unknown prompt are refused', { timeout: 20000 }, async t => {
+  const f = await fixture(t, { rows: [...four, { id: 'msg_05', type: 'user', text: 'busy' }] });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const busy = c.lines.find(l => l.ev?.message?.id === 'msg_05').ev.uuid;
+  c.write({ t: 'req', rid: 1, op: 'rewind', uuid: busy });
+  assert.deepEqual(await res(c, 1), { t: 'res', rid: 1, ok: false, error: 'the session is busy' });
+  c.write({ t: 'req', rid: 2, op: 'rewind', uuid: 'nope' });
+  assert.deepEqual(await res(c, 2), { t: 'res', rid: 2, ok: false, error: 'this prompt cannot be rewound' });
+  const mark = c.lines.length;
+  await f.emit({ type: 'session.revert.committed', data: { sessionID: 'ses_fixture' } });
+  await until(() => c.lines.slice(mark).some(l => l.t === 'ready'));
+  assert.equal(c.lines.slice(mark).filter(l => l.t === 'hello').length, 1);
+  assert.equal(afterReset(c.lines).length, 5);
   c.close();
 });
