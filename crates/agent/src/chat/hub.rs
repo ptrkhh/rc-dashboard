@@ -1147,9 +1147,9 @@ mod tests {
     fn cut(after: Option<&str>) -> Value {
         json!({"type":"cdash","subtype":"cut","after":after})
     }
-    async fn log6(tx: &mpsc::Sender<EngineMsg>) {
+    async fn log6(hub: &Hub, tx: &mpsc::Sender<EngineMsg>) {
         for e in [prompt("u1", "a"), answer("k1"), result("s1"), prompt("u2", "b"), answer("k2"), result("s2")] { tx.send(EngineMsg::Ev(e)).await.unwrap(); }
-        settle().await;
+        settle(hub, tx).await;
     }
     fn last_state(s: &Subscription) -> Value {
         serde_json::from_str(s.backlog.last().unwrap()).unwrap()
@@ -1161,7 +1161,10 @@ mod tests {
         send_with(cid, text, &[])
     }
     async fn upload(hub: &Hub, id: &str, kind: Kind, name: &str) -> PathBuf {
-        let path = crate::chat::tmux_io::tests::tempfile_path(&format!("hub-up-{id}")).join(name);
+        // One folder per call: two tests uploading the same id must not share one.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = crate::chat::tmux_io::tests::tempfile_path(&format!("hub-up-{id}-{n}")).join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"12345678").unwrap();
         let mime = if kind == Kind::Image { "image/png" } else { "text/plain" };
@@ -1174,8 +1177,19 @@ mod tests {
     fn plan_ask(id: &str) -> Value {
         json!({"id":id,"kind":"plan","tool":"claude","plan":"# P"})
     }
-    async fn settle() {
+    /// Waits until the actor has handled everything sent to it so far. The
+    /// 20 ms sleep is kept so paused-clock tests advance as they always did;
+    /// alone it was only a guess under load. The engine channel drained means
+    /// the actor took the last message, and since it handles one message at a
+    /// time, a command sent after that is answered only once that one is done.
+    async fn settle(hub: &Hub, tx: &mpsc::Sender<EngineMsg>) {
         tokio::time::sleep(Duration::from_millis(20)).await;
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while tx.capacity() < tx.max_capacity() {
+            assert!(std::time::Instant::now() < end, "the hub took no engine message for 30 s");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        hub.folder().await;
     }
 
     #[tokio::test]
@@ -1186,7 +1200,7 @@ mod tests {
         hub.command(send("c2", "shown")).await;
         tx.send(EngineMsg::Ev(prompt("u2", "shown"))).await.unwrap();
         tx.send(EngineMsg::Reset).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let acks: Vec<(String, String)> = frames(&mut sub).iter().filter(|f| f["t"] == "ack")
             .map(|f| (f["cid"].as_str().unwrap().into(), f["status"].as_str().unwrap().into())).collect();
         assert_eq!(acks, [("c1".to_string(), "unconfirmed".to_string())], "c2 was shown; it leaves with the old conversation");
@@ -1212,9 +1226,9 @@ mod tests {
         upload(&hub, "aaaa", Kind::Image, "shot.png").await;
         let mut sub = hub.subscribe(None, None).await.unwrap();
         tx.send(engine_status(true, false)).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(send_with("c1", "later", &["aaaa"])).await)["status"], "held");
-        settle().await;
+        settle(&hub, &tx).await;
         let state = frames(&mut sub).into_iter().rev().find(|f| f["t"] == "state").unwrap();
         assert_eq!(state["held"][0]["files"], json!([{"id":"aaaa","name":"shot.png","kind":"image","size":8,"mime":"image/png"}]));
         hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h1".into() }).await;
@@ -1252,7 +1266,7 @@ mod tests {
         let (hub, tx, calls) = rig_accepting();
         hub.command(send("c1", "the tool reworded this")).await;
         tx.send(EngineMsg::Ev(json!({"type":"result","subtype":"success"}))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Stop).await;
         assert_eq!(*calls.lock().unwrap(), ["send:the tool reworded this:false"], "idle with nothing pending: Stop interrupts nothing");
     }
@@ -1260,21 +1274,21 @@ mod tests {
     async fn a_fresh_subscriber_gets_hello_backlog_and_state_then_live_events() {
         let (hub, tx, _) = rig();
         for i in 0..3 { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         let mut sub = hub.subscribe(None, None).await.unwrap();
         let b: Vec<Value> = sub.backlog.iter().map(|f| serde_json::from_str(f).unwrap()).collect();
         assert_eq!((b[0]["t"].as_str(), b[0]["reset"].as_bool(), b[0]["first"].as_u64(), b[0]["head"].as_u64()), (Some("hello"), Some(true), Some(1), Some(3)));
         assert_eq!(b[1..4].iter().map(|f| f["seq"].as_u64().unwrap()).collect::<Vec<_>>(), [1, 2, 3]);
         assert_eq!(b[4]["t"], "state");
         tx.send(EngineMsg::Ev(answer("k"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(frames(&mut sub)[0]["seq"], 4);
     }
     #[tokio::test]
     async fn a_known_position_resumes_and_a_stale_epoch_gets_a_reset_and_a_fresh_backlog() {
         let (hub, tx, _) = rig();
         for i in 0..5 { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         let first = hub.subscribe(None, None).await.unwrap();
         let epoch = serde_json::from_str::<Value>(&first.backlog[0]).unwrap()["epoch"].as_str().unwrap().to_string();
         let resumed = hub.subscribe(Some(3), Some(epoch)).await.unwrap();
@@ -1292,14 +1306,14 @@ mod tests {
         assert_eq!(reply(hub.command(send("c1", "first")).await)["status"], "sent");
         tx.send(engine_status(true, false)).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let held = reply(hub.command(send("c2", "second")).await);
         assert_eq!((held["status"].as_str(), held["id"].as_str()), (Some("held"), Some("h1")));
         hub.command(send("c3", "third")).await;
         tx.send(EngineMsg::Ev(answer("k1"))).await.unwrap();
         tx.send(EngineMsg::Ev(json!({"type":"result","subtype":"success"}))).await.unwrap();
         tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(*calls.lock().unwrap(), ["send:first:false", "send:second:false"], "one per turn");
     }
     #[tokio::test(start_paused = true)]
@@ -1309,7 +1323,7 @@ mod tests {
         hub.command(send("c1", "first")).await;
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(send("c2", "second")).await;
         hub.command(ClientFrame::Stop).await;
         tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
@@ -1327,13 +1341,13 @@ mod tests {
     async fn an_interrupt_from_any_door_stops_the_queue_and_send_now_steers() {
         let (hub, tx, calls) = rig();
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(send("c1", "held one")).await;
         hub.command(send("c2", "held two")).await;
         hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h2".into() }).await;
         tx.send(EngineMsg::Ev(json!({"type":"result","subtype":"interrupted"}))).await.unwrap();
         tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(*calls.lock().unwrap(), ["send:held two:true"], "steered at once; the other one stays held");
         hub.command(ClientFrame::Held { op: HeldOp::Remove, id: "h1".into() }).await;
         let sub = hub.subscribe(None, None).await.unwrap();
@@ -1347,7 +1361,7 @@ mod tests {
         hub.command(send("c2", "same")).await;
         tx.send(EngineMsg::Ev(prompt("u1", "same"))).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u2", "same"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let cids: Vec<String> = frames(&mut sub).iter().filter(|f| f["ev"]["type"] == "user").map(|f| f["ev"]["cid"].as_str().unwrap().to_string()).collect();
         assert_eq!(cids, ["c1", "c2"]);
         hub.command(send("c3", "never shows up")).await;
@@ -1360,7 +1374,7 @@ mod tests {
         let mut sub = hub.subscribe(None, None).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(sub.backlog.last().unwrap()).unwrap()["waiting_for"], Value::Null);
         tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: Some("dialog open".into()) }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(frames(&mut sub).last().unwrap()["waiting_for"], "dialog open");
     }
     #[tokio::test]
@@ -1368,14 +1382,14 @@ mod tests {
         let (hub, tx, calls) = rig();
         let mut sub = hub.subscribe(None, None).await.unwrap();
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(send("c1", "held")).await;
         tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(send("c2", "x")).await)["status"], "refused");
         assert!(calls.lock().unwrap().is_empty(), "nothing is typed into a dialog");
         tx.send(EngineMsg::Ended).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let f = frames(&mut sub);
         assert!(f.iter().any(|x| x["t"] == "ack" && x["cid"] == "c1" && x["status"] == "refused" && x["error"] == "session ended"));
         assert!(f.iter().any(|x| x["t"] == "state" && x["ended"] == true && x["held"] == json!([])));
@@ -1393,7 +1407,7 @@ mod tests {
     async fn paging_returns_older_events_and_reset_starts_a_new_conversation() {
         let (hub, tx, _) = rig();
         for i in 0..(BACKLOG + 50) { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         let mut sub = hub.subscribe(None, None).await.unwrap();
         let hello: Value = serde_json::from_str(&sub.backlog[0]).unwrap();
         assert_eq!(hello["first"], 51);
@@ -1401,7 +1415,7 @@ mod tests {
         assert_eq!((page["events"].as_array().unwrap().len(), page["events"][0]["seq"].as_u64(), page["more"].as_bool()), (30, Some(21), Some(true)));
         tx.send(EngineMsg::Reset).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("n1", "new"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let f = frames(&mut sub);
         assert_eq!(f[0]["t"], "reset");
         assert_eq!(f[1]["seq"], 1);
@@ -1410,7 +1424,7 @@ mod tests {
     async fn an_unreadable_session_says_so_and_types_nothing() {
         let (hub, tx, calls) = rig();
         tx.send(EngineMsg::Unreadable).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let sub = hub.subscribe(None, None).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(sub.backlog.last().unwrap()).unwrap()["unreadable"], true);
         let ack = reply(hub.command(send("c1", "x")).await);
@@ -1422,13 +1436,13 @@ mod tests {
         let (hub, tx, calls) = rig();
         let mut sub = hub.subscribe(None, None).await.unwrap();
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(send("c1", "held")).await;
         tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h1".into() }).await;
         tx.send(EngineMsg::Unreadable).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h1".into() }).await;
         assert!(calls.lock().unwrap().is_empty(), "Enter in a permission dialog would approve it");
         let f = frames(&mut sub);
@@ -1441,11 +1455,11 @@ mod tests {
         let (hub, tx, _) = rig();
         let mut sub = hub.subscribe(None, None).await.unwrap();
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(send("c1", "later")).await;
         hub.command(ClientFrame::Held { op: HeldOp::Now, id: "h1".into() }).await;
         tx.send(EngineMsg::Ev(json!({"type":"cdash","subtype":"queued","text":"later"}))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let f = frames(&mut sub);
         assert!(f.iter().any(|x| x["ev"]["subtype"] == "queued" && x["ev"]["cid"] == "c1"));
     }
@@ -1455,10 +1469,10 @@ mod tests {
         hub.command(send("c1", "first")).await;
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Stop).await;
         tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let early = reply(hub.command(send("c2", "second")).await);
         assert_eq!((early["status"].as_str(), early["error"].as_str()), (Some("refused"), Some("stopping; send again in a moment")));
         assert!(STOP_SETTLE >= Duration::from_millis(2500), "transcript writes were seen up to 2.2 s late");
@@ -1474,7 +1488,7 @@ mod tests {
         hub.command(send("c1", "first")).await;
         tx.send(engine_status(true, false)).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Stop).await;
         tx.send(engine_status(false, false)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1490,7 +1504,7 @@ mod tests {
         hub.command(send("c1", "first")).await;
         tx.send(engine_status(true, false)).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Stop).await;
         tx.send(engine_status(false, false)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1504,7 +1518,7 @@ mod tests {
         let (hub, tx, calls) = rig();
         hub.command(send("c1", "first")).await;
         tx.send(engine_status(true, false)).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Stop).await;
         tx.send(engine_status(false, false)).await.unwrap();
         for i in 1..=14 {
@@ -1517,7 +1531,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_never_notifies_only_live_turn_ends_do() {
-        let (_hub, tx, _ctx, mut notes) = rig_noting(false);
+        let (hub, tx, _ctx, mut notes) = rig_noting(false);
         tx.send(turn_end("success")).await.unwrap(); // replayed history
         tx.send(EngineMsg::Ready).await.unwrap();
         for s in ["success", "error_during_execution", "interrupted"] {
@@ -1527,7 +1541,7 @@ mod tests {
         tx.send(turn_end("success")).await.unwrap(); // the new conversation's history
         tx.send(EngineMsg::Ready).await.unwrap();
         tx.send(turn_end("success")).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(note_kinds(&mut notes), ["done", "error", "done"], "a Stop or Esc (interrupted) never notifies");
     }
 
@@ -1535,17 +1549,17 @@ mod tests {
     async fn finished_waits_for_the_queue_but_an_error_does_not() {
         let (hub, tx, _ctx, mut notes) = rig_noting(true);
         tx.send(engine_status(true, false)).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(send("c1", "next")).await; // held; leaves on its own
         tx.send(turn_end("success")).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert!(note_kinds(&mut notes).is_empty(), "the held message is about to go");
         tx.send(turn_end("error_during_execution")).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(note_kinds(&mut notes), ["error"]);
         hub.command(ClientFrame::Stop).await; // after a Stop nothing leaves on its own
         tx.send(turn_end("success")).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(note_kinds(&mut notes), ["done"]);
     }
 
@@ -1566,15 +1580,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_someone_is_looking_at_does_not_notify() {
-        let (_hub, tx, ctx, mut notes) = rig_noting(true);
+        let (hub, tx, ctx, mut notes) = rig_noting(true);
         let mut looking = FocusGuard::new(&ctx, "cdash-a");
         looking.set(true);
         tx.send(turn_end("success")).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert!(note_kinds(&mut notes).is_empty());
         drop(looking);
         tx.send(turn_end("success")).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(note_kinds(&mut notes), ["done"]);
     }
 
@@ -1582,7 +1596,7 @@ mod tests {
     async fn older_pages_come_from_the_source_and_a_position_older_than_the_window_starts_over() {
         let (hub, tx, _) = rig_history();
         for i in 0..2100 { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 101, limit: Some(50) }).await.unwrap()).unwrap();
         assert_eq!((page["events"][0]["seq"].as_u64(), page["events"][0]["ev"]["n"].as_u64()), (Some(51), Some(51)), "re-read from the source");
         let epoch = serde_json::from_str::<Value>(&hub.subscribe(None, None).await.unwrap().backlog[0]).unwrap()["epoch"].as_str().unwrap().to_string();
@@ -1596,12 +1610,12 @@ mod tests {
         hub.command(send("c1", "first")).await;
         tx.send(engine_status(true, false)).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Stop).await;
         tx.send(engine_status(false, false)).await.unwrap();
         tokio::time::sleep(STOP_SETTLE + Duration::from_millis(300)).await; // the retract lands at position 2
         for i in 0..=WINDOW { tx.send(EngineMsg::Ev(answer(&format!("k{i}")))).await.unwrap(); } // positions 1 to 3 leave memory
-        settle().await;
+        settle(&hub, &tx).await;
         let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 4, limit: Some(3) }).await.unwrap()).unwrap();
         let got: Vec<(u64, Value)> = page["events"].as_array().unwrap().iter()
             .map(|e| (e["seq"].as_u64().unwrap(), if e["ev"]["subtype"] == "retract" { json!("retract") } else { e["ev"]["n"].clone() })).collect();
@@ -1612,7 +1626,7 @@ mod tests {
     async fn a_page_across_the_window_edge_joins_the_source_and_memory() {
         let (hub, tx, _) = rig_history();
         for i in 0..2100 { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 120, limit: Some(50) }).await.unwrap()).unwrap();
         let ev = page["events"].as_array().unwrap();
         assert_eq!(ev.iter().map(|e| e["seq"].as_u64().unwrap()).collect::<Vec<_>>(), (70..=119).collect::<Vec<_>>());
@@ -1624,7 +1638,7 @@ mod tests {
     async fn a_source_that_comes_up_short_ends_paging() {
         let (hub, tx, _) = rig_history_to(60); // a transcript cut short since it was read
         for i in 0..2100 { tx.send(EngineMsg::Ev(prompt(&format!("u{i}"), "x"))).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         let page: Value = serde_json::from_str(&hub.command(ClientFrame::Page { before: 101, limit: Some(50) }).await.unwrap()).unwrap();
         assert_eq!(page["more"], false, "asking again would loop on the same short page");
     }
@@ -1632,12 +1646,12 @@ mod tests {
     #[tokio::test]
     async fn a_cut_truncates_after_its_anchor_and_reloads_every_client() {
         let (hub, tx, _) = rig();
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         let mut sub = hub.subscribe(None, None).await.unwrap();
         let old: Value = serde_json::from_str(&sub.backlog[0]).unwrap();
         tx.send(EngineMsg::Ev(cut(Some("s1")))).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u3", "c"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let f = frames(&mut sub);
         assert_eq!((f[0]["t"].as_str(), f[0]["reset"].as_bool(), f[0]["head"].as_u64()), (Some("hello"), Some(true), Some(3)));
         assert_ne!(f[0]["epoch"], old["epoch"]);
@@ -1648,24 +1662,24 @@ mod tests {
     #[tokio::test]
     async fn a_cut_that_removes_nothing_or_cannot_be_placed_changes_nothing() {
         let (hub, tx, _) = rig();
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         let mut sub = hub.subscribe(None, None).await.unwrap();
         for after in [Some("s2"), Some("not-in-this-log")] { tx.send(EngineMsg::Ev(cut(after))).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         assert!(frames(&mut sub).is_empty(), "no new epoch, no reload, nothing hidden");
     }
     #[tokio::test]
     async fn a_cut_keeps_pending_and_held_messages() {
         let (hub, tx, _) = rig();
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         hub.command(send("c1", "next")).await;
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(send("c2", "later")).await;
         let mut sub = hub.subscribe(None, None).await.unwrap();
         tx.send(EngineMsg::Ev(cut(Some("s1")))).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u3", "next"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let f = frames(&mut sub);
         assert_eq!(f.iter().find(|x| x["ev"]["uuid"] == "u3").unwrap()["ev"]["cid"], "c1", "the prompt after a cut still confirms it");
         assert_eq!(f.iter().rev().find(|x| x["t"] == "state").unwrap()["held"][0]["text"], "later");
@@ -1677,13 +1691,13 @@ mod tests {
         assert_eq!((st["usage"].clone(), st["tasks"].clone()), (Value::Null, json!([])), "keys always present");
         tx.send(EngineMsg::Usage(json!({"cwd":"/w","context":{"used":5,"window":null}}))).await.unwrap();
         tx.send(EngineMsg::Tasks(vec![json!({"id":"b1","kind":"shell","title":"sleep 60","started":"2026-11-13T10:00:00Z"})])).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let s = hub.subscribe(None, None).await.unwrap();
         assert_eq!((last_state(&s)["usage"]["cwd"].as_str(), last_state(&s)["tasks"][0]["id"].as_str()), (Some("/w"), Some("b1")));
         assert_eq!(serde_json::from_str::<Value>(&s.backlog[0]).unwrap()["head"], 0, "snapshots are not events");
         assert_eq!(hub.folder().await.as_deref(), Some("/w"));
         tx.send(EngineMsg::Reset).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let st = last_state(&hub.subscribe(None, None).await.unwrap());
         assert_eq!((st["usage"].clone(), st["tasks"].clone(), hub.folder().await), (Value::Null, json!([]), None));
     }
@@ -1691,14 +1705,14 @@ mod tests {
     async fn a_root_cut_cuts_everything_in_memory_and_nothing_once_events_left_it() {
         let head = |s: Subscription| serde_json::from_str::<Value>(&s.backlog[0]).unwrap()["head"].clone();
         let (hub, tx, _) = rig();
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         tx.send(EngineMsg::Ev(cut(None))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(head(hub.subscribe(None, None).await.unwrap()), 0, "the whole log goes");
         let (hub, tx, _) = rig();
         for i in 0..=WINDOW { tx.send(EngineMsg::Ev(answer(&format!("k{i}")))).await.unwrap(); } // position 1 leaves memory
         tx.send(EngineMsg::Ev(cut(None))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(head(hub.subscribe(None, None).await.unwrap()), WINDOW + 1, "the start is not in memory: nothing goes");
     }
     #[tokio::test(start_paused = true)]
@@ -1707,12 +1721,12 @@ mod tests {
         hub.command(send("c1", "first")).await;
         tx.send(engine_status(true, false)).await.unwrap();
         tx.send(EngineMsg::Ev(prompt("u1", "first"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         hub.command(ClientFrame::Stop).await;
         tx.send(engine_status(false, false)).await.unwrap();
         tokio::time::sleep(STOP_SETTLE + Duration::from_millis(300)).await; // the retract, also uuid u1, lands at position 2
         tx.send(EngineMsg::Ev(cut(Some("u1")))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let b: Vec<Value> = hub.subscribe(None, None).await.unwrap().backlog.iter().map(|f| serde_json::from_str(f).unwrap()).collect();
         assert_eq!(b[0]["head"], 1, "a retract names the prompt it withdraws; it is not the anchor");
         assert_eq!(b[1]["ev"]["uuid"], "u1");
@@ -1723,19 +1737,19 @@ mod tests {
         let todo = |uuid: &str, text: &str| json!({"type":"cdash","subtype":"todo","uuid":uuid,"items":[{"text":text,"status":"pending"}]});
         let todo_now = || async { last_state(&hub.subscribe(None, None).await.unwrap())["todo"].clone() };
         assert_eq!(todo_now().await, Value::Null);
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         for e in [todo("t1", "first"), result("s3"), todo("t2", "second")] { tx.send(EngineMsg::Ev(e)).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(todo_now().await[0]["text"], "second");
         tx.send(EngineMsg::Ev(cut(Some("s3")))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(todo_now().await[0]["text"], "first", "the cut list goes, the one before it is back");
         tx.send(EngineMsg::Ev(cut(Some("s1")))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(todo_now().await, Value::Null);
         tx.send(EngineMsg::Ev(todo("t3", "third"))).await.unwrap();
         tx.send(EngineMsg::Reset).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(todo_now().await, Value::Null);
     }
 
@@ -1743,13 +1757,13 @@ mod tests {
     #[tokio::test]
     async fn rewind_runs_only_while_idle_cuts_at_the_prompt_and_reloads_clients_once() {
         let (hub, tx, calls) = rig();
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let busy = reply(hub.command(rewind("u2")).await);
         assert_eq!((busy["ok"].as_bool(), busy["error"].as_str()), (Some(false), Some("Stop the turn or wait for it to finish")));
         tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let mut sub = hub.subscribe(None, None).await.unwrap();
         assert_eq!(reply(hub.command(rewind("u2")).await), json!({"t":"rewound","uuid":"u2","ok":true,"text":"text of u2","attachments":0}));
         assert_eq!(*calls.lock().unwrap(), ["rewind:u2:true"], "nothing reached the engine while busy");
@@ -1757,7 +1771,7 @@ mod tests {
         assert_eq!((f[0]["t"].as_str(), f[0]["head"].as_u64()), (Some("hello"), Some(3)), "cut before the prompt");
         tx.send(EngineMsg::Ev(cut(Some("s1")))).await.unwrap();             // the next prompt makes the tap cut at the same place
         tx.send(EngineMsg::Ev(prompt("u3", "two, edited"))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let g = frames(&mut sub);
         assert!(!g.iter().any(|x| x["t"] == "hello"), "a chat rewind followed by its prompt reloads clients once");
         assert_eq!(g.iter().find(|x| x["t"] == "ev").unwrap()["seq"], 4);
@@ -1765,14 +1779,14 @@ mod tests {
     #[tokio::test]
     async fn a_failed_unknown_or_steered_rewind_leaves_the_conversation_alone() {
         let (hub, tx, calls) = rig_failing_rewind();
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         let failed = reply(hub.command(rewind("u2")).await);
         assert_eq!((failed["ok"].as_bool(), failed["error"].as_str()), (Some(false), Some("rewind failed; use Terminal")));
         assert_eq!(reply(hub.command(rewind("zz")).await)["error"], "not in this conversation");
         let mut steered = prompt("s9", "steered");
         steered["src"] = json!("steer");
         tx.send(EngineMsg::Ev(steered)).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(rewind("s9")).await)["error"], "this prompt cannot be rewound");
         assert_eq!(*calls.lock().unwrap(), ["rewind:u2:true"]);
         assert_eq!(serde_json::from_str::<Value>(&hub.subscribe(None, None).await.unwrap().backlog[0]).unwrap()["head"], 7);
@@ -1780,26 +1794,26 @@ mod tests {
         let mut p = prompt("u1", "a");
         p["files"] = json!([{"kind":"file","name":"a.pdf"},{"kind":"image","ref":"ab","mime":"image/png"}]);
         tx.send(EngineMsg::Ev(p)).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(rewind("u1")).await)["attachments"], 2);
     }
     #[tokio::test]
     async fn a_rewind_also_cuts_the_queued_row_that_announced_its_prompt() {
         let (hub, tx, _) = rig();
         for e in [prompt("u1", "a"), answer("k1"), json!({"type":"cdash","subtype":"queued","text":"b"}), prompt("u2", "b")] { tx.send(EngineMsg::Ev(e)).await.unwrap(); }
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(rewind("u2")).await)["ok"], true);
         let mut sub = hub.subscribe(None, None).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&sub.backlog[0]).unwrap()["head"], 2);
         tx.send(EngineMsg::Ev(cut(Some("k1")))).await.unwrap(); // the tap's cut when the edited prompt lands
-        settle().await;
+        settle(&hub, &tx).await;
         assert!(!frames(&mut sub).iter().any(|x| x["t"] == "hello"), "the tap's cut removes nothing more");
         assert_eq!(serde_json::from_str::<Value>(&hub.subscribe(None, None).await.unwrap().backlog[0]).unwrap()["head"], 2);
     }
     #[tokio::test]
     async fn a_rewind_right_after_a_send_waits_for_that_prompt() {
         let (hub, tx, calls) = rig();
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         assert_eq!(reply(hub.command(send("c1", "next")).await)["status"], "sent");
         let r = reply(hub.command(rewind("u2")).await);
         assert_eq!((r["ok"].as_bool(), r["error"].as_str()), (Some(false), Some("Stop the turn or wait for it to finish")));
@@ -1810,10 +1824,10 @@ mod tests {
     async fn undo_reaches_the_engine_only_while_idle() {
         let (hub, tx, calls) = rig();
         tx.send(EngineMsg::Status { working: true, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(ClientFrame::RewindUndo).await)["ok"], false);
         tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(ClientFrame::RewindUndo).await), json!({"t":"rewound","uuid":null,"ok":true}));
         assert_eq!(*calls.lock().unwrap(), ["undo"]);
     }
@@ -1821,9 +1835,9 @@ mod tests {
     #[tokio::test]
     async fn a_side_question_never_touches_the_log_or_the_queue() {
         let (hub, tx, calls) = rig();
-        log6(&tx).await;
+        log6(&hub, &tx).await;
         tx.send(engine_status(true, false)).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(send("c1", "later")).await)["status"], "held");
         let before = last_state(&hub.subscribe(None, None).await.unwrap());
         let mut sub = hub.subscribe(None, None).await.unwrap();
@@ -1833,14 +1847,14 @@ mod tests {
         assert!(rx.recv().await.unwrap().done);
         assert_eq!(hub.aside("q2".into(), " \n ".into()).await.err().as_deref(), Some("empty message"));
         hub.aside_cancel("q1".into()).await;
-        settle().await;
+        settle(&hub, &tx).await;
         assert!(frames(&mut sub).is_empty(), "no frame reaches the hub's clients");
         let after = hub.subscribe(None, None).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&after.backlog[0]).unwrap()["head"], 6);
         assert_eq!((last_state(&after)["held"].clone(), before["held"][0]["text"].as_str()), (before["held"].clone(), Some("later")));
         assert_eq!(*calls.lock().unwrap(), ["aside:q1:why?", "aside_cancel:q1"]);
         tx.send(EngineMsg::Ended).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(hub.aside("q3".into(), "why?".into()).await.err().as_deref(), Some("session ended"));
         assert_eq!(calls.lock().unwrap().len(), 2, "an ended session never reaches the engine");
     }
@@ -1872,7 +1886,7 @@ mod tests {
         assert!(st.get("waiting_for").is_some(), "Part 4's key stays");
         tx.send(EngineMsg::Asks(vec![plan_ask("a1")])).await.unwrap();
         tx.send(EngineMsg::Settings(json!({"model":"m","effort":"high","plan":true,"agent":null,"variant":null}))).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         let st = last(hub.subscribe(None, None).await.unwrap());
         assert_eq!((st["asks"][0]["id"].as_str(), st["settings"]["effort"].as_str()), (Some("a1"), Some("high")));
     }
@@ -1882,7 +1896,7 @@ mod tests {
         let ans = |id: &str, c: &str| ClientFrame::Answer { id: id.into(), choice: Some(c.into()), text: None, answers: None };
         assert_eq!(reply(hub.command(ans("gone", "yes")).await), json!({"t":"answered","id":"gone","ok":false,"error":"already answered"}));
         tx.send(EngineMsg::Asks(vec![plan_ask("a1")])).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(ans("a1", "maybe")).await)["error"], "not a valid answer");
         assert_eq!(reply(hub.command(ans("a1", "yes")).await), json!({"t":"answered","id":"a1","ok":true}));
         assert_eq!(*calls.lock().unwrap(), ["answer:a1:yes"]);
@@ -1891,10 +1905,10 @@ mod tests {
     async fn waiting_refuses_sends_with_the_card_or_the_terminal_message() {
         let (hub, tx, _) = rig();
         tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: Some("permission prompt".into()) }).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(send("c1", "x")).await)["error"], "answer in Terminal first");
         tx.send(EngineMsg::Asks(vec![plan_ask("a1")])).await.unwrap();
-        settle().await;
+        settle(&hub, &tx).await;
         assert_eq!(reply(hub.command(send("c2", "x")).await)["error"], "answer the card first");
     }
     #[tokio::test]

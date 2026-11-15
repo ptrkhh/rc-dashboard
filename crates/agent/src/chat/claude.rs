@@ -190,6 +190,9 @@ struct Shared {
     /// Transcript polls the loop made.
     #[cfg(test)]
     polls: AtomicUsize,
+    /// Whether the loop's last pass parked it in the slow wait.
+    #[cfg(test)]
+    parked: std::sync::atomic::AtomicBool,
 }
 
 impl Engine for ClaudeEngine {
@@ -588,6 +591,8 @@ async fn run(
                 && idle_since.is_some_and(|t| !c.tap.turn_open() || t.elapsed() >= TURN_END_GRACE)
                 // No transcript yet (no prompt so far) counts as unchanged.
                 && tokio::fs::metadata(&c.tail.path).await.map_or(true, |m| m.len() == c.tail.offset);
+            #[cfg(test)]
+            shared.parked.store(slow, Ordering::Relaxed);
             let lines = if slow {
                 Vec::new()
             } else {
@@ -708,7 +713,7 @@ pub(crate) mod tests {
     use crate::chat::hub::Answer;
     use crate::chat::hub::Kind;
     use crate::chat::hub::{ClientFrame, Hub, WINDOW};
-    use crate::chat::tmux_io::tests::{chip_stub, stub_tmux, tempfile_path};
+    use crate::chat::tmux_io::tests::{chip_stub, eventually, stub_tmux, tempfile_path};
     use crate::host::cmd::Runner;
     use crate::host::log::LogBuffer;
     use serde_json::{json, Value};
@@ -866,6 +871,21 @@ pub(crate) mod tests {
         engine.shared.polls.load(Ordering::Relaxed) - before
     }
 
+    /// Waits for the loop to park in the slow wait.
+    async fn parks(engine: &ClaudeEngine) {
+        eventually("the loop parks", || engine.shared.parked.load(Ordering::Relaxed)).await;
+    }
+
+    /// Waits for `n` more transcript polls. A parked loop with an unchanged
+    /// transcript makes none, so this passing means the loop is not parked.
+    async fn polled(engine: &ClaudeEngine, n: usize) {
+        let before = engine.shared.polls.load(Ordering::Relaxed);
+        eventually("transcript polls", || engine.shared.polls.load(Ordering::Relaxed) >= before + n).await;
+    }
+
+    /// Generous: a positive wait under CPU load.
+    const SLOW_OK: Duration = Duration::from_secs(10);
+
     #[tokio::test]
     async fn an_idle_session_nobody_watches_is_read_through_its_status_file_only() {
         let (ctx, dir) = fixture_ctx("idle");
@@ -873,20 +893,24 @@ pub(crate) mod tests {
         let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
         next_status(&mut rx).await; // idle
-        tokio::time::sleep(Duration::from_millis(500)).await; // the pass after Ready parks
+        parks(&engine).await;
+        // Must not happen: checked over a bounded window of two slow waits.
         assert_eq!(polls_in(&engine, 2000).await, 0, "parked: the transcript is not polled");
-        let wait = |ms| Duration::from_millis(ms);
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy"}"#);
-        assert!(matches!(tokio::time::timeout(wait(1500), next_status(&mut rx)).await, Ok(EngineMsg::Status { working: true, .. })), "busy is seen within a slow wait");
+        assert!(matches!(tokio::time::timeout(SLOW_OK, next_status(&mut rx)).await, Ok(EngineMsg::Status { working: true, .. })), "busy is seen while parked");
+        // The transcript has not changed: only the fast poll reads it now.
+        polled(&engine, 2).await;
         append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(13..14));
-        assert!(tokio::time::timeout(wait(300), next_ev(&mut rx)).await.is_ok(), "busy: the prompt is read at the fast rate");
+        assert!(tokio::time::timeout(SLOW_OK, next_ev(&mut rx)).await.is_ok(), "busy: the prompt is read at the fast rate");
         append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(9..10)); // the turn ends
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
         next_ev(&mut rx).await; // its result: slow again
+        parks(&engine).await;
         engine.watchers(1).await;
-        assert!(polls_in(&engine, 2000).await > 10, "someone watches: polled as today");
+        polled(&engine, 10).await; // someone watches: polled as today
+        assert!(!engine.shared.parked.load(Ordering::Relaxed), "someone watches: not parked");
         append(&dir.join("projects/-proj/sid-1.jsonl"), &fixture_lines(13..14));
-        assert!(tokio::time::timeout(wait(1000), next_ev(&mut rx)).await.is_ok(), "and what is appended is read");
+        assert!(tokio::time::timeout(SLOW_OK, next_ev(&mut rx)).await.is_ok(), "and what is appended is read");
     }
 
     #[tokio::test]
@@ -895,12 +919,12 @@ pub(crate) mod tests {
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
         let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        parks(&engine).await;
+        // Must not happen: checked over a bounded window of two slow waits.
         assert_eq!(polls_in(&engine, 2000).await, 0, "parked");
         append(&dir.join("projects/-proj/sid-1.jsonl"), &format!("{}{}", fixture_lines(13..14), fixture_lines(9..10)));
-        let wait = |ms| Duration::from_millis(ms);
-        assert!(tokio::time::timeout(wait(1500), next_ev(&mut rx)).await.is_ok(), "the prompt, with no status change");
-        let end = tokio::time::timeout(wait(300), next_ev(&mut rx)).await;
+        assert!(tokio::time::timeout(SLOW_OK, next_ev(&mut rx)).await.is_ok(), "the prompt, with no status change");
+        let end = tokio::time::timeout(SLOW_OK, next_ev(&mut rx)).await;
         assert!(matches!(end, Ok(EngineMsg::Ev(ref v)) if v["type"] == "result"), "and its turn end");
     }
 
@@ -913,6 +937,8 @@ pub(crate) mod tests {
         collect_until_ready(&mut rx).await;
         assert!(polls_in(&engine, 1000).await >= 4, "inside the grace the open turn is polled fast");
         tokio::time::sleep(TURN_END_GRACE).await;
+        parks(&engine).await;
+        // Must not happen: checked over a bounded window of two slow waits.
         assert_eq!(polls_in(&engine, 2000).await, 0, "past the grace it parks");
     }
 
@@ -1025,7 +1051,8 @@ pub(crate) mod tests {
         write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"idle"}"#);
         let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
         collect_until_ready(&mut rx).await;
-        tokio::time::sleep(Duration::from_millis(500)).await; // the pass after Ready parks
+        parks(&engine).await;
+        // Must not happen: checked over a bounded window longer than one slow wait.
         assert_eq!(polls_in(&engine, 1200).await, 0, "parked");
         let _hook = engine.live().lock().unwrap().hold(&plan_request("p1", "# P"), std::time::Instant::now()).unwrap();
         let shown = tokio::time::timeout(Duration::from_millis(150), next_of(&mut rx, |m| matches!(m, EngineMsg::Asks(a) if a.len() == 1))).await;

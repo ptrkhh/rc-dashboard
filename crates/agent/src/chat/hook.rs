@@ -192,17 +192,18 @@ mod tests {
     }
     #[tokio::test]
     async fn other_tools_subagents_and_requests_without_a_dialog_are_answered_empty() {
-        let (addr, _ctx, dir) = hook_server("empty", "4242||tok-1").await;
-        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"waiting","waitingFor":"permission prompt"}"#);
-        let started = std::time::Instant::now();
+        // No dialog shows: a request that reached the dialog check would be answered "no dialog".
+        let (addr, ctx, _dir) = hook_server("empty", "4242||tok-1").await;
         let bash = json!({"prompt_id":"p","tool_name":"Bash","tool_input":{"command":"ls"}}).to_string();
         assert_eq!(post(addr, "pane=cdash-a", Some("tok-1"), bash).await, (200, String::new()));
         let mut sub = ask_request("p1");
         sub["agent_id"] = json!("a6cc68d2a048556bd");
         assert_eq!(post(addr, "pane=cdash-a", Some("tok-1"), sub.to_string()).await, (200, String::new()));
-        assert!(started.elapsed() < DIALOG_WINDOW, "neither waits for the dialog check");
-        write_session(&dir, r#"{"sessionId":"sid-1","cwd":"/proj","status":"busy"}"#);
         assert_eq!(post(addr, "pane=cdash-a", Some("tok-1"), ask_request("p1").to_string()).await, (200, String::new()), "no dialog within 300 ms");
+        let empties: Vec<String> = ctx.host.log.lines().into_iter().filter(|l| l.contains(": empty (")).collect();
+        assert_eq!(empties.iter().map(|l| l.split_once("hook ").unwrap().1).collect::<Vec<_>>(),
+            ["cdash-a Bash: empty (other tool)", "cdash-a AskUserQuestion: empty (subagent)", "cdash-a AskUserQuestion: empty (no dialog)"],
+            "neither waits for the dialog check");
     }
     #[tokio::test]
     async fn a_question_from_a_real_dialog_is_held_until_chat_answers() {

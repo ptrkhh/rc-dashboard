@@ -520,8 +520,7 @@ pub(crate) mod tests {
         assert_eq!(http_post(&format!("http://127.0.0.1:{port}/hook/claude?pane=bad"), "{}").await.0, 400);
         assert_ne!(http_post(&format!("http://{}/hook/claude?pane=bad", b.addr), "{}").await.0, 400, "not on the dashboard's port");
         b.stop().await;
-        // What a desktop restart does right after stop.
-        tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("stop released the hook port");
+        released(([127, 0, 0, 1], port).into()).await;
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut cfg = cfg_for(tempdir("hook-taken"));
         cfg.hook_port = Some(held.local_addr().unwrap().port());
@@ -535,10 +534,16 @@ pub(crate) mod tests {
         let b = serve(cfg_for(tempdir("stop"))).await.unwrap();
         let addr = b.addr;
         b.stop().await;
-        // The old listener must be gone, not just the accept loop parked.
-        // Rebinding the port would race parallel tests, which draw ephemeral
-        // ports too; a refused connect cannot be taken from us. A connect that
-        // succeeds (a self-connect, or a neighbour's listener) is retried.
+        released(addr).await;
+    }
+
+    /// The listener on `addr` is gone, not just its accept loop parked.
+    /// Rebinding the port would race parallel tests, which draw ephemeral
+    /// ports too (a neighbour's outgoing connection can take it as its source
+    /// port the moment it is free); a refused connect cannot be taken from us.
+    /// A connect that succeeds (a self-connect, or a neighbour's listener) is
+    /// retried.
+    async fn released(addr: SocketAddr) {
         for _ in 0..300 {
             match tokio::net::TcpStream::connect(addr).await {
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return,
