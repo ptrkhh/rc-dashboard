@@ -8,6 +8,7 @@ const say = (uuid, id, text) => ({ type: 'assistant', uuid, message: { id, role:
 const use = (uuid, id, name, input) => ({ type: 'assistant', uuid, message: { id: 'm' + id, role: 'assistant', content: [{ type: 'tool_use', id, name, input }] } });
 const done = (uuid, id, text, is_error = false) => ({ type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: text, is_error }] } });
 const hello = (o = {}) => ({ t: 'hello', epoch: 'e1', tool: 'claude', first: 1, head: 0, reset: true, ...o });
+const WORKING = { t: 'state', working: true, waiting: false, ended: false, held: [] };
 const feed = frames => frames.reduce(S.apply, S.initial());
 
 test('events become rows; repeats and gaps are not shown twice', () => {
@@ -42,7 +43,7 @@ test('held, returned, refused and unconfirmed messages keep their text', () => {
   assert.equal(mine[3].error, 'session ended');
 });
 test('a withdrawn prompt disappears and a queued one shows until Claude takes it', () => {
-  let s = feed([hello(), ev(1, prompt('u4', 'handed back')), ev(2, { type: 'cdash', subtype: 'retract', uuid: 'u4' }),
+  let s = feed([hello(), WORKING, ev(1, prompt('u4', 'handed back')), ev(2, { type: 'cdash', subtype: 'retract', uuid: 'u4' }),
     ev(3, { type: 'cdash', subtype: 'queued', text: 'use -j4' })]);
   assert.deepEqual(S.rows(s).map(r => [r.text, r.status]), [['use -j4', 'queued']]);
   s = S.apply(s, ev(4, prompt('q1', 'use -j4', { src: 'steer' })));
@@ -75,7 +76,7 @@ test('turn ends, shell commands and both prompt content shapes are understood', 
   assert.equal(S.rows(s)[1].stdout, 'hi');
 });
 test('a message Claude queued shows once, as queued, until Claude takes it', () => {
-  let s = feed([hello()]);
+  let s = feed([hello(), WORKING]);
   S.addMine(s, 'c1', 'later');
   s = S.apply(s, { t: 'ack', cid: 'c1', status: 'sent' });
   s = S.apply(s, ev(1, { type: 'cdash', subtype: 'queued', text: 'later', cid: 'c1' }));
@@ -190,4 +191,65 @@ test('my attachments show until the prompt event replaces them', () => {
   assert.deepEqual(S.rows(s).map(r => [r.text, r.status, r.files]), [['', 'sending', files]]);
   s = S.apply(s, ev(1, prompt('u1', '', { cid: 'c1', files: [{ kind: 'image', ref: 'ab'.repeat(32), mime: 'image/png' }] })));
   assert.deepEqual(S.rows(s).map(r => [r.status, r.files[0].ref]), [['sent', 'ab'.repeat(32)]]);
+});
+
+test('rows carry time, id and source; days are separated; thinking is its own row', () => {
+  const s = feed([hello(), ev(1, prompt('u1', 'hi', { ts: '2026-11-12T12:00:00Z' })),
+    ev(2, { type: 'assistant', uuid: 'k1', ts: '2026-11-12T12:00:05Z', message: { id: 'm1', role: 'assistant', content: [{ type: 'thinking', thinking: 'Plan it.' }] } }),
+    ev(3, { ...say('k2', 'm1', 'hello'), ts: '2026-11-12T12:00:06Z' }), ev(4, prompt('u2', 'again', { ts: '2026-11-13T12:00:00Z', src: 'steer' }))]);
+  assert.deepEqual(S.rows(s).map(r => r.kind), ['user', 'thinking', 'text', 'day', 'user']);
+  const [u1, th, , day, u2] = S.rows(s);
+  assert.deepEqual([u1.uuid, u1.src, u1.ts, th.text, day.ts, u2.src], ['u1', 'typed', '2026-11-12T12:00:00Z', 'Plan it.', '2026-11-13T12:00:00Z', 'steer']);
+});
+test('the checklist is the latest todo event; a staged revert is a row', () => {
+  const todo = items => ({ type: 'cdash', subtype: 'todo', items });
+  const s = feed([hello(), ev(1, todo([{ text: 'a', status: 'pending' }])), ev(2, todo([{ text: 'a', status: 'completed' }, { text: 'b', status: 'in_progress' }])),
+    ev(3, { type: 'cdash', subtype: 'staged', messages: 2 })]);
+  assert.deepEqual(S.todo(s), { done: 1, total: 2, items: [{ text: 'a', status: 'completed' }, { text: 'b', status: 'in_progress' }] });
+  assert.equal(S.todo(feed([hello()])), null);
+  assert.deepEqual(S.rows(s).map(r => [r.kind, r.count]), [['staged', 2]], 'todo events are not rows');
+});
+test('the hub\'s state todo wins and outlives the backlog', () => {
+  const items = [{ text: 'a', status: 'completed' }, { text: 'b', status: 'pending' }];
+  const st = todo => ({ t: 'state', working: false, waiting: false, ended: false, held: [], todo });
+  let s = feed([hello(), st(items)]);
+  assert.deepEqual(S.todo(s), { done: 1, total: 2, items }, 'no todo event in the rows');
+  s = S.apply(s, ev(1, { type: 'cdash', subtype: 'todo', items: [{ text: 'old', status: 'pending' }] }));
+  assert.equal(S.todo(s).items[0].text, 'a', 'state beats an event');
+  s = S.apply(s, st(null));
+  assert.equal(S.todo(s).items[0].text, 'old', 'no state todo: the latest event');
+});
+test('a queued row with no later prompt is hidden once the session is idle', () => {
+  let s = feed([hello(), WORKING, ev(1, { type: 'cdash', subtype: 'queued', text: 'lost' })]);
+  assert.equal(S.rows(s).length, 1);
+  s = S.apply(s, { ...WORKING, working: false });
+  assert.deepEqual(S.rows(s), []);
+});
+test('edit diffs and their counts come from each tool\'s own record', () => {
+  assert.deepEqual(S.lineDiff('a\nb\nc', 'a\nB\nc'), [{ t: ' ', s: 'a' }, { t: '-', s: 'b' }, { t: '+', s: 'B' }, { t: ' ', s: 'c' }]);
+  const n = d => [d.add, d.del];
+  assert.deepEqual(n(S.editDiff({ name: 'Edit', input: { file_path: '/p/x.js', old_string: 'a\nb\nc', new_string: 'a\nB\nc' } })), [1, 1]);
+  assert.deepEqual(n(S.editDiff({ name: 'MultiEdit', input: { file_path: '/p/x.js', edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c', new_string: 'd\ne' }] } })), [3, 2]);
+  assert.deepEqual(n(S.editDiff({ name: 'Write', input: { file_path: '/p/n.txt', content: 'x\ny' } })), [2, 0]);
+  const codex = S.editDiff({ name: 'Edit', input: { changes: [{ path: 'a.rs', kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-old\n+new\n' }, { path: 'b.rs', kind: { type: 'add' }, diff: 'one\ntwo\n' }] } });
+  assert.deepEqual([...n(codex), codex.files.length], [3, 1, 2]);
+  assert.deepEqual(n(S.editDiff({ name: 'edit', input: { path: 'a.ts' }, diff: [{ file: 'a.ts', additions: 1, deletions: 1, patch: '--- a.ts\n+++ a.ts\n@@ -1 +1 @@\n-x\n+y\n' }] })), [1, 1]);
+  assert.equal(S.editDiff({ name: 'Read', input: { file_path: '/p/x' } }), null);
+  const rows = S.rows(feed([hello(), ev(1, use('a', 't1', 'Edit', { file_path: '/p/x.js', old_string: 'a\nb', new_string: 'a\nB' })), ev(2, done('b', 't1', 'ok'))]));
+  assert.equal(rows[0].label, 'Edited x.js +1 \u22121');
+});
+test('an OpenCode tool result\'s diff lands on its call', () => {
+  const diff = [{ file: 'a.ts', additions: 1, deletions: 0, patch: '+z\n' }];
+  const r = { type: 'user', uuid: 'b', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] }, diff };
+  const rows = S.rows(feed([hello(), ev(1, use('a', 't1', 'edit', { path: 'a.ts' })), ev(2, { ...r, message: { ...r.message, content: [{ ...r.message.content[0], diff }] } })]));
+  assert.deepEqual(rows[0].calls[0].diff, diff);
+});
+test('rewind is offered on idle prompts backed by an event that did not steer; state carries usage and tasks', () => {
+  const idle = { working: false, waiting: false, ended: false, unreadable: false };
+  assert.equal(S.canRewind(idle, { kind: 'user', uuid: 'u1', src: 'typed' }), true);
+  assert.equal(S.canRewind(idle, { kind: 'user', uuid: 'u1' }), true, 'Codex and OpenCode prompts have no src');
+  for (const [st, row] of [[{ ...idle, working: true }, { kind: 'user', uuid: 'u1' }], [idle, { kind: 'user', uuid: 'u1', src: 'steer' }],
+    [idle, { kind: 'user', cid: 'c1' }], [idle, { kind: 'text', uuid: 'k1' }]]) assert.equal(S.canRewind(st, row), false);
+  const s = feed([hello(), { t: 'state', working: false, waiting: false, ended: false, held: [], usage: { cwd: '/w' }, tasks: [{ id: 'b1' }] }]);
+  assert.deepEqual([s.usage, s.tasks], [{ cwd: '/w' }, [{ id: 'b1' }]]);
 });

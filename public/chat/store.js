@@ -14,6 +14,7 @@
     menu: null,          // {commands, models, efforts, agents} once the menu frame arrived
     answered: new Map(), // ask id -> {ok, error}; forgotten once the ask leaves `asks`
     setReply: null,      // {ok, error} of the last settings change
+    usage: null, tasks: [], stateTodo: null,  // from the state frame; stateTodo is the hub's checklist
   });
 
   const isPrompt = ev => ev.type === 'user' && !(Array.isArray(ev.message?.content) && ev.message.content.some(b => b?.type === 'tool_result'));
@@ -81,6 +82,7 @@
         s.streams.set(f.id, (s.streams.get(f.id) || '') + f.text);
         break;
       case 'state':
+        Object.assign(s, { usage: f.usage ?? null, tasks: f.tasks ?? [], stateTodo: f.todo ?? null });
         Object.assign(s, { working: !!f.working, waiting: !!f.waiting, ended: !!f.ended, unreadable: !!f.unreadable, held: f.held || [] });
         Object.assign(s, { asks: f.asks ?? [], settings: f.settings ?? {}, hooks: f.hooks !== false, waiting_for: f.waiting_for ?? null });
         for (const id of s.answered.keys()) if (!s.asks.some(a => a.id === id)) s.answered.delete(id);
@@ -161,8 +163,52 @@
     : VERBS[name] && name !== 'Bash' ? VERBS[name][done ? 1 : 0] + ' ' + calls.length + ' files'
     : name + ' ×' + calls.length;
 
+  const lines = x => x === '' ? [] : String(x).replace(/\n$/, '').split('\n');
+  const mark = (t, ls) => ls.map(s => ({ t, s }));
+  function lineDiff(a, b) {
+    const x = lines(a), y = lines(b);
+    // ponytail: the table is x*y cells; past 250,000 the whole of a goes, then the whole of b. Myers diff if that shows.
+    if (x.length * y.length > 250000) return [...mark('-', x), ...mark('+', y)];
+    const L = Array.from({ length: x.length + 1 }, () => new Array(y.length + 1).fill(0));
+    for (let i = x.length; i--;) for (let j = y.length; j--;) L[i][j] = x[i] === y[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    const out = [];
+    let i = 0, j = 0;
+    while (i < x.length || j < y.length) {
+      if (i < x.length && j < y.length && x[i] === y[j]) { out.push({ t: ' ', s: x[i++] }); j++; }
+      else if (j >= y.length || (i < x.length && L[i + 1][j] >= L[i][j + 1])) out.push({ t: '-', s: x[i++] });
+      else out.push({ t: '+', s: y[j++] });
+    }
+    return out;
+  }
+  // A unified patch's body: no headers, so counts skip +++ and ---.
+  const patchLines = p => lines(p).filter(l => !/^(@@|\+\+\+|---)/.test(l)).map(l => ({ t: l[0] === '+' || l[0] === '-' ? l[0] : ' ', s: l.slice(1) }));
+  function editDiff(call) {
+    const i = call?.input || {};
+    let files;
+    if (Array.isArray(call?.diff)) files = call.diff.filter(d => typeof d?.patch === 'string').map(d => ({ path: d.file, lines: patchLines(d.patch) }));
+    else if (Array.isArray(i.changes)) {
+      files = i.changes.map(c => ({ path: c.path, lines: c.kind?.type === 'update' ? patchLines(c.diff ?? '') : mark(c.kind?.type === 'delete' ? '-' : '+', lines(c.diff ?? '')) }));
+    } else if (call?.name === 'Edit' && typeof i.old_string === 'string' && typeof i.new_string === 'string') files = [{ path: i.file_path, lines: lineDiff(i.old_string, i.new_string) }];
+    else if (call?.name === 'MultiEdit' && Array.isArray(i.edits)) files = [{ path: i.file_path, lines: i.edits.flatMap(e => lineDiff(e.old_string ?? '', e.new_string ?? '')) }];
+    else if (call?.name === 'Write' && typeof i.content === 'string') files = [{ path: i.file_path, lines: mark('+', lines(i.content)) }];
+    if (!files?.length) return null;
+    const count = t => files.reduce((n, f) => n + f.lines.filter(l => l.t === t).length, 0);
+    return { files, add: count('+'), del: count('-') };
+  }
+
+  // The hub's checklist outlives the backlog; without it, the latest todo event.
+  function todo(s) {
+    let items = s.stateTodo;
+    if (!items) for (const q of [...s.events.keys()].sort((a, b) => b - a)) { const e = s.events.get(q); if (e.type === 'cdash' && e.subtype === 'todo') { items = e.items; break; } }
+    return Array.isArray(items) ? { done: items.filter(i => i.status === 'completed').length, total: items.length, items } : null;
+  }
+
+  const canRewind = (s, row) => row?.kind === 'user' && !!row.uuid && row.src !== 'steer' && !(s.working || s.waiting || s.ended || s.unreadable);
+
   function rows(s) {
-    if (s.memo?.rev !== s.rev) s.memo = { rev: s.rev, rows: build(s) };
+    // An idle session hides stale queued events, so a change of `working` rebuilds when the events hold one.
+    const queued = [...s.events.values()].some(e => e.subtype === 'queued');
+    if (s.memo?.rev !== s.rev || (queued && s.memo.working !== s.working)) s.memo = { rev: s.rev, working: s.working, rows: build(s) };
     return s.memo.rows;
   }
 
@@ -181,7 +227,7 @@
         const text = promptText(e);
         const queued = out.findIndex(r => r.kind === 'user' && r.status === 'queued' && r.text === text);
         if (queued >= 0) out.splice(queued, 1);
-        const row = { kind: 'user', key: 'e' + q, text, status: 'sent' };
+        const row = { kind: 'user', key: 'e' + q, text, status: 'sent', uuid: e.uuid, src: e.src, ts: e.ts };
         const files = keepFiles(e.files);
         if (files.length) row.files = files;
         out.push(row);
@@ -189,15 +235,17 @@
         for (const b of e.message.content) {
           const c = calls.get(b?.tool_use_id);
           if (c) Object.assign(c, { result: flatten(b.content), error: !!b.is_error, done: true });
+          if (c && b.diff) c.diff = b.diff;
         }
       } else if (e.type === 'assistant') {
         for (const b of e.message?.content || []) {
-          if (b.type === 'text') out.push({ kind: 'text', key: 'e' + q, text: b.text, streaming: false });
+          if (b.type === 'thinking') out.push({ kind: 'thinking', key: 'e' + q + 'k', text: b.thinking ?? '', ts: e.ts });
+          if (b.type === 'text') out.push({ kind: 'text', key: 'e' + q, text: b.text, streaming: false, ts: e.ts });
           if (b.type === 'tool_use') {
             const c = { id: b.id, name: b.name, input: b.input, result: null, error: false, done: false, at: q };
             calls.set(b.id, c);
             if (last?.kind === 'tools' && last.name === b.name) last.calls.push(c);
-            else out.push({ kind: 'tools', key: 'e' + q, name: b.name, calls: [c] });
+            else out.push({ kind: 'tools', key: 'e' + q, name: b.name, calls: [c], ts: e.ts });
           }
         }
       } else if (e.type === 'result') {
@@ -209,6 +257,8 @@
       } else if (e.type === 'cdash' && e.subtype === 'shell_output') {
         const sh = [...out].reverse().find(r => r.kind === 'shell');
         if (sh) Object.assign(sh, { stdout: e.stdout ?? '', stderr: e.stderr ?? '' });
+      } else if (e.type === 'cdash' && e.subtype === 'staged') {
+        out.push({ kind: 'staged', key: 'e' + q, count: e.messages });
       } else if (e.type === 'cdash' && e.subtype === 'queued') {
         out.push({ kind: 'user', key: 'e' + q, text: e.text, status: 'queued' });
       }
@@ -217,7 +267,11 @@
       if (r.kind !== 'tools') continue;
       r.running = r.calls.some(c => !c.done && c.at > lastResult);
       r.label = groupLabel(r.name, r.calls, !r.running);
+      const d = r.calls.length === 1 && editDiff(r.calls[0]);
+      if (d) r.label += ' +' + d.add + ' \u2212' + d.del;
     }
+    // A queued row nobody took (a rewind dropped it) is stale once the session is idle.
+    if (!s.working) for (let i = out.length; i--;) if (out[i].kind === 'user' && out[i].status === 'queued') out.splice(i, 1);
     for (const [id, text] of s.streams) out.push({ kind: 'text', key: 's' + id, text, streaming: true });
     for (const m of s.mine) {
       if (m.seq != null) continue;
@@ -228,8 +282,20 @@
     }
     // What build() shows, as a short string; the view compares it instead of serializing the row.
     // A row's text only grows under its key, so lengths stand in for the text.
+    // A day row goes before the first row of each later local day.
+    let day = null;
+    for (let i = 0; i < out.length; i++) {
+      const ts = out[i].ts;
+      if (!ts) continue;
+      const d = new Date(ts).toDateString();
+      if (day && d !== day) { out.splice(i, 0, { kind: 'day', key: 'd' + out[i].key, ts }); i++; }
+      day = d;
+    }
     for (const r of out) {
-      r.sig = r.kind === 'user' ? [r.status, r.error, r.text.length, r.files?.length].join('|')
+      r.sig = r.kind === 'user' ? [r.status, r.error, r.text.length, r.files?.length, r.uuid, r.src].join('|')
+        : r.kind === 'thinking' ? r.text.length
+        : r.kind === 'day' ? new Date(r.ts).toDateString()
+        : r.kind === 'staged' ? r.count
         : r.kind === 'text' ? r.text.length + '|' + r.streaming
         : r.kind === 'tools' ? [r.label, r.running, r.calls.map(c => c.error ? 'e' : c.done ? 'd' : 'r').join('')].join('|')
         : r.kind === 'shell' ? [r.command, r.stdout.length, r.stderr.length].join('|')
@@ -238,5 +304,5 @@
     return out;
   }
 
-  g.cdashChatStore = { initial, apply, rows, addMine, dropMine, toolLabel, needsTerminal, chipText };
+  g.cdashChatStore = { initial, apply, rows, addMine, dropMine, toolLabel, needsTerminal, chipText, todo, lineDiff, editDiff, canRewind };
 })(typeof globalThis === 'undefined' ? this : globalThis);
