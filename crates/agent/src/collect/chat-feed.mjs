@@ -106,6 +106,8 @@ export class ChatFeed {
   }
 
   setTasks(tasks) {
+    // A title is a shell command, maybe a whole heredoc: clip as the Claude tap does.
+    tasks = tasks.map(t => (typeof t.title === 'string' && t.title.length > 80 ? { ...t, title: [...t.title].slice(0, 80).join('') } : t));
     this.#tasks = tasks;
     this.#broadcast({ t: 'tasks', tasks });
   }

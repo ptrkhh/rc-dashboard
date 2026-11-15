@@ -148,6 +148,9 @@ pub struct Live {
     pub effort: Option<String>,
     /// The prompts Claude's rewind selector lists, oldest first.
     pub branch: Vec<Listed>,
+    /// A chat rewind cut `branch` and Claude has written no prompt since: the
+    /// transcript's last leaf is still the abandoned branch.
+    pub rewound: bool,
     /// The session file's `sessionId` and `cwd`, as last read.
     pub sid: Option<String>,
     pub cwd: Option<String>,
@@ -285,7 +288,11 @@ impl Engine for ClaudeEngine {
         let tui = TmuxTui { ctx: &self.ctx, name: &self.name, pid: self.pid, leftover };
         rewind::drive(&tui, &branch, target, files).await?;
         // Claude writes nothing until the next prompt; until then the selector lists only the prompts before the target.
-        lock(&self.live).branch.truncate(target);
+        {
+            let mut l = lock(&self.live);
+            l.branch.truncate(target);
+            l.rewound = true;
+        }
         Ok(branch[target].text.clone())
     }
 
@@ -356,6 +363,10 @@ impl Engine for ClaudeEngine {
     async fn aside(&self, _id: &str, text: &str) -> Result<mpsc::Receiver<AsideChunk>, String> {
         let (sid, cwd, model) = {
             let l = lock(&self.live);
+            if l.rewound {
+                // `--resume` would fork the abandoned branch and answer from it.
+                return Err("after a rewind, side questions work again once you send a message".into());
+            }
             (l.sid.clone(), l.cwd.clone(), l.model.clone())
         };
         let (Some(sid), Some(cwd)) = (sid, cwd) else { return Err("no session yet".into()) };
@@ -573,7 +584,11 @@ async fn run(
                 }
                 (last_usage, last_tasks) = (None, None);
                 last_branch.clear();
-                lock(live).branch.clear();
+                {
+                    let mut l = lock(live);
+                    l.branch.clear();
+                    l.rewound = false;
+                }
                 let path = ctx.claude_dir.join("projects").join(project_dir_name(&cwd)).join(format!("{sid}.jsonl"));
                 *transcript.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
                 conv = Some(Conv { sid, tail: Tail::new(path), tap: Tap::default(), ready: false });
@@ -625,7 +640,10 @@ async fn run(
             if !idle_read {
                 let branch = c.tap.listed();
                 if branch != last_branch {
-                    lock(live).branch.clone_from(&branch);
+                    let mut l = lock(live);
+                    l.branch.clone_from(&branch);
+                    l.rewound = false;
+                    drop(l);
                     last_branch = branch;
                 }
             }
@@ -1348,6 +1366,12 @@ pub(crate) mod aside_tests {
         assert_eq!((end.done, end.error.as_deref()), (true, Some("no answer (claude exited 3)")));
         lock(&engine.live).sid = None;
         assert_eq!(engine.aside("q2", "why?").await.err().as_deref(), Some("no session yet"));
+        {
+            let mut l = lock(&engine.live);
+            l.sid = Some("sid-1".into());
+            l.rewound = true;
+        }
+        assert!(engine.aside("q3", "why?").await.err().is_some_and(|e| e.starts_with("after a rewind")), "the fork would see the abandoned branch");
     }
     #[tokio::test]
     async fn a_side_question_that_outlives_its_limit_is_killed_and_says_so() {

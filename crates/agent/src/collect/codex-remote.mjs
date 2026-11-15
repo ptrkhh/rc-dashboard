@@ -545,6 +545,7 @@ async function nativeLauncher(statePath, state, script) {
   const asks = new Map(); // ask id -> { rpcId, questions } for a question, { implement: true } for the plan card
   let lastPlan = null, plan = null, models = null;
   let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
+  const openRequests = new Set(); // ids of server requests not yet resolved
   const running = new Map(), children = new Map(); // id -> task; thread id -> { agent, title }
   // A side question: { id, child, turnId, item, cancelled, closed }. `asking` holds it by question id from the
   // moment it is asked; `sides` by its thread, kept once closed so the thread's late notifications are still dropped.
@@ -786,9 +787,10 @@ async function nativeLauncher(statePath, state, script) {
       }
       return;
     }
-    if (m.id != null && m.method) feed.setState({ waiting: true }); // a server request: an approval or a question
+    if (m.id != null && m.method) { openRequests.add(String(m.id)); feed.setState({ waiting: true }); } // a server request: an approval or a question
     if (m.method === 'serverRequest/resolved') {
-      feed.setState({ waiting: false });
+      openRequests.delete(String(p.requestId));
+      feed.setState({ waiting: openRequests.size > 0 }); // another subagent's question may still be open
       asks.delete(String(p.requestId));
       feed.dropAsk(String(p.requestId));
     }
@@ -833,6 +835,7 @@ async function nativeLauncher(statePath, state, script) {
     }
     if (m.method === 'item/completed' && p.item.type === 'plan') lastPlan = { turnId: p.turnId, text: p.item.text };
     if (m.method === 'turn/completed') {
+      openRequests.clear();
       feed.setState({ working: false, waiting: false });
       if (p.turn.status === 'completed' && lastPlan?.turnId === p.turn.id) {
         const id = `implement:${p.turn.id}`;
@@ -898,6 +901,8 @@ async function nativeLauncher(statePath, state, script) {
   };
   // A revert changed the conversation: start chat over from the thread's turns.
   const reread = () => {
+    for (const id of asks.keys()) if (id.startsWith('implement:')) { asks.delete(id); feed.dropAsk(id); } // the plan may be gone
+    lastPlan = null;
     feed.reset();
     firstOf.clear(); prompts.clear();
     for (const [id, t] of running) if (t.kind === 'shell') running.delete(id); // a revert kills background terminals

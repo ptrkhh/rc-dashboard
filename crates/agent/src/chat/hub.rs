@@ -706,7 +706,11 @@ impl<E: Engine> Actor<E> {
                 Some(frame(v))
             }
             ClientFrame::Set { what, value } => {
-                let r = self.engine.set(&what, &value).await;
+                // Claude's picker types `/model x` into the box: same rule as a send.
+                let r = match self.rewind_refusal() {
+                    Some(e) => Err(e.to_string()),
+                    None => self.engine.set(&what, &value).await,
+                };
                 self.log.push(format!("chat set {} {what:?}", self.name));
                 let mut v = json!({"t":"set","ok":r.is_ok()});
                 if let Err(e) = r {
@@ -970,6 +974,7 @@ impl<E: Engine> Actor<E> {
         }
         self.ended = true;
         self.asks.clear();
+        self.tasks.clear();
         let held: Vec<String> = self.queue.clear().into_iter().map(|h| h.cid).collect();
         let pending: Vec<String> = self.pending.drain(..).map(|p| p.cid).collect();
         for cid in held.iter().chain(&pending) {
@@ -1700,6 +1705,10 @@ mod tests {
         settle(&hub, &tx).await;
         let st = last_state(&hub.subscribe(None, None).await.unwrap());
         assert_eq!((st["usage"].clone(), st["tasks"].clone(), hub.folder().await), (Value::Null, json!([]), None));
+        tx.send(EngineMsg::Tasks(vec![json!({"id":"b2","kind":"shell","title":"sleep 60","started":"2026-11-13T10:00:00Z"})])).await.unwrap();
+        tx.send(EngineMsg::Ended).await.unwrap();
+        settle(&hub, &tx).await;
+        assert_eq!(last_state(&hub.subscribe(None, None).await.unwrap())["tasks"], json!([]), "an ended session runs nothing");
     }
     #[tokio::test]
     async fn a_root_cut_cuts_everything_in_memory_and_nothing_once_events_left_it() {
@@ -1918,6 +1927,18 @@ mod tests {
         assert_eq!(reply(hub.command(ClientFrame::Set { what: "nope".into(), value: json!(1) }).await), json!({"t":"set","ok":false,"error":"not here"}));
         assert_eq!(reply(hub.command(ClientFrame::Menu).await), json!({"t":"menu","commands":[{"name":"compact"}],"models":[],"efforts":[],"agents":[]}));
         assert_eq!(*calls.lock().unwrap(), ["set:plan:true", "set:nope:1"]);
+    }
+    #[tokio::test]
+    async fn a_setting_is_refused_while_a_send_could_be_refused() {
+        let (hub, tx, calls) = rig();
+        tx.send(EngineMsg::Status { working: false, waiting: true, waiting_for: Some("permission prompt".into()) }).await.unwrap();
+        settle(&hub, &tx).await;
+        assert_eq!(reply(hub.command(ClientFrame::Set { what: "model".into(), value: json!("opus") }).await), json!({"t":"set","ok":false,"error":"answer in Terminal first"}));
+        tx.send(EngineMsg::Status { working: false, waiting: false, waiting_for: None }).await.unwrap();
+        settle(&hub, &tx).await;
+        hub.command(send("c1", "hello")).await; // pending: Claude may not show it as working yet
+        assert_eq!(reply(hub.command(ClientFrame::Set { what: "model".into(), value: json!("opus") }).await)["ok"], false, "/model would join the prompt");
+        assert!(!calls.lock().unwrap().iter().any(|c| c.starts_with("set:")), "{:?}", calls.lock().unwrap());
     }
     #[tokio::test]
     async fn a_command_the_engine_ran_itself_is_done_and_leaves_nothing_pending() {

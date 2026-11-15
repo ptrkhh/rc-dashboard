@@ -581,6 +581,31 @@ test('a reread drops shell tasks and keeps agent tasks', { timeout: 20000 }, asy
   assert.deepEqual(c.lines.findLast(l => l.t === 'tasks').tasks.map(x => [x.id, x.kind]), [['child-1', 'agent']]);
 });
 
+test('a revert drops the plan card, a long task title is clipped, and one answered question of two keeps waiting', { timeout: 20000 }, async t => {
+  const sid = '01234567-1234-1234-1234-0123456789ab';
+  const f = await fixture(t, '', process.platform, true, { history: steered });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  await f.inject({ method: 'turn/started', params: { threadId: sid, turn: { id: 't5' } } });
+  await f.inject({ method: 'item/completed', params: { threadId: sid, turnId: 't5', item: { id: 'p1', type: 'plan', text: '# Plan' } } });
+  await f.inject({ method: 'turn/completed', params: { threadId: sid, turn: { id: 't5', status: 'completed' } } });
+  await until(() => asksNow(c).length === 1);
+  await f.inject({ method: 'thread/reverted', params: { threadId: sid } });
+  await until(() => asksNow(c).length === 0);
+  await f.inject({ method: 'item/started', params: { threadId: sid, turnId: 't6', item: { id: 'x1', type: 'commandExecution', source: 'unifiedExecStartup', command: 'cat <<EOF\n' + 'y'.repeat(500), status: 'inProgress' } } });
+  await until(() => c.lines.findLast(l => l.t === 'tasks')?.tasks.length === 1);
+  assert.equal(c.lines.findLast(l => l.t === 'tasks').tasks[0].title.length, 80);
+  await f.inject({ id: 81, method: 'item/tool/requestUserInput', params: { threadId: sid, turnId: 't6', itemId: 'q1', questions: [] } });
+  await f.inject({ id: 82, method: 'item/tool/requestUserInput', params: { threadId: sid, turnId: 't6', itemId: 'q2', questions: [] } });
+  await until(() => c.lines.some(l => l.t === 'state' && l.waiting === true));
+  await f.inject({ method: 'serverRequest/resolved', params: { threadId: sid, requestId: 81 } });
+  await until(() => asksNow(c).length === 1);
+  assert.equal(c.lines.findLast(l => l.t === 'state').waiting, true, 'the other question is still open');
+  await f.inject({ method: 'serverRequest/resolved', params: { threadId: sid, requestId: 82 } });
+  await until(() => c.lines.findLast(l => l.t === 'state').waiting === false);
+});
+
 test('a Codex side question forks read-only, streams the answer aside, and cleans up', { timeout: 20000 }, async t => {
   const f = await fixture(t);
   await f.wait(() => f.native()?.chat_sock);
