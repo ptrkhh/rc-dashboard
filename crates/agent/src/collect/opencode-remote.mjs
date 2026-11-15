@@ -611,7 +611,7 @@ async function supervise(statePath, name) {
         .then(() => first && stagedAt ? rebuild() : feed.ready(), error => restart(error)).finally(() => { first = false; });
     };
     let first = true;
-    stagedAt = (await client.request(sessionPath)).data?.revert?.messageID ?? null; // a revert staged before this start
+    stagedAt = (await client.request(sessionPath).catch(() => ({}))).data?.revert?.messageID ?? null; // a revert staged before this start; a failed read only loses the hiding
     startChat();
     let updates = Promise.resolve();
     const enqueue = operation => { updates = updates.then(operation).catch(() => {}); };
