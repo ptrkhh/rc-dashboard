@@ -410,6 +410,26 @@ pub async fn get_chat(
     Ok(ws.max_message_size(2 << 20).on_upgrade(move |socket| crate::chat::ws::serve(ctx, hub, name, after, epoch, socket)))
 }
 
+/// The session folder's changes against HEAD. Only the session name comes from
+/// the client; the folder is the transcript's own `cwd`.
+pub async fn get_chat_diff(
+    State(ctx): State<Arc<Ctx>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let name = q.get("session").cloned().unwrap_or_default();
+    assert_kill_name(&name)?;
+    let conflict = |message: String| ApiError { status: StatusCode::CONFLICT, message };
+    let hub = match crate::chat::hub_for(&ctx, &name).await {
+        Ok(hub) => hub,
+        Err(Refused::BadRequest(m) | Refused::Failed(m)) => return Err(conflict(m)),
+    };
+    let Some(folder) = hub.folder().await else {
+        return Err(conflict("this session's folder is not known yet".into()));
+    };
+    ctx.host.log.push(format!("chat diff {name}"));
+    Ok(Json(crate::chat::diff::diff(&ctx.runner, &folder).await).into_response())
+}
+
 pub async fn post_purge(
     State(ctx): State<Arc<Ctx>>,
     Json(body): Json<SidBody>,
@@ -489,6 +509,13 @@ mod tests {
         let mut out = String::new();
         s.read_to_string(&mut out).await.unwrap();
         out.split(' ').nth(1).unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_diff_refuses_bad_names_and_sessions_without_chat() {
+        let b = serve(cfg_for(tempdir("chat-diff"))).await.unwrap();
+        assert_eq!(http_get(&format!("http://{}/api/chat/diff?session=other", b.addr)).await.0, 400);
+        assert_eq!(http_get(&format!("http://{}/api/chat/diff?session=cdash-gone", b.addr)).await.0, 409);
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 
 pub mod asks;
 pub mod claude;
+pub mod diff;
 pub mod ece;
 pub mod hook;
 pub mod hub;
