@@ -88,6 +88,7 @@ impl Runner {
 
     /// One-shot with a byte cap: reads at most `cap` bytes of stdout, kills
     /// the child when more arrive, and errs only on spawn failure or timeout.
+    /// The cap counts raw bytes, before lossy UTF-8 decoding.
     /// `code` is `None` when the child was killed for the cap.
     pub async fn run_capped(
         &self,
