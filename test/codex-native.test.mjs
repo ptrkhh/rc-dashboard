@@ -88,7 +88,8 @@ setInterval(()=>{const marker=process.env.CDASH_CHECK_ROOT+'/stop-remote';if(fs.
   const messages = async () => (await readFile(wire,'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
   const alive = pid => { try { process.kill(pid,0); return true; } catch { return false; } };
   t.after(async () => {
-    child.kill(); child.stdin.end();
+    // The supervisor writes into `dir` while it shuts down: rm only once it has exited.
+    if (child.exitCode === null && child.signalCode === null) { const exit = new Promise(r => child.once('exit', r)); child.kill(); child.stdin.end(); await exit; }
     for (const m of await messages()) if (m.pid && alive(m.pid)) process.kill(m.pid,'SIGKILL');
     await rm(dir,{recursive:true,force:true});
   });
@@ -587,6 +588,8 @@ test('a Codex side question forks read-only, streams the answer aside, and clean
   await until(() => c.lines.some(l => l.t === 'ready'));
   c.write({ t: 'req', rid: 1, op: 'aside', id: 'q1', text: 'what did I ask?' });
   assert.equal((await res(c, 1)).ok, true);
+  // The answer can come before the side turn is started; the fake logs requests in order.
+  await until(() => f.rpc('turn/start'));
   const fork = f.rpc('thread/fork').params;
   assert.deepEqual([fork.threadId, fork.ephemeral, fork.excludeTurns, fork.sandbox, fork.approvalPolicy, fork.model, fork.config], [SID, true, true, 'read-only', 'never', 'gpt-check', { model_reasoning_effort: 'low' }]);
   const inject = f.rpc('thread/inject_items').params;
