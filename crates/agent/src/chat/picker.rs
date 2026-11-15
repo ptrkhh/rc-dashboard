@@ -187,15 +187,19 @@ pub fn confirm_ready(screen: &str, title: &str) -> bool {
 }
 
 const WAITING: &str = "Answer the open question first";
+pub(crate) const BUSY: &str = "Stop the turn or wait for it to finish";
 
-/// Refuses unless the session is idle (a background shell counts).
-async fn idle(ctx: &Ctx, pid: i32) -> Result<(), String> {
-    let file = session_file_for(&ctx.claude_dir, pid).await;
-    match file.and_then(|f| f.status).as_deref() {
+/// Refuses unless the status file's `status` is idle (a background shell counts).
+pub(crate) fn idle_gate(status: Option<&str>) -> Result<(), String> {
+    match status {
         Some("idle" | "shell") => Ok(()),
         Some("waiting") => Err(WAITING.into()),
-        _ => Err("Stop the turn or wait for it to finish".into()),
+        _ => Err(BUSY.into()),
     }
+}
+
+async fn idle(ctx: &Ctx, pid: i32) -> Result<(), String> {
+    idle_gate(session_file_for(&ctx.claude_dir, pid).await.and_then(|f| f.status).as_deref())
 }
 
 async fn read_footer(ctx: &Ctx, name: &str) -> Option<&'static str> {

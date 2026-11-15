@@ -47,9 +47,22 @@ struct Rec {
 /// A main-chain record: its parent, and the uuid of the last event emitted at
 /// or before it, which is where a branch from it cuts the log back to.
 struct Node {
-    #[allow(dead_code)] // Task 5 walks it for the rewind selector's list.
     parent: Option<String>,
     anchor: Option<String>,
+}
+
+/// A prompt Claude's rewind selector lists (Claude Code 2.1.325): typed and
+/// queued prompts, image prompts, `!` commands and messages absorbed mid-turn,
+/// but not slash commands or task-notification turns.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Listed {
+    pub uuid: String,
+    /// What chat shows; for a `!` command, what the selector shows.
+    pub text: String,
+    /// As recorded, with paste and image tokens.
+    pub raw: String,
+    pub pasted: bool,
+    pub images: bool,
 }
 
 #[derive(Default)]
@@ -63,6 +76,8 @@ pub struct Tap {
     nodes: HashMap<String, Node>,
     last_main: Option<String>,
     anchor: Option<String>,
+    /// The listed prompts by uuid, on any branch.
+    prompts: HashMap<String, Listed>,
     /// Tool calls whose results tell us something: id to (name, input).
     calls: HashMap<String, (String, Value)>,
     todo: Vec<Item>,
@@ -268,6 +283,23 @@ impl Tap {
         }
     }
 
+    /// The current branch's listed prompts, oldest first: the parents from the
+    /// last main-chain record, up to an unknown or `null` parent.
+    pub fn listed(&self) -> Vec<Listed> {
+        let chain = std::iter::successors(self.last_main.as_deref(), |u| self.nodes.get(*u)?.parent.as_deref());
+        // A parent cycle in a damaged transcript ends after one pass.
+        let mut out: Vec<Listed> = chain.take(self.nodes.len()).filter_map(|u| self.prompts.get(u).cloned()).collect();
+        out.reverse();
+        out
+    }
+
+    fn list(&mut self, r: &Rec, text: String, raw: &str, images: bool) {
+        if let Some(uuid) = &r.uuid {
+            let pasted = raw.contains("<pasted_content");
+            self.prompts.insert(uuid.clone(), Listed { uuid: uuid.clone(), text, raw: raw.to_string(), pasted, images });
+        }
+    }
+
     /// True from a prompt until the next `result` event.
     pub fn turn_open(&self) -> bool {
         self.open
@@ -296,7 +328,7 @@ impl Tap {
                 (Some("enqueue"), Some((text, _))) if !injected(&text) => vec![json!({"type":"cdash","subtype":"queued","text":clean(&text).0})],
                 _ => Vec::new(),
             },
-            "attachment" => steer(&r).into_iter().collect(),
+            "attachment" => self.steer(&r).into_iter().collect(),
             "system" if r.subtype.as_deref() == Some("turn_duration") => {
                 let subtype = if std::mem::take(&mut self.api_error) { "error_during_execution" } else { "success" };
                 let mut ev = json!({"type":"result","subtype":subtype});
@@ -357,6 +389,7 @@ impl Tap {
         let text = &strip_image_tokens(raw);
         let t = text.trim_start();
         if let Some(cmd) = between(t, "<bash-input>", "</bash-input>") {
+            self.list(r, format!("! {}", cmd.trim()), raw, false);
             return vec![json!({"type":"cdash","subtype":"shell","uuid":r.uuid,"command":cmd.trim()})];
         }
         if let Some(stdout) = between(t, "<bash-stdout>", "</bash-stdout>") {
@@ -366,7 +399,8 @@ impl Tap {
         if r.source.as_deref() == Some("system") || injected(t) {
             return Vec::new();
         }
-        let prompt = match between(t, "<command-name>", "</command-name>") {
+        let slash = between(t, "<command-name>", "</command-name>");
+        let prompt = match slash {
             Some(name) => {
                 let args = between(t, "<command-args>", "</command-args>").unwrap_or("");
                 format!("{} {}", name.trim(), args.trim()).trim().to_string()
@@ -374,6 +408,7 @@ impl Tap {
             None => unwrap_pastes(text),
         };
         let (prompt, attached) = split_attached(&prompt);
+        let images = !files.is_empty();
         files.extend(attached);
         self.api_error = false;
         let src = if r.source.as_deref() == Some("queued") { "queued" } else { "typed" };
@@ -387,8 +422,28 @@ impl Tap {
         if raw != ev["message"]["content"] {
             ev["raw"] = json!(raw);
         }
+        if slash.is_none() {
+            self.list(r, prompt.trim().to_string(), raw, images);
+        }
         out.push(ev);
         out
+    }
+
+    /// Rule 3: a message Claude absorbed mid-turn has no `user` record, only this.
+    fn steer(&mut self, r: &Rec) -> Option<Value> {
+        let a = r.attachment.as_ref()?;
+        if a["type"] != "queued_command" || a["commandMode"] != "prompt" {
+            return None;
+        }
+        let (raw, mut files) = parts(&a["prompt"])?;
+        let images = !files.is_empty();
+        let (text, attached) = clean(&raw);
+        files.extend(attached);
+        if text.is_empty() && files.is_empty() {
+            return None;
+        }
+        self.list(r, text.clone(), &raw, images);
+        Some(prompt_event(r.uuid.as_deref(), &text, "steer", files))
     }
 }
 
@@ -483,20 +538,6 @@ fn clean(text: &str) -> (String, Vec<Value>) {
     (t.trim().to_string(), files)
 }
 
-/// Rule 3: a message Claude absorbed mid-turn has no `user` record, only this.
-fn steer(r: &Rec) -> Option<Value> {
-    let a = r.attachment.as_ref()?;
-    if a["type"] != "queued_command" || a["commandMode"] != "prompt" {
-        return None;
-    }
-    let (text, mut files) = parts(&a["prompt"])?;
-    let (text, attached) = clean(&text);
-    files.extend(attached);
-    if text.is_empty() && files.is_empty() {
-        return None;
-    }
-    Some(prompt_event(r.uuid.as_deref(), &text, "steer", files))
-}
 
 /// Rule 5: one event per `text`, `tool_use` or readable `thinking` block.
 fn assistant(r: &Rec) -> Vec<Value> {
@@ -737,6 +778,23 @@ mod tests {
         let info = r#"{"type":"system","subtype":"informational","uuid":"i1","parentUuid":"m1"}"#;
         let back = r#"{"type":"user","uuid":"u3","parentUuid":"m1","promptSource":"typed","message":{"role":"user","content":"back"}}"#;
         assert_eq!(cuts(&[end, meta, info, back]), [json!("s1")], "a hidden record is on the chain, so branching from it cuts");
+    }
+
+    #[test]
+    fn the_branch_lists_its_prompts_oldest_first_and_skips_abandoned_ones() {
+        // Claude Code 2.1.325 lists `!` commands (b1) and absorbed messages (q1), not notification turns (n1).
+        let mut tap = Tap::default();
+        for l in include_str!("testdata/claude.jsonl").lines() { tap.feed(l); }
+        let listed = tap.listed();
+        assert_eq!(listed.iter().map(|p| p.uuid.as_str()).collect::<Vec<_>>(), ["u1", "b1", "u2", "u5", "q1", "g1"]);
+        assert_eq!((listed[1].text.as_str(), listed[1].raw.as_str()), ("! echo hi", "<bash-input> echo hi</bash-input>"), "shown as the selector shows it");
+        assert_eq!((listed[5].text.as_str(), listed[5].raw.as_str(), listed[5].images), ("What color is this image?", "[Image #1] What color is this image?", true));
+        let slash = r#"{"type":"user","uuid":"c1","parentUuid":"g2","promptSource":"typed","message":{"role":"user","content":"<command-name>/review</command-name><command-args>x</command-args>"}}"#;
+        let pasted = r#"{"type":"user","uuid":"p1","parentUuid":"c1","promptSource":"typed","message":{"role":"user","content":"<pasted_content id=\"2\">\nlog\n</pasted_content id=\"2\">"}}"#;
+        tap.feed(slash);
+        tap.feed(pasted);
+        let tail: Vec<_> = tap.listed().into_iter().skip(6).map(|p| (p.uuid, p.text, p.pasted)).collect();
+        assert_eq!(tail, [("p1".to_string(), "log".to_string(), true)], "slash commands are not listed");
     }
 
     const FACTS: &str = include_str!("testdata/facts.jsonl");

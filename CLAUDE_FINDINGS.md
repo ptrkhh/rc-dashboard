@@ -137,3 +137,136 @@ Chat reads them in `crates/agent/src/chat/tap.rs` and `claude.rs`.
   `imagePasteIds`, and an `isMeta` record `[Image: source: <path>]` follows.
   Chat pastes each path alone and waits for exactly one new chip in the input
   box (`tmux_io::attach_image`), then pastes a space and the text.
+
+## Dashboard chat rewind (Claude Code 2.1.325)
+
+Observed on Claude Code 2.1.325 on 2026-11-15 (haiku, 160x50 pane on the
+private `tmux -L cdash-test` server, cwd a git repo holding `f.txt`). Chat
+drives this dialog in `crates/agent/src/chat/rewind.rs`; `Tap::listed()` in
+`tap.rs` predicts the list. Prompts sent in order: `Reply with only: one`,
+`!echo two`, `/rename spike-rewind`, `Append the line b to f.txt, then reply
+with only: done` (the model appended with a shell command, so no tracked code
+change), `Run sleep 3 with run_in_background, then reply with only: started`
+(a background-completion turn followed), `Run sleep 8 in the foreground, then
+reply ok` with `Reply with only: queued` sent while it ran, and later `Use the
+Edit tool (not bash) to change the line a to c in f.txt, then reply with only:
+edited`. Twice an Enter sent right after typed text was swallowed and a second
+Enter submitted it.
+
+- **Opening.** Esc, Esc 250 ms later, while idle. The cursor starts on
+  `(current)`. The list scrolls: four rows show (`(current)` included), with
+  `↑ N more` / `↓ N more` markers. On 2.1.323 all rows showed.
+
+  ```
+     Rewind
+
+     Restore the code and/or conversation to the point before…
+
+       ↑ 3 more
+       Run sleep 3 with run_in_background, then reply with only: started
+       No code changes
+
+       Run sleep 8 in the foreground, then reply ok
+       No code changes
+
+       Reply with only: queued
+       ⚠ No code restore
+
+     ❯ (current)
+
+     Enter to continue · Esc to cancel
+  ```
+
+  After eight presses of Up:
+
+  ```
+     Rewind
+     Restore the code and/or conversation to the point before…
+     ❯ Reply with only: one
+       No code changes
+       ! echo two
+       No code changes
+       Append the line b to f.txt, then reply with only: done
+       No code changes
+       Run sleep 3 with run_in_background, then reply with only: started
+       No code changes
+       ↓ 3 more
+     Enter to continue · Esc to cancel
+  ```
+
+  Once the Edit prompt was on the branch, the bottom of the list read:
+
+  ```
+       ↑ 4 more
+       Run sleep 8 in the foreground, then reply ok
+       No code changes
+       Reply with only: queued
+       ⚠ No code restore
+       Use the Edit tool (not bash) to change the line a to c in f.txt, then reply with only: edited
+       f.txt +1 -1
+     ❯ (current)
+     Enter to continue · Esc to cancel
+  ```
+
+- **(a) What the selector lists.** A row is the prompt's first line, then
+  `No code changes`, `⚠ No code restore` or `<file> +N -M`.
+  - Plain prompts: listed, verbatim.
+  - `!echo two`: listed as `! echo two` (a `<bash-input>` record).
+  - `/rename spike-rewind`: not listed. It wrote only `system`
+    `local_command` records and an `isMeta` reminder, no prompt record.
+  - A prompt whose turn edited files: listed. With a shell append the row says
+    `No code changes`; with the Edit tool, `f.txt +1 -1`.
+  - Background-notification turns (`promptSource: "system"`,
+    `<task-notification>`): not listed.
+  - The message sent mid-turn: listed as its own row with `⚠ No code
+    restore`. The transcript holds no `user` record for it, only the
+    `attachment` of type `queued_command` (`commandMode: "prompt"`) that a
+    message absorbed mid-turn writes.
+- **(b) The confirm screen.** Enter on a row without code changes:
+
+  ```
+     Rewind
+     Confirm you want to restore to the point before you sent this message:
+     │ Append the line b to f.txt, then reply with only: done
+     │ (2m ago)
+     The conversation goes back to before this message.
+     The code will be unchanged.
+     ❯ 1. Restore conversation
+       2. Summarize from here
+       3. Summarize up to here
+       4. Never mind
+  ```
+
+  Enter on the Edit-tool row:
+
+  ```
+     Rewind
+     Confirm you want to restore to the point before you sent this message:
+     │ Use the Edit tool (not bash) to change the line a to c in f.txt, then reply with only: edited
+     │ (26s ago)
+     The conversation goes back to before this message.
+     The code will be restored +1 -1 in f.txt.
+     ❯ 1. Restore code and conversation
+       2. Restore conversation
+       3. Restore code
+       4. Summarize from here
+     ↓ 5. Summarize up to here
+     ⚠ Restored files go back whole, losing later changes by anyone. Bash changes to other files are not undone.
+  ```
+
+  The digits shift with code changes (`Restore conversation` is 1 without,
+  2 with), and this list scrolls too (`6. Never mind` is below the fold).
+  Chat therefore picks the option by its label: `Restore code and
+  conversation` when files are wanted and it is offered, else `Restore
+  conversation`. One Escape goes back from the confirm screen to the list; a
+  second closes it.
+- **(c) The digit alone confirms.** `1` with no Enter, on the Edit-tool row
+  (`Restore code and conversation`): 300 ms later the dialog was gone, the
+  Edit turn was removed and `f.txt` was restored. The digit of a plain
+  `Restore conversation` was not pressed; it is the same menu. Chat sends no
+  Enter after the digit.
+- **After the rewind** (300 ms and 2 s later, the same): the conversation ends
+  after the turn before the target, and the input box holds the rewound
+  prompt verbatim, as on 2.1.323
+  (`❯ Use the Edit tool (not bash) to change the line a to c in f.txt, then reply with only: edited`).
+  Chat clears it with `tmux_io::clear_input`.

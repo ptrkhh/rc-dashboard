@@ -15,6 +15,7 @@ pub mod picker;
 mod perf;
 pub mod push;
 pub mod queue;
+pub mod rewind;
 pub mod tap;
 pub mod tmux_io;
 pub mod wire;

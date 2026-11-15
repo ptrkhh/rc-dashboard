@@ -5,7 +5,8 @@ use super::asks::Cards;
 use super::hub::{place_cut, Answer, Attachment, Engine, EngineMsg, Kind, Sent, WINDOW};
 use super::media;
 use super::picker;
-use super::tap::{is_cut, Tap};
+use super::rewind::{self, Tui};
+use super::tap::{is_cut, Listed, Tap};
 use super::tmux_io;
 use crate::collect::ctx::Ctx;
 use crate::collect::lookup::session_file_for;
@@ -106,6 +107,11 @@ pub struct Live {
     pub plan: Option<bool>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The prompts Claude's rewind selector lists, oldest first.
+    pub branch: Vec<Listed>,
+    /// The session file's `sessionId` and `cwd`, as last read.
+    pub sid: Option<String>,
+    pub cwd: Option<String>,
     /// The loop's wake-up, so a card shows without waiting out a parked tick.
     wake: Arc<Notify>,
 }
@@ -228,6 +234,19 @@ impl Engine for ClaudeEngine {
         tmux_io::escape(&self.ctx.runner, &self.name).await
     }
 
+    async fn rewind(&self, uuid: &str, files: bool) -> Result<String, String> {
+        let branch = lock(&self.live).branch.clone();
+        let target = branch.iter().position(|p| p.uuid == uuid).ok_or("this prompt cannot be rewound from chat; use Terminal")?;
+        let leftover = &self.shared.leftover;
+        // Text left in the box would make Esc Esc clear it instead of opening the dialog.
+        picker::clear_leftover(&self.ctx, &self.name, self.pid, leftover).await;
+        let tui = TmuxTui { ctx: &self.ctx, name: &self.name, pid: self.pid, leftover };
+        rewind::drive(&tui, &branch, target, files).await?;
+        // Claude writes nothing until the next prompt; until then the selector lists only the prompts before the target.
+        lock(&self.live).branch.truncate(target);
+        Ok(branch[target].text.clone())
+    }
+
     async fn clear_input(&self, text: &str) {
         if let Err(e) = tmux_io::clear_input(&self.ctx.runner, &self.name, text).await {
             self.ctx.host.log.push(format!("chat clear failed {}: {e}", self.name));
@@ -314,6 +333,31 @@ impl ClaudeEngine {
     }
 }
 
+/// The pane, for driving the rewind dialog.
+struct TmuxTui<'a> {
+    ctx: &'a Ctx,
+    name: &'a str,
+    pid: i32,
+    leftover: &'a picker::Leftover,
+}
+
+impl Tui for TmuxTui<'_> {
+    async fn screen(&self) -> String {
+        tmux_io::capture(&self.ctx.runner, self.name).await.unwrap_or_default()
+    }
+    async fn press(&self, key: &str) -> Result<(), String> {
+        tmux_io::key(&self.ctx.runner, self.name, key).await
+    }
+    /// Cleared now when the box takes keys, else before the next send.
+    async fn clear(&self, text: &str) {
+        *self.leftover.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
+        picker::clear_leftover(self.ctx, self.name, self.pid, self.leftover).await;
+    }
+    async fn status(&self) -> (Option<String>, Option<String>) {
+        session_file_for(&self.ctx.claude_dir, self.pid).await.map_or((None, None), |f| (f.status, f.waiting_for))
+    }
+}
+
 pub fn start(ctx: Arc<Ctx>, name: String, pid: i32) -> (ClaudeEngine, mpsc::Receiver<EngineMsg>) {
     let (tx, rx) = mpsc::channel(256);
     let transcript = Arc::new(Mutex::new(None));
@@ -381,6 +425,8 @@ async fn run(
     let mut last: Option<(bool, bool, Option<String>)> = None;
     let (mut last_asks, mut last_settings) = (None, None);
     let (mut last_usage, mut last_tasks): (Option<Value>, Option<Vec<Value>>) = (None, None);
+    // Set only when it changes, so a rewind's shortened branch outlives lines that are no prompt.
+    let mut last_branch: Vec<Listed> = Vec::new();
     let mut blind_sent = false;
     let mut warmed = false;
     let mut slow = false;
@@ -397,6 +443,10 @@ async fn run(
         } else if idle_since.is_none() {
             idle_since = Some(Instant::now());
         }
+        if let Some(f) = &file {
+            let mut l = lock(live);
+            (l.sid, l.cwd) = (f.session_id.clone(), f.cwd.clone());
+        }
         if let Some((sid, cwd)) = file.as_ref().and_then(|f| Some((f.session_id.clone()?, f.cwd.clone()?))) {
             if !warmed {
                 // The first menu should find the command list cached, not wait for `claude -p`.
@@ -412,6 +462,8 @@ async fn run(
                     return;
                 }
                 (last_usage, last_tasks) = (None, None);
+                last_branch.clear();
+                lock(live).branch.clear();
                 let path = ctx.claude_dir.join("projects").join(project_dir_name(&cwd)).join(format!("{sid}.jsonl"));
                 *transcript.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
                 conv = Some(Conv { sid, tail: Tail::new(path), tap: Tap::default(), ready: false });
@@ -456,6 +508,13 @@ async fn run(
                     if tx.send(EngineMsg::Ev(stash_images(ev, &name, &ctx.host.log))).await.is_err() {
                         return;
                     }
+                }
+            }
+            if !idle_read {
+                let branch = c.tap.listed();
+                if branch != last_branch {
+                    lock(live).branch.clone_from(&branch);
+                    last_branch = branch;
                 }
             }
             if idle_read && c.tail.at_end() && !c.ready {
@@ -1037,6 +1096,22 @@ pub(crate) mod tests {
         }
     }
     /// The fixture's first record, which shows no event.
+    #[tokio::test]
+    async fn rewind_targets_a_listed_prompt_and_keys_go_only_to_an_idle_session() {
+        let (ctx, dir) = fixture_ctx("rewind");
+        write_transcript(&dir, "sid-1", &fixture_lines(1..37));
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        {
+            let l = engine.live.lock().unwrap();
+            assert_eq!(l.branch.iter().map(|p| p.uuid.as_str()).collect::<Vec<_>>(), ["u1", "b1", "u2", "u5", "q1", "g1"]);
+            assert_eq!((l.sid.as_deref(), l.cwd.as_deref()), (Some("sid-1"), Some("/proj")));
+        }
+        assert_eq!(engine.rewind("u4", false).await, Err("this prompt cannot be rewound from chat; use Terminal".into()), "handed back, off the branch");
+        assert_eq!(engine.rewind("u2", false).await, Err("Stop the turn or wait for it to finish".into()));
+        assert!(!std::fs::read_to_string(dir.join("tmux-args")).unwrap_or_default().contains("send-keys"));
+    }
+
     const ROOT: &str = "b2d9530c-cfa3-452a-8335-e1f1ef9c5d5a";
     #[tokio::test]
     async fn the_engine_reports_usage_once_ready_with_the_session_folder_as_fallback() {

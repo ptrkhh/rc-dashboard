@@ -721,7 +721,7 @@ impl<E: Engine> Actor<E> {
     /// waits for nothing is, so no key lands in a turn or a dialog. A prompt
     /// just typed counts as a turn: the engine's `working` lags it.
     fn rewind_refusal(&self) -> Option<&'static str> {
-        const BUSY: &str = "Stop the turn or wait for it to finish";
+        use super::picker::BUSY;
         if self.working {
             Some(BUSY)
         } else if let Some(e) = self.refusal() {
