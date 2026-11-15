@@ -686,6 +686,10 @@ button, input, select { font: inherit; }
   background: var(--surface-2); border: 1px solid var(--border);
 }
 .chat-text pre code { font-size: inherit; padding: 0; background: none; border: 0; }
+.hl-c { color: var(--text-muted); font-style: italic; }
+.hl-s { color: var(--ok); }
+.hl-n { color: var(--warn); }
+.hl-k { color: var(--accent); }
 .chat-text table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 14px; }
 .chat-text :is(th, td) { padding: 6px 10px; text-align: left; vertical-align: top; border: 1px solid var(--border); }
 .chat-text th { background: var(--surface-2); font-weight: 600; }
