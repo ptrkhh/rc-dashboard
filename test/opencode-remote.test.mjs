@@ -491,7 +491,8 @@ test('historyMessages without chat is unchanged; with chat it adds thinking, ts 
   assert.deepEqual(chat.map(m => m.message.content[0].type), ['thinking', 'text', 'tool_use', 'tool_result']);
   assert.deepEqual([chat[0].message.id, chat[0].message.content[0].thinking], ['msg_a-reasoning-0', 'pondering']);
   assert.ok(chat.every(m => m.ts === new Date(1789000000000).toISOString()));
-  const diff = chat[3].diff;
+  const diff = chat[3].message.content[0].diff;
+  assert.ok(!('diff' in chat[3]), 'the diff sits in the tool_result block');
   assert.deepEqual(diff[0], files[0]);
   assert.deepEqual([diff[1].file, diff[1].additions, diff[1].deletions, 'patch' in diff[1]], ['big.ts', 9, 0, false], 'a patch past the 16 KiB budget keeps counts only');
   assert.ok(chat.slice(1).every((m, i) => m.uuid === plain[i].uuid), 'uuids of existing messages are unchanged');
@@ -503,7 +504,7 @@ test('historyMessages hardening: odd times and file entries, byte-counted patch 
     metadata: { files: [{ relativePath: 7, additions: '2', deletions: 'x', diff: 'é'.repeat(9000) }, { file: 'b', patch: 'ok' }] } } }] });
   const out = historyMessages(row('soon'), 's', 'r', new Set(), { chat: true });
   assert.ok(out.every(m => !('ts' in m)));
-  const [a, b] = out.at(-1).diff;
+  const [a, b] = out.at(-1).message.content[0].diff;
   assert.deepEqual([a.file, a.additions, a.deletions, 'patch' in a, b.patch], ['7', 2, 0, false, 'ok'], '18000 bytes (9000 chars) pass a character count but not the byte cap');
   assert.equal(typeof historyMessages(row(1789000000000), 's', 'r', new Set(), { chat: true })[0].ts, 'string');
 });

@@ -181,18 +181,32 @@
     return out;
   }
   // A unified patch's body: no headers, so counts skip +++ and ---.
-  const patchLines = p => lines(p).filter(l => !/^(@@|\+\+\+|---)/.test(l)).map(l => ({ t: l[0] === '+' || l[0] === '-' ? l[0] : ' ', s: l.slice(1) }));
+  const patchLines = p => {
+    let hunk = false;  // ---/+++ are headers only before the first @@
+    const out = [];
+    for (const l of lines(p)) {
+      if (l.startsWith('@@')) hunk = true;
+      else if (hunk || !/^(\+\+\+|---)/.test(l)) out.push({ t: l[0] === '+' || l[0] === '-' ? l[0] : ' ', s: l.slice(1) });
+    }
+    return out;
+  };
+  const diffs = new WeakMap();  // tool input (or OpenCode diff array) -> its editDiff; rows rebuild on every delta
   function editDiff(call) {
+    const key = Array.isArray(call?.diff) ? call.diff : call?.input;
+    if (key && typeof key === 'object' && !diffs.has(key)) diffs.set(key, diffOf(call));
+    return key && typeof key === 'object' ? diffs.get(key) : diffOf(call);
+  }
+  function diffOf(call) {
     const i = call?.input || {};
     let files;
-    if (Array.isArray(call?.diff)) files = call.diff.filter(d => typeof d?.patch === 'string').map(d => ({ path: d.file, lines: patchLines(d.patch) }));
+    if (Array.isArray(call?.diff)) files = call.diff.filter(d => d && d.file != null).map(d => typeof d.patch === 'string' ? { path: d.file, lines: patchLines(d.patch) } : { path: d.file, lines: [], add: +d.additions || 0, del: +d.deletions || 0 });
     else if (Array.isArray(i.changes)) {
       files = i.changes.map(c => ({ path: c.path, lines: c.kind?.type === 'update' ? patchLines(c.diff ?? '') : mark(c.kind?.type === 'delete' ? '-' : '+', lines(c.diff ?? '')) }));
     } else if (call?.name === 'Edit' && typeof i.old_string === 'string' && typeof i.new_string === 'string') files = [{ path: i.file_path, lines: lineDiff(i.old_string, i.new_string) }];
     else if (call?.name === 'MultiEdit' && Array.isArray(i.edits)) files = [{ path: i.file_path, lines: i.edits.flatMap(e => lineDiff(e.old_string ?? '', e.new_string ?? '')) }];
     else if (call?.name === 'Write' && typeof i.content === 'string') files = [{ path: i.file_path, lines: mark('+', lines(i.content)) }];
     if (!files?.length) return null;
-    const count = t => files.reduce((n, f) => n + f.lines.filter(l => l.t === t).length, 0);
+    const count = t => files.reduce((n, f) => n + (f.lines.length ? f.lines.filter(l => l.t === t).length : f[t === '+' ? 'add' : 'del'] ?? 0), 0);
     return { files, add: count('+'), del: count('-') };
   }
 
@@ -203,12 +217,12 @@
     return Array.isArray(items) ? { done: items.filter(i => i.status === 'completed').length, total: items.length, items } : null;
   }
 
-  const canRewind = (s, row) => row?.kind === 'user' && !!row.uuid && row.src !== 'steer' && !(s.working || s.waiting || s.ended || s.unreadable);
+  const canRewind = (s, row) => row?.kind === 'user' && !!row.uuid && row.src !== 'steer' && !(s.working || s.waiting || s.ended || s.unreadable || s.mine?.some(m => m.status === 'sending'));
 
   function rows(s) {
     // An idle session hides stale queued events, so a change of `working` rebuilds when the events hold one.
     const queued = [...s.events.values()].some(e => e.subtype === 'queued');
-    if (s.memo?.rev !== s.rev || (queued && s.memo.working !== s.working)) s.memo = { rev: s.rev, working: s.working, rows: build(s) };
+    if (s.memo?.rev !== s.rev || (queued && s.memo.idle !== (!s.working && !s.waiting))) s.memo = { rev: s.rev, idle: !s.working && !s.waiting, rows: build(s) };
     return s.memo.rows;
   }
 
@@ -271,7 +285,8 @@
       if (d) r.label += ' +' + d.add + ' \u2212' + d.del;
     }
     // A queued row nobody took (a rewind dropped it) is stale once the session is idle.
-    if (!s.working) for (let i = out.length; i--;) if (out[i].kind === 'user' && out[i].status === 'queued') out.splice(i, 1);
+    // ponytail: a status poll can catch idle just before the dequeued prompt lands, so the row may flash for one tick.
+    if (!s.working && !s.waiting) for (let i = out.length; i--;) if (out[i].kind === 'user' && out[i].status === 'queued') out.splice(i, 1);
     for (const [id, text] of s.streams) out.push({ kind: 'text', key: 's' + id, text, streaming: true });
     for (const m of s.mine) {
       if (m.seq != null) continue;

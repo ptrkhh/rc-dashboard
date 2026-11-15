@@ -73,7 +73,7 @@ export function historyMessages(row, nativeSid, remoteSid, submitted = new Set()
     // shortcut: tool results are capped at 65,536 characters; use Terminal for larger output.
     const output = (tool.content || []).filter(item => item.type === 'text' && typeof item.text === 'string').map(item => item.text).join('\n').slice(0, 65536);
     const files = chat && Array.isArray(tool.metadata?.files) ? editFiles(tool.metadata.files) : null;
-    emit(`tool:${part.id}:result`, { type: 'user', ...(files?.length && { diff: files }), parent_tool_use_id: null, message: { id: `${part.id}-tool-result`, role: 'user', content: [{ type: 'tool_result', tool_use_id: part.id, content: output || (tool.status === 'error' ? 'Tool failed' : ''), is_error: tool.status === 'error' }] } });
+    emit(`tool:${part.id}:result`, { type: 'user', parent_tool_use_id: null, message: { id: `${part.id}-tool-result`, role: 'user', content: [{ type: 'tool_result', tool_use_id: part.id, content: output || (tool.status === 'error' ? 'Tool failed' : ''), is_error: tool.status === 'error', ...(files?.length && { diff: files }) }] } });
   }
   return messages;
 }

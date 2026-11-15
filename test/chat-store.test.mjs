@@ -240,8 +240,8 @@ test('edit diffs and their counts come from each tool\'s own record', () => {
 });
 test('an OpenCode tool result\'s diff lands on its call', () => {
   const diff = [{ file: 'a.ts', additions: 1, deletions: 0, patch: '+z\n' }];
-  const r = { type: 'user', uuid: 'b', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] }, diff };
-  const rows = S.rows(feed([hello(), ev(1, use('a', 't1', 'edit', { path: 'a.ts' })), ev(2, { ...r, message: { ...r.message, content: [{ ...r.message.content[0], diff }] } })]));
+  const r = { type: 'user', uuid: 'b', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok', diff }] } };
+  const rows = S.rows(feed([hello(), ev(1, use('a', 't1', 'edit', { path: 'a.ts' })), ev(2, r)]));
   assert.deepEqual(rows[0].calls[0].diff, diff);
 });
 test('rewind is offered on idle prompts backed by an event that did not steer; state carries usage and tasks', () => {
@@ -252,4 +252,26 @@ test('rewind is offered on idle prompts backed by an event that did not steer; s
     [idle, { kind: 'user', cid: 'c1' }], [idle, { kind: 'text', uuid: 'k1' }]]) assert.equal(S.canRewind(st, row), false);
   const s = feed([hello(), { t: 'state', working: false, waiting: false, ended: false, held: [], usage: { cwd: '/w' }, tasks: [{ id: 'b1' }] }]);
   assert.deepEqual([s.usage, s.tasks], [{ cwd: '/w' }, [{ id: 'b1' }]]);
+});
+test('a turn waiting on a permission keeps its queued row; only an idle session hides it', () => {
+  const st = (working, waiting) => ({ t: 'state', working, waiting, ended: false, held: [] });
+  let s = feed([hello(), st(false, true), ev(1, { type: 'cdash', subtype: 'queued', text: 'later' })]);
+  assert.equal(S.rows(s).length, 1);
+  s = S.apply(s, st(false, false));
+  assert.equal(S.rows(s).length, 0);
+});
+test('editDiff is computed once per input', () => {
+  const input = { file_path: '/p/x.js', old_string: 'a\nb', new_string: 'a\nB' };
+  assert.equal(S.editDiff({ name: 'Edit', input }), S.editDiff({ name: 'Edit', input }));
+  const diff = [{ file: 'a', patch: '@@ -1 +1 @@\n-x\n+y\n' }];
+  assert.equal(S.editDiff({ name: 'edit', input: {}, diff }), S.editDiff({ name: 'edit', input: {}, diff }));
+});
+test('patch headers are skipped only before the first hunk; a cut patch keeps its counts', () => {
+  const d = S.editDiff({ name: 'edit', input: {}, diff: [{ file: 'a', patch: '--- a\n+++ a\n@@ -1,2 +1 @@\n--- comment\n+x\n' }, { file: 'big', additions: 9, deletions: 4 }] });
+  assert.deepEqual([d.add, d.del, d.files.length], [10, 5, 2]);
+});
+test('rewind waits while one of my messages is still sending', () => {
+  const idle = { working: false, waiting: false, ended: false, unreadable: false, mine: [{ status: 'sending' }] };
+  assert.equal(S.canRewind(idle, { kind: 'user', uuid: 'u1' }), false);
+  assert.equal(S.canRewind({ ...idle, mine: [{ status: 'sent' }] }, { kind: 'user', uuid: 'u1' }), true);
 });
