@@ -182,12 +182,12 @@
   }
   // A unified patch's body: no headers, so counts skip +++ and ---.
   const patchLines = p => {
-    let hunk = false;  // ---/+++ are headers only before the first @@
+    // Everything before the first @@ is header (diff --git, Index:, ====, ---/+++); with no @@, only ---/+++ are.
+    const ls = lines(p), first = ls.findIndex(l => l.startsWith('@@'));
     const out = [];
-    for (const l of lines(p)) {
-      if (l.startsWith('@@')) hunk = true;
-      else if (hunk || !/^(\+\+\+|---)/.test(l)) out.push({ t: l[0] === '+' || l[0] === '-' ? l[0] : ' ', s: l.slice(1) });
-    }
+    ls.forEach((l, i) => {
+      if (first >= 0 ? i > first && !l.startsWith('@@') : !/^(\+\+\+|---)/.test(l)) out.push({ t: l[0] === '+' || l[0] === '-' ? l[0] : ' ', s: l.slice(1) });
+    });
     return out;
   };
   const diffs = new WeakMap();  // tool input (or OpenCode diff array) -> its editDiff; rows rebuild on every delta

@@ -272,6 +272,13 @@ test('patch headers are skipped only before the first hunk; a cut patch keeps it
   assert.deepEqual([d.add, d.del, d.files.length], [10, 5, 2]);
   assert.deepEqual(d.files.map(f => [f.add, f.del]), [[1, 1], [9, 4]]);
 });
+test("OpenCode's real patch header (Index:, ====, unprefixed ---/+++) is not shown as lines", () => {
+  const patch = 'Index: a.txt\n===================================================================\n--- a.txt\n+++ a.txt\n@@ -1,1 +1,2 @@\n one\n+two\n';
+  const d = S.editDiff({ name: 'edit', input: {}, diff: [{ file: 'a.txt', patch }] });
+  assert.deepEqual(d.files[0].lines, [{ t: ' ', s: 'one' }, { t: '+', s: 'two' }]);
+  const codex = S.editDiff({ name: 'Edit', input: { changes: [{ path: 'a.txt', kind: { type: 'update' }, diff: '@@ -1 +1,2 @@\n one\n+two\n' }] } });
+  assert.deepEqual(codex.files[0].lines, [{ t: ' ', s: 'one' }, { t: '+', s: 'two' }], "Codex's bare hunk");
+});
 test('rewind waits while one of my messages is still sending', () => {
   const idle = { working: false, waiting: false, ended: false, unreadable: false, mine: [{ status: 'sending' }] };
   assert.equal(S.canRewind(idle, { kind: 'user', uuid: 'u1' }), false);
