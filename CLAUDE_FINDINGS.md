@@ -303,3 +303,85 @@ Enter submitted it.
     selector over a suggestion. After a rewind to a slash command the box
     holds the command and its grey (`38;5;246`, not dim) argument hint:
     `❯ /compact  <optional custom summarization instructions>`.
+
+## Dashboard chat prompts and menus (Claude Code 2.1.325)
+
+Observed 2026-11-16 on a private tmux server with haiku at low effort. None of
+this is a supported contract; each item is what this version did.
+
+- **The `PermissionRequest` matcher filters.** With
+  `"matcher":"AskUserQuestion|ExitPlanMode"`, an AskUserQuestion and an
+  ExitPlanMode each reached the hook listener (`hook … AskUserQuestion: card`,
+  `ExitPlanMode: card`), while a Bash permission dialog in manual mode produced
+  no hook call at all; chat showed the "Answer in Terminal" banner for it.
+- **A held hook and a Terminal answer.** Answering a question in the TUI with
+  Enter cleared the card within a second and the hook settled empty
+  (`AskUserQuestion: empty (settled)`); the held connection on the hook port
+  was still established one second later. Escape in the TUI cleared the card
+  within two seconds and Claude closed the held connection.
+- **ExitPlanMode can carry the previous plan (E1c).** Asked to write a new plan
+  and call ExitPlanMode in the same message, the transcript's ExitPlanMode
+  input held the earlier plan; the plan file held the new one. Chat reads the
+  plan file, so its card showed the new plan.
+- **Plan mode switches the model.** Turning plan mode on from a haiku session
+  ran the plan turns on `claude-sonnet-5-5`, and back on `claude-haiku-5-5`
+  after it was turned off.
+- **`/model` confirms; `/effort` does not.** With a warm cache, `/model sonnet`
+  opened a dialog titled `Switch model?` with `❯ 1. Yes, switch to Sonnet 5.5`
+  and `2. No, go back`; the session file read `"status":"waiting"`,
+  `"waitingFor":"dialog open"`. `/effort high` and `/effort medium` (also right
+  after a reply) applied at once with no dialog: `Set effort level to high
+  (saved as your default for new sessions)`. Both commands write the default
+  into `~/.claude/settings.json`.
+- **Slash menu.** The command list came back with 152 commands without
+  creating a transcript or a session.
+
+## Dashboard chat later tier (Claude Code 2.1.325, codex-cli 0.167.0, OpenCode 2.2.6)
+
+Observed 2026-11-16; not a supported contract.
+
+### Claude Code
+
+- **Side questions.** `claude -p --resume <sid> --fork-session
+  --no-session-persistence --tools "" --strict-mcp-config --mcp-config
+  {"mcpServers":{}} --settings {"disableAllHooks":true} --model <id>
+  --output-format stream-json --verbose -- <question>` answered from the
+  conversation (a question starting with `-` included), left the transcript's
+  md5 unchanged, added no session file and no dashboard session. The run takes
+  a few seconds.
+- **Model id and window.** Haiku reports `claude-haiku-5-5`. `/context` shows
+  "Auto-compact window: 135k tokens" for it, below the model's 1M; the usage
+  sheet leaves its window blank.
+- **Rewind (see also the rewind section above).** `waitingFor` with the selector open is `"dialog open"` (status
+  `waiting`); after Escape the status is `idle`.
+- **After a rewind** the restored prompt is in the box about 0.45 s after the
+  digit. A new prompt is parented on the target's parent, the same as a
+  Terminal rewind.
+
+### Codex
+
+- `thread/revert` took about 140 ms. `thread/reverted` reached the connection
+  that asked for it. No token usage is sent after a revert.
+- `Turn.startedAt` is in seconds.
+- A side question (fork, inject, turn) answered in about 4 s. The fork reported
+  sandbox `readOnly` and `forkedFromId` = the parent, with `parentThreadId`
+  null; MCP tools were present in it. A write asked for inside it did not
+  happen.
+- An edit's diff is in the `fileChange` item's `changes[].diff` as a bare hunk
+  (`@@ -1 +1,2 @@`), with no file header.
+- The app-server keeps a 16 MiB limit per WebSocket frame on what it receives
+  and closes the connection on a bigger one; whole messages may be up to
+  64 MiB. A 15 MB image prompt is a 20 MB `turn/start` line.
+- A pasted image path in the TUI becomes `[Image #1]` in the composer and stays
+  in the prompt text.
+
+### OpenCode
+
+- `session.revert.staged` deletes no rows; `session.revert.committed` fires
+  just before the next prompt is queued. No row-delete events reach the stream.
+- `shell.created` carries `data.info` (`id` `sh_…`, `metadata.sessionID`). A
+  child `session.created` has `data.sessionID` (no `id`) and `parentID`. The
+  subagent tool is named `subagent`.
+- An edit tool's `metadata.files[]` has `file`, `patch`, `status`,
+  `additions`, `deletions`. A patch starts `Index: a.txt`, a `====` rule, then
+  `--- a.txt` / `+++ a.txt` with no `a/` `b/` prefixes.
