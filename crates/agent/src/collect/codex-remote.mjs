@@ -166,7 +166,7 @@ function toolMessages(item, completed = true) {
 
 const textOnly = async item => ({ content: item.content.filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text })) });
 
-async function replayHistory(codex, threadId, remoteSid, emit, submitted = new Set(), shapeUser = textOnly) {
+async function replayHistory(codex, threadId, remoteSid, emit, submitted = new Set(), { shapeUser = textOnly } = {}) {
   let cursor;
   const seen = new Set();
   do {
@@ -175,7 +175,7 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
     });
     for (const turn of page.data) for (const item of turn.items) {
       for (const payload of toolMessages(item, item.status !== 'inProgress')) {
-        await emit({ ...payload, uuid: messageUuid(remoteSid, threadId, turn.id, payload.message.id) });
+        await emit({ ...payload, uuid: messageUuid(remoteSid, threadId, turn.id, payload.message.id) }, turn.id);
       }
       const role = item.type === 'userMessage' ? 'user' : item.type === 'agentMessage' ? 'assistant' : null;
       if (!role || (role === 'user' && submitted.has(item.clientId))) continue;
@@ -183,7 +183,7 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
       if (!content.length && !files?.length) continue;
       // Stable UUIDs let the remote deduplicate a replay interrupted by a crash.
       const uuid = messageUuid(remoteSid, threadId, turn.id, item.id);
-      await emit({ uuid, type: role, message: { id: item.id, role, content, ...(role === 'assistant' ? { stop_reason: item.phase === 'commentary' ? null : 'end_turn' } : {}) }, ...(files?.length ? { files } : {}) });
+      await emit({ uuid, type: role, message: { id: item.id, role, content, ...(role === 'assistant' ? { stop_reason: item.phase === 'commentary' ? null : 'end_turn' } : {}) }, ...(files?.length ? { files } : {}) }, turn.id);
     }
     cursor = page.nextCursor;
     if (cursor && seen.has(cursor)) throw Error('Repeated Codex history cursor');
@@ -533,7 +533,24 @@ async function nativeLauncher(statePath, state, script) {
     if (steer && control.turnId) await control.call('turn/steer', { threadId: state.sid, expectedTurnId: control.turnId, input, clientUserMessageId });
     else await control.call('turn/start', { threadId: state.sid, input, effort: state.effort, clientUserMessageId });
   };
+  // Every chat message reaches the feed here, live or replayed: it tracks each turn's first prompt, the only one that can be rewound.
+  const firstOf = new Map(), prompts = new Map();
+  const accept = (msg, turnId) => {
+    if (msg.type === 'user' && !msg.message.content.some(b => b.type === 'tool_result')) {
+      if (!firstOf.has(turnId)) firstOf.set(turnId, msg.uuid);
+      prompts.set(msg.uuid, { turnId, text: msg.message.content.find(b => b.type === 'text')?.text ?? '' });
+      if (firstOf.get(turnId) !== msg.uuid) msg = { ...msg, src: 'steer' };
+    }
+    feed.accept(msg);
+  };
   const ops = {
+    rewind: async ({ uuid }) => {
+      const p = prompts.get(uuid);
+      if (!p || firstOf.get(p.turnId) !== uuid) throw Error('this prompt cannot be rewound');
+      await control.call('thread/revert', { threadId: state.sid, beforeTurnId: p.turnId });
+      restartTui();
+      return { text: p.text }; // Codex never restores files
+    },
     answer: async ({ id, answer }) => {
       const ask = asks.get(id);
       if (!ask) throw Error('already answered');
@@ -610,7 +627,7 @@ async function nativeLauncher(statePath, state, script) {
   const loopback = process.platform === 'android';
   const socket = join(dir, 'backend.sock'), tokenFile = join(dir, 'token');
   let endpoint = loopback ? undefined : socket;
-  let backend, runner, tui, control, log, cleanup, remoteRetry;
+  let backend, runner, tui, control, log, cleanup, remoteRetry, restartTui;
   let closing = false;
   stop = () => {
     if (cleanup) return cleanup;
@@ -691,9 +708,10 @@ async function nativeLauncher(statePath, state, script) {
     if (!mainThread(m, state.sid)) return; // a subagent's turns and items are not this conversation; its questions (above) still are
     if (state.sid) {
       const chat = await chatMessages(m, state.sid);
-      if (replayed) replayed.push(...chat); else for (const msg of chat) feed.accept(msg);
+      for (const msg of chat) if (replayed) replayed.push([msg, p.turnId ?? p.turn?.id]); else accept(msg, p.turnId ?? p.turn?.id);
     }
     if (m.method === 'item/agentMessage/delta') feed.delta(p.itemId, p.delta);
+    if (m.method === 'thread/reverted' && p.threadId === state.sid) reread(); // chat's own revert too: it reaches every connection
     if (m.method === 'turn/started') {
       feed.setState({ working: true });
       for (const id of asks.keys()) if (id.startsWith('implement:')) { asks.delete(id); feed.dropAsk(id); }
@@ -742,26 +760,44 @@ async function nativeLauncher(statePath, state, script) {
   await atomic(statePath, JSON.stringify(state));
   await saveNative();
   feed.setState({ working: state.working });
-  if (resuming) {
-    // Not awaited: the TUI must not wait for history.
+  // Not awaited: the TUI must not wait for history.
+  let gen = 0;
+  const replay = () => {
+    const mine = ++gen;
     replayed = [];
-    replayHistory(control, state.sid, 'cdash-chat', async msg => feed.accept(msg), new Set(), async item => {
+    replayHistory(control, state.sid, 'cdash-chat', (msg, turnId) => { if (gen === mine) accept(msg, turnId); }, new Set(), { shapeUser: async item => {
       const p = await chatPrompt(item);
       return { content: p.text ? [{ type: 'text', text: p.text }] : [], ...(p.files.length ? { files: p.files } : {}) };
-    })
+    } })
       .catch(e => log.write(`${new Date().toISOString()} chat history replay failed: ${e.message}\n`).catch(() => {}))
       .finally(() => {
+        if (gen !== mine) return; // a newer replay owns `replayed`
         const live = replayed;
         replayed = null;
-        for (const msg of live) feed.accept(msg);
+        for (const [msg, turnId] of live) accept(msg, turnId);
         feed.ready();
       });
-  } else feed.ready();
-  tui = spawn('codex', ['resume', '--remote', loopback ? endpoint : `unix://${socket}`, ...(loopback ? ['--remote-auth-token-env', 'CDASH_CODEX_TOKEN'] : []), '-c', 'tui.fullscreen_transcript=true', '-c', 'tui.alternate_screen="always"', state.sid], {
-    cwd: state.dir, env: { ...codexEnv(), CDASH_CODEX_TOKEN: process.env.CDASH_CODEX_TOKEN }, stdio: 'inherit',
-  });
-  tui.on('error', fatal);
-  tui.on('exit', code => { if (!closing) { process.exitCode = code ?? 1; stop(); } });
+  };
+  // A revert changed the conversation: start chat over from the thread's turns.
+  const reread = () => {
+    feed.reset();
+    firstOf.clear(); prompts.clear();
+    replay(); // Task 10 also drops shell tasks here
+  };
+  if (resuming) replay(); else feed.ready();
+  let restarting = false;
+  const startTui = () => {
+    tui = spawn('codex', ['resume', '--remote', loopback ? endpoint : `unix://${socket}`, ...(loopback ? ['--remote-auth-token-env', 'CDASH_CODEX_TOKEN'] : []), '-c', 'tui.fullscreen_transcript=true', '-c', 'tui.alternate_screen="always"', state.sid], {
+      cwd: state.dir, env: { ...codexEnv(), CDASH_CODEX_TOKEN: process.env.CDASH_CODEX_TOKEN }, stdio: 'inherit',
+    });
+    tui.on('error', fatal);
+    tui.on('exit', code => {
+      if (restarting) { restarting = false; if (!closing) return startTui(); }
+      if (!closing) { process.exitCode = code ?? 1; stop(); }
+    });
+  };
+  restartTui = () => { restarting = true; tui.kill('SIGTERM'); };
+  startTui();
   const debugPath = join(controlDir, 'remote-debug.log');
   await writeFile(debugPath, '', { flag: 'a', mode: 0o600 });
   await chmod(debugPath, 0o600);

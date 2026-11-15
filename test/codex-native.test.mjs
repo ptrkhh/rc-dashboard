@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 
-async function fixture(t, failure = '', platform = 'linux', resuming = false) {
+async function fixture(t, failure = '', platform = 'linux', resuming = false, { history } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-native-test-'));
   const state = join(dir, 'state.json'), wire = join(dir, 'wire.jsonl');
   await mkdir(join(dir,'controls','cdash-test'),{recursive:true});
@@ -51,7 +51,9 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  if(m.method==='account/read')send({account:{type:'apiKey'},requiresOpenaiAuth:false});
  if(['thread/start','thread/resume'].includes(m.method))send({thread:{id:'01234567-1234-1234-1234-0123456789ab'},model:'gpt-check',reasoningEffort:'low'});
  if(m.method==='thread/name/set')send({});
- if(m.method==='thread/turns/list')send({data:[{id:'t1',items:[
+ if(m.method==='thread/revert')send({thread:{id:'01234567-1234-1234-1234-0123456789ab',turns:[]}});
+ if(m.method==='thread/turns/list'&&process.env.CDASH_CHECK_HISTORY)send(JSON.parse(process.env.CDASH_CHECK_HISTORY));
+ else if(m.method==='thread/turns/list')send({data:[{id:'t1',items:[
    {id:'u1',type:'userMessage',content:[{type:'text',text:'hello'},{type:'image',url:'data:image/png;base64,'+Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('hist')]).toString('base64')}]},
    {id:'a1',type:'agentMessage',text:'hi there',phase:'final'}]}],nextCursor:null});
  if(['turn/steer','turn/interrupt','thread/settings/update','thread/compact/start','review/start'].includes(m.method))send({});
@@ -74,7 +76,7 @@ setInterval(()=>{const marker=process.env.CDASH_CHECK_ROOT+'/stop-remote';if(fs.
   const pin = `data:text/javascript,${encodeURIComponent(`Object.defineProperty(process,'platform',{value:'${platform}'})`)}`;
   const child = spawn(process.execPath, ['--import', pin, resolve('crates/agent/src/collect/codex-remote.mjs'), '--state', state, '--name', 'cdash-test'], {
     env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_CHECK_ROOT: dir, CDASH_CHECK_WIRE: wire,
-      CDASH_CHECK_FAILURE: failure, CDASH_MEDIA_DIR: join(dir, 'media'), CDASH_CODEX_AGENT: join(dir, 'agent'), CLAUDE_CODE_SESSION_ACCESS_TOKEN: 'test-must-not-leak' },
+      CDASH_CHECK_FAILURE: failure, ...(history ? { CDASH_CHECK_HISTORY: JSON.stringify(history) } : {}), CDASH_MEDIA_DIR: join(dir, 'media'), CDASH_CODEX_AGENT: join(dir, 'agent'), CLAUDE_CODE_SESSION_ACCESS_TOKEN: 'test-must-not-leak' },
     stdio: ['pipe','pipe','pipe'],
   });
   let output = '';
@@ -480,4 +482,36 @@ test('a media folder that cannot be written, or a bad data URL, still shows the 
   assert.deepEqual(c.lines.find(l => l.t === 'ev' && l.ev.message?.id === 'u3').ev.files, [{ kind: 'file', name: 'image' }, { kind: 'file', name: 'image' }, { kind: 'file', name: 'image' }]);
   assert.ok(f.alive(f.child.pid), 'the supervisor is still running');
   c.close();
+});
+
+const steered = { data: [
+  { id: 't1', startedAt: 1789000000, items: [{ id: 'u1', type: 'userMessage', content: [{ type: 'text', text: 'hello' }] }, { id: 'a1', type: 'agentMessage', text: 'hi', phase: 'final' }] },
+  { id: 't2', startedAt: 1789000100, items: [{ id: 'u2', type: 'userMessage', content: [{ type: 'text', text: 'second' }] },
+    { id: 'u3', type: 'userMessage', content: [{ type: 'text', text: 'steer me' }] }, { id: 'a2', type: 'agentMessage', text: 'ok', phase: 'final' }] },
+], nextCursor: null };
+test('Codex rewinds: steers are marked, chat reverts and restarts the TUI, any revert resets chat', { timeout: 30000 }, async t => {
+  const f = await fixture(t, '', process.platform, true, { history: steered });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const ev = id => c.lines.find(l => l.t === 'ev' && l.ev.message?.id === id).ev;
+  assert.deepEqual([ev('u2').src, ev('u3').src], [undefined, 'steer']);
+  await f.wait(async () => (await f.messages()).some(m => m.kind === 'tui')); // a TUI killed before it starts never logs
+  c.write({ t: 'req', rid: 1, op: 'rewind', uuid: ev('u3').uuid, files: false });
+  c.write({ t: 'req', rid: 2, op: 'rewind', uuid: ev('u2').uuid, files: true });
+  await until(() => c.lines.some(l => l.rid === 2));
+  assert.equal(c.lines.find(l => l.rid === 1).ok, false, 'a steer cannot be rewound');
+  assert.equal(f.rpc('thread/revert').params.beforeTurnId, 't2');
+  assert.deepEqual(c.lines.find(l => l.rid === 2).data, { text: 'second' });
+  await f.wait(async () => (await f.messages()).filter(m => m.kind === 'tui').length === 2);
+  const [old] = (await f.messages()).filter(m => m.kind === 'tui');
+  assert.equal(f.alive(old.pid), false);
+  assert.equal(f.child.exitCode, null, 'the supervisor keeps running');
+  const before = c.lines.length;
+  await f.inject({ method: 'thread/reverted', params: { threadId: '01234567-1234-1234-1234-0123456789ab' } });
+  await until(() => c.lines.slice(before).some(l => l.t === 'ready'));
+  const after = c.lines.slice(before);
+  assert.equal(after[0].t, 'hello');
+  assert.notEqual(after[0].epoch, c.lines[0].epoch);
+  assert.equal(after.find(l => l.t === 'ev').seq, 1);
 });
