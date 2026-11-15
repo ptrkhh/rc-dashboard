@@ -60,7 +60,9 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  if(['turn/steer','turn/interrupt','thread/settings/update','thread/compact/start','review/start'].includes(m.method))send({});
  if(m.method==='model/list')send({data:[{model:'gpt-check',displayName:'GPT Check',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'high'}],defaultReasoningEffort:'low'},{model:'gpt-mini',displayName:'GPT Mini',hidden:false,supportedReasoningEfforts:[{reasoningEffort:'low'}],defaultReasoningEffort:'low'}],nextCursor:null});
  if(m.method==='skills/list')send({data:[{cwd:'/p',errors:[],skills:[{name:'lint',description:'Run lint',enabled:true,path:'/p/.codex/skills/lint/SKILL.md',scope:'repo'}]}]});
- if(m.method==='turn/start')send({turn:{id:'t3',status:'inProgress'}});
+ if(m.method==='turn/start')send({turn:{id:m.params.threadId==='side-1'?'st1':'t3',status:'inProgress'}});
+ if(m.method==='thread/fork')send({thread:{id:'side-1'}});
+ if(['thread/inject_items','thread/unsubscribe'].includes(m.method))send({});
 });
 `, { mode: 0o700 });
   await writeFile(join(dir, 'claude'), header + `
@@ -575,4 +577,51 @@ test('a reread drops shell tasks and keeps agent tasks', { timeout: 20000 }, asy
   await f.inject({ method: 'thread/reverted', params: { threadId: sid } });
   await until(() => c.lines.findLast(l => l.t === 'tasks').tasks.length === 1);
   assert.deepEqual(c.lines.findLast(l => l.t === 'tasks').tasks.map(x => [x.id, x.kind]), [['child-1', 'agent']]);
+});
+
+test('a Codex side question forks read-only, streams the answer aside, and cleans up', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  c.write({ t: 'req', rid: 1, op: 'aside', id: 'q1', text: 'what did I ask?' });
+  assert.equal((await res(c, 1)).ok, true);
+  const fork = f.rpc('thread/fork').params;
+  assert.deepEqual([fork.threadId, fork.ephemeral, fork.excludeTurns, fork.sandbox, fork.approvalPolicy, fork.model, fork.config], [SID, true, true, 'read-only', 'never', 'gpt-check', { model_reasoning_effort: 'low' }]);
+  const inject = f.rpc('thread/inject_items').params;
+  assert.equal(inject.threadId, 'side-1');
+  assert.deepEqual([inject.items[0].type, inject.items[0].role, inject.items[0].content[0].type], ['message', 'user', 'input_text']);
+  assert.ok(inject.items[0].content[0].text.startsWith('Side conversation boundary.'));
+  assert.deepEqual(f.rpc('turn/start').params, { threadId: 'side-1', input: [{ type: 'text', text: 'what did I ask?', text_elements: [] }] });
+  // the fake's thread/read names main as every thread's parent: a side thread still never runs as an agent
+  await f.inject({ method: 'thread/status/changed', params: { threadId: 'side-1', status: { type: 'active', activeFlags: [] } } });
+  await f.inject({ method: 'turn/started', params: { threadId: 'side-1', turn: { id: 'st1' } } });
+  await f.inject({ method: 'item/agentMessage/delta', params: { threadId: 'side-1', turnId: 'st1', itemId: 's', delta: 'You asked' } });
+  await f.inject({ method: 'item/completed', params: { threadId: 'side-1', turnId: 'st1', item: { id: 's', type: 'agentMessage', text: 'You asked', phase: 'final' } } });
+  await f.inject({ method: 'turn/completed', params: { threadId: 'side-1', turn: { id: 'st1', status: 'completed' } } });
+  await until(() => c.lines.some(l => l.t === 'aside' && l.done));
+  assert.deepEqual(c.lines.filter(l => l.t === 'aside'), [{ t: 'aside', id: 'q1', text: 'You asked', done: false }, { t: 'aside', id: 'q1', text: '', done: true }]);
+  await until(() => f.rpc('thread/unsubscribe'));
+  assert.deepEqual(f.rpc('thread/unsubscribe').params, { threadId: 'side-1' });
+  assert.ok(!c.lines.some(l => l.t === 'ev' || l.t === 'delta'), 'the side answer never reaches the conversation');
+  assert.ok(!c.lines.some(l => l.t === 'state' && l.working), 'a side turn is not the main turn');
+  assert.ok(!c.lines.some(l => l.t === 'tasks' && l.tasks.length), 'a side question is not a running agent');
+  // the side turn did not become the main turn: a steer starts a main turn
+  c.write({ t: 'send', cid: 'c1', text: 'main prompt', steer: true });
+  await until(() => f.rpc('turn/start')?.params.threadId === SID || f.rpc('turn/steer'));
+  assert.equal(f.rpc('turn/steer'), undefined, 'the steer went to the side turn');
+  // a second question cancelled mid-turn
+  c.write({ t: 'req', rid: 2, op: 'aside', id: 'q2', text: 'and then?' });
+  assert.equal((await res(c, 2)).ok, true);
+  c.write({ t: 'req', rid: 3, op: 'aside_cancel', id: 'q2' });
+  assert.equal((await res(c, 3)).ok, true);
+  await until(() => f.rpc('turn/interrupt'));
+  assert.deepEqual(f.rpc('turn/interrupt').params, { threadId: 'side-1', turnId: 'st1' });
+  await until(() => readFileSync(join(f.dir, 'wire.jsonl'), 'utf8').split('"thread/unsubscribe"').length === 3);
+  await f.inject({ method: 'turn/completed', params: { threadId: 'side-1', turn: { id: 'st1', status: 'interrupted' } } });
+  // notifications are handled in order, so once this usage shows, the line above was handled
+  await f.inject({ method: 'thread/tokenUsage/updated', params: { threadId: SID, tokenUsage: { total: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 }, last: { totalTokens: 9 }, modelContextWindow: 100 } } });
+  await until(() => c.lines.some(l => l.t === 'usage' && l.usage.context?.used === 9));
+  assert.ok(!c.lines.some(l => l.t === 'aside' && l.id === 'q2'), 'a cancelled question sends nothing more');
+  c.close();
 });

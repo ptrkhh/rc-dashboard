@@ -15,11 +15,11 @@ export class OpenCode {
     // 10 PDFs of 20 MiB are about 267 MiB of base64; V8 strings stop at about 512 MiB
     this.bodyMax = 8 * 1024 * 1024; this.rowMax = 320 * 1024 * 1024; this.eventMax = 1024 * 1024;
   }
-  async request(path, { method = 'GET', body, signal } = {}) {
+  async request(path, { method = 'GET', body, signal, timeout = 15000 } = {}) {
     if (!path.startsWith('/api/') || path.startsWith('//')) throw new Error('Invalid API path');
     let response;
     try {
-      response = await fetch(this.url + path, { method, redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000), headers: { authorization: `Basic ${Buffer.from(`opencode:${this.password}`).toString('base64')}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+      response = await fetch(this.url + path, { method, redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout), headers: { authorization: `Basic ${Buffer.from(`opencode:${this.password}`).toString('base64')}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     } catch (cause) {
       if (signal?.aborted) throw cause;
       throw new Error('OpenCode API request failed');

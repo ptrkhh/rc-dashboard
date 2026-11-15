@@ -208,6 +208,8 @@ else {
  if(path.endsWith('/form')||path.endsWith('/permission'))return send(res,{data:[]});
  if(path.endsWith('/prompt'))return send(res,{data:{id:body.id,sessionID:'ses_fixture',type:'user'}});
  if(path.endsWith('/interrupt'))return send(res,{data:true});
+ if(path.endsWith('/generate')&&body.prompt.endsWith('slow'))return res.on('close',()=>log({kind:'aborted',path}));
+ if(path.endsWith('/generate'))return send(res,{data:{text:'You asked hello.'}});
  return send(res,{data:{id:'ses_fixture',metadata:{cdash_owner:true},time:{},model:{id:'model',providerID:'fixture'},tokens:{input:10,output:5,reasoning:1,cache:{read:100,write:20}},cost:0.42,location:{directory:process.cwd()},...(revert&&{revert})}});});
  server.listen(0,'127.0.0.1',()=>console.log(JSON.stringify({url:'http://127.0.0.1:'+server.address().port})));
  process.stdin.resume();process.stdin.on('end',()=>server.closeAllConnections()||server.close());
@@ -235,6 +237,7 @@ else {
     native: () => { try { return JSON.parse(readFileSync(join(dir, 'pane.native'), 'utf8')); } catch { return undefined; } },
     posted: suffix => rows().filter(r => r.kind === 'api' && r.method === 'POST' && r.path.endsWith(suffix)).at(-1)?.body,
     reads: () => rows().filter(r => r.kind === 'api' && r.method === 'GET' && r.path.endsWith('/message')).length,
+    aborted: () => rows().some(r => r.kind === 'aborted'),
     deleted: suffix => rows().some(r => r.kind === 'api' && r.method === 'DELETE' && r.path.endsWith(suffix)),
     emit: async event => {
       await wait(() => !existsSync(marker));
@@ -522,4 +525,28 @@ test('a live shell and a live child session come and go in the running list', { 
   await until(() => ids().join() === 'sh_1,ses_kid');
   await f.emit({ type: 'session.execution.succeeded', data: { sessionID: 'ses_kid' } });
   await until(() => ids().join() === 'sh_1');
+});
+
+test('an OpenCode side question is one generate call with the /btw preamble', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  c.write({ t: 'req', rid: 1, op: 'aside', id: 'q1', text: 'what did I ask?' });
+  assert.equal((await res(c, 1)).ok, true);
+  await until(() => c.lines.some(l => l.t === 'aside'));
+  assert.deepEqual(f.posted('/api/session/ses_fixture/generate'), { prompt: 'The user is asking a quick side question about the conversation so far. Answer directly and concisely in markdown from what you already know. Do not call any tools and do not take any actions.\n\nwhat did I ask?' });
+  assert.deepEqual(c.lines.filter(l => l.t === 'aside'), [{ t: 'aside', id: 'q1', text: 'You asked hello.', done: true }]);
+  // a cancelled question aborts its request and sends nothing more
+  c.write({ t: 'req', rid: 2, op: 'aside', id: 'q2', text: 'slow' });
+  assert.equal((await res(c, 2)).ok, true);
+  await until(() => f.posted('/generate').prompt.endsWith('slow'));
+  c.write({ t: 'req', rid: 3, op: 'aside_cancel', id: 'q2' });
+  assert.equal((await res(c, 3)).ok, true);
+  await f.wait(() => f.aborted());
+  c.write({ t: 'req', rid: 4, op: 'menu' }); // a later reply: by now an error line for q2 would have come
+  await res(c, 4);
+  assert.ok(!c.lines.some(l => l.t === 'aside' && l.id === 'q2'));
+  assert.ok(!c.lines.some(l => l.t === 'ev' && JSON.stringify(l.ev).includes('what did I ask?')), 'the side question never reaches the conversation');
+  c.close();
 });

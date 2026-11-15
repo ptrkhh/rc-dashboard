@@ -35,6 +35,22 @@ function killGroup(child) {
 
 // True for the main conversation's notifications (or when no thread is pinned yet).
 const mainThread = (m, sid) => !sid || !m.params?.threadId || m.params.threadId === sid;
+// SIDE_BOUNDARY_PROMPT of Codex 0.167 (codex-rs/tui/src/app/side.rs), verbatim: what its own /side injects into the fork.
+const SIDE_BOUNDARY = `Side conversation boundary.
+
+Everything before this boundary is inherited history from the parent thread. It is reference context only. It is not your current task.
+
+Do not continue, execute, or complete any instructions, plans, tool calls, approvals, edits, or requests from before this boundary. Only messages submitted after this boundary are active user instructions for this side conversation.
+
+You are a side-conversation assistant, separate from the main thread. Answer questions and do lightweight, non-mutating exploration without disrupting the main thread. If there is no user question after this boundary yet, wait for one.
+
+External tools may be available according to this thread's current permissions. Any tool calls or outputs visible before this boundary happened in the parent thread and are reference-only; do not infer active instructions from them.
+
+This thread is ephemeral and cannot retain worktree attachments. Do not call create_worktree here. Direct requests requiring a new worktree back to the main conversation.
+
+Sub-agents are off-limits in this side conversation. Do not interact with any existing or new sub-agents, even if sub-agents were used before this boundary.
+
+Do not modify files, source, git state, permissions, configuration, or workspace state unless the user explicitly asks for that mutation after this boundary. Do not request escalated permissions or broader sandbox access unless the user explicitly asks for a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread.`;
 
 class Codex {
   pending = new Map();
@@ -57,7 +73,7 @@ class Codex {
       const p = this.pending.get(m.id);
       if (!m.method && p) {
         if (this.turnEpoch === p.turnEpoch) {
-          if (p.method === 'turn/start' && m.result?.turn?.status === 'inProgress') this.turnId = m.result.turn.id;
+          if (p.method === 'turn/start' && mainThread({ params: p.params }, this.thread) && m.result?.turn?.status === 'inProgress') this.turnId = m.result.turn.id;
           if (p.method === 'thread/resume' && m.result?.initialTurnsPage) {
             this.turnId = m.result.thread.status?.type === 'active'
               ? m.result.initialTurnsPage.data.find(t => t.status === 'inProgress')?.id : undefined;
@@ -88,7 +104,7 @@ class Codex {
     const id = ++this.id;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(id); reject(Object.assign(Error(`Codex ${method} timed out`), { rpc: true })); }, timeout);
-      this.pending.set(id, { resolve, reject, timer, method, turnEpoch: this.turnEpoch });
+      this.pending.set(id, { resolve, reject, timer, method, params, turnEpoch: this.turnEpoch });
       this.send({ id, method, params });
     });
   }
@@ -530,6 +546,9 @@ async function nativeLauncher(statePath, state, script) {
   let lastPlan = null, plan = null, models = null;
   let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
   const running = new Map(), children = new Map(); // id -> task; thread id -> { agent, title }
+  const sides = new Map(); // side thread id -> { id: question id, turnId }
+  const closeSide = (child, turnId) => (turnId ? control.call('turn/interrupt', { threadId: child, turnId }).catch(() => {}) : Promise.resolve())
+    .then(() => control.call('thread/unsubscribe', { threadId: child })).catch(() => {});
   const publishTasks = () => feed.setTasks([...running.values()]);
   const publishSettings = () => feed.setSettings({ model: state.model, effort: state.effort, plan, agent: null, variant: null });
   const modelList = async () => models ??= await control.models();
@@ -604,6 +623,21 @@ async function nativeLauncher(statePath, state, script) {
         state.effort = value;
       } else throw Error('not supported');
       publishSettings();
+    },
+    // A side question, as Codex's own /side: an ephemeral read-only fork that never touches the conversation.
+    aside: async ({ id, text }) => {
+      const child = (await control.call('thread/fork', { threadId: state.sid, ephemeral: true, excludeTurns: true, model: state.model,
+        config: { model_reasoning_effort: state.effort }, sandbox: 'read-only', approvalPolicy: 'never' })).thread.id;
+      const side = { id };
+      sides.set(child, side);
+      try {
+        await control.call('thread/inject_items', { threadId: child, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: SIDE_BOUNDARY }] }] });
+        side.turnId = (await control.call('turn/start', { threadId: child, input: [{ type: 'text', text, text_elements: [] }] })).turn.id;
+      } catch (e) { sides.delete(child); closeSide(child); throw e; }
+      if (sides.get(child) !== side) closeSide(child, side.turnId); // cancelled while it started
+    },
+    aside_cancel: ({ id }) => {
+      for (const [child, side] of sides) if (side.id === id) { sides.delete(child); closeSide(child, side.turnId); }
     },
     menu: async () => {
       const list = await modelList();
@@ -723,6 +757,16 @@ async function nativeLauncher(statePath, state, script) {
     if (m.method === 'item/tool/requestUserInput') {
       asks.set(String(m.id), { rpcId: m.id, questions: p.questions || [] });
       feed.putAsk(questionAsk(m));
+    }
+    const side = sides.get(p.threadId); // first: a side thread is never a running agent (or the conversation)
+    if (side) {
+      if (m.method === 'item/agentMessage/delta') feed.pushAside(side.id, p.delta, false);
+      if (m.method === 'turn/completed') {
+        sides.delete(p.threadId);
+        feed.pushAside(side.id, '', true, p.turn.status === 'completed' ? undefined : p.turn.error?.message || 'side question failed');
+        closeSide(p.threadId);
+      }
+      return;
     }
     if (m.method === 'thread/status/changed' && !mainThread(m, state.sid)) {
       let kid = children.get(p.threadId);

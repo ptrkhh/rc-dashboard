@@ -365,6 +365,8 @@ async function worker(args) {
   } finally { stop(); await saved.catch(() => {}); await client.close(); }
 }
 
+const BTW = 'The user is asking a quick side question about the conversation so far. Answer directly and concisely in markdown from what you already know. Do not call any tools and do not take any actions.';
+
 function modelRef(model, variant) {
   const split = typeof model === 'string' ? model.indexOf('/') : -1;
   if (split < 1 || split === model.length - 1) throw new Error('Invalid OpenCode model');
@@ -462,6 +464,7 @@ async function supervise(statePath, name) {
     const agents = async () => (await list('/api/agent')).filter(a => a.mode !== 'subagent' && !a.hidden);
     const models = async () => normalizeModels(await client.request('/api/model'));
     const promptRows = new Map(); // chat row uuid -> {id, text}, the prompts a rewind can stage
+    const sides = new Map(); // side question id -> AbortController of its generate call
     const ops = {
       rewind: async ({ uuid, files }) => {
         const row = promptRows.get(uuid);
@@ -497,6 +500,16 @@ async function supervise(statePath, name) {
         } else throw new Error('not supported');
         publishSettings();
       },
+      // A side question: OpenCode's own /btw, one tool-less call that leaves the session's history and cost alone.
+      aside: ({ id, text }) => {
+        const ac = new AbortController();
+        sides.get(id)?.abort();
+        sides.set(id, ac);
+        client.request(`${sessionPath}/generate`, { method: 'POST', body: { prompt: BTW + '\n\n' + text }, signal: ac.signal, timeout: 300000 })
+          .then(r => feed.pushAside(id, r?.data?.text || '', true), e => { if (!ac.signal.aborted) feed.pushAside(id, '', true, e.message); })
+          .finally(() => { if (sides.get(id) === ac) sides.delete(id); });
+      },
+      aside_cancel: ({ id }) => { sides.get(id)?.abort(); sides.delete(id); },
       menu: async () => ({
         commands: (await commands()).slice(0, 150).map(c => ({ name: c.name, description: (c.description ?? '').slice(0, 100) })),
         models: (await models()).map(m => ({ value: m.model, label: m.label.replace(/^OpenCode: /, ''), variants: m.variants })),
