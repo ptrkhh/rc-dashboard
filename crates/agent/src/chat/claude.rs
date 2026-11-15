@@ -212,10 +212,12 @@ impl Engine for ClaudeEngine {
         match picker::route(text) {
             // A paste cannot be confirmed by the TUI; the transcript confirms it.
             picker::Route::Paste => {
+                let ours = self.shared.leftover.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                 picker::clear_leftover(&self.ctx, &self.name, self.pid, &self.shared.leftover).await;
                 let (runner, name) = (&self.ctx.runner, self.name.as_str());
-                // A Terminal draft, text left before an agent restart, or a leftover the clear missed would join the message.
-                if tmux_io::capture_styled(runner, name).await.ok().and_then(|s| tmux_io::input_text(&s)).is_some_and(|t| !t.is_empty()) {
+                // A Terminal draft, or text left before an agent restart, would join the message.
+                // ponytail: not read right after our own clear, which Claude may not have redrawn yet.
+                if !ours && tmux_io::capture_styled(runner, name).await.ok().and_then(|s| tmux_io::input_text(&s)).is_some_and(|t| !t.is_empty()) {
                     return Err(rewind::DRAFT.into());
                 }
                 let (images, others): (Vec<_>, Vec<_>) = files.iter().partition(|f| f.kind == Kind::Image);
