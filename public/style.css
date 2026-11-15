@@ -697,7 +697,7 @@ button, input, select { font: inherit; }
 .chat-text hr { border: 0; border-top: 1px solid var(--border); }
 .chat-text a { color: var(--accent); text-underline-offset: 2px; }
 /* Text still arriving ends in a caret. */
-.chat-text.streaming > :last-child::after {
+.chat-text.streaming > :last-child:not(.chat-code)::after, .chat-text.streaming > .chat-code:last-child > pre::after {
   content: ''; display: inline-block; width: 0.5em; height: 1em; margin-left: 2px; vertical-align: -0.12em;
   background: var(--accent); border-radius: 1px; animation: chat-caret 1s steps(1) infinite;
 }
@@ -937,7 +937,7 @@ button, input, select { font: inherit; }
 
 @media (prefers-reduced-motion: reduce) {
   .chat-spinner { animation: none; border-color: var(--accent); }
-  .chat-text.streaming > :last-child::after { animation: none; }
+  .chat-text.streaming > :last-child:not(.chat-code)::after, .chat-text.streaming > .chat-code:last-child > pre::after { animation: none; }
 }
 
 /* Wide windows: the dashboard folds into a narrow left column and chat sits on

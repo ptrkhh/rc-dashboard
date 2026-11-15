@@ -708,3 +708,13 @@ test('view.js never assigns state.mine: only the store mutates what rows() reads
   const src = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
   assert.ok(!src.includes('state.mine ='));
 });
+
+test('one rewind or undo at a time, a caret not after the code wrapper, and keyboard-reachable messages', () => {
+  const view = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
+  const sends = view.split('\n').filter(l => /t: 'rewind(_undo)?'/.test(l));
+  assert.ok(sends.length >= 2 && sends.every(l => l.includes('rewinding')), sends.join('\n'));
+  assert.ok(view.includes('tabIndex = 0'), 'message bodies take focus');
+  assert.ok(!/MARK\[/.test(view) || /Object\.hasOwn\(MARK/.test(view), 'MARK is looked up as own keys only');
+  const css = readFileSync(new URL('../public/style.css', import.meta.url), 'utf8');
+  for (const rule of css.match(/[^{}]*streaming[^{}]*::after[^{}]*\{/g) || []) assert.ok(rule.includes(':not(.chat-code)') || rule.includes('.chat-code'), rule);
+});

@@ -55,14 +55,20 @@
       if (code) { c.opts.copy(code.previousSibling.textContent); return; }
       const think = t.closest('[data-think]');
       if (think) { const k = think.dataset.think; if (!c.opened.delete(k)) c.opened.add(k); schedule(); return; }
-      if (t.closest('[data-undo]')) { sendFrame({ t: 'rewind_undo' }); return; }
+      const undo = t.closest('[data-undo]');
+      if (undo) { if (!c.rewinding && sendFrame({ t: 'rewind_undo' })) c.rewinding = undo; return; }
       const rowEl = t.closest('[data-row]');
       const row = rowEl && (c.rows || []).find(r => r.key === rowEl.dataset.row);
       if (!row) return;
       const act = t.closest('[data-act]')?.dataset.act;
       if (act === 'copy') c.opts.copy(row.text);
       else if (act === 'rewind') { if (cdashChatStore.canRewind(c.state, row)) showRewind(row); }
-      else if (!t.closest('button, a, input') && !getSelection().toString()) { c.acted = c.acted === row.key ? null : row.key; schedule(); }
+      else if (!t.closest('button, a, input') && !getSelection().toString()) toggleActions(row.key);
+    });
+    log.addEventListener('keydown', e => {
+      if (!c || (e.key !== 'Enter' && e.key !== ' ') || !e.target.dataset?.row) return;
+      e.preventDefault();
+      toggleActions(e.target.dataset.row);
     });
     cdashMenu.wire(sendFrame, () => c?.state ?? null);
     $('#chat-sheet-close').addEventListener('click', () => $('#chat-sheet').close());
@@ -133,7 +139,8 @@
       opts, state: cdashChatStore.initial(), ws: null, nodes: new Map(), raf: 0,
       attempt: 0, retryTimer: 0, done: false, follow: true, paging: false, paged: false,
       link: 'Connecting…', since: 0, clock: 0,
-      acted: null, opened: new Set(), todoOpen: false, hint: '',  // row with its action line, open Thinking rows
+      acted: null, opened: new Set(), todoOpen: false, todoSig: null, hint: '',  // row with its action line, open Thinking rows
+      rewinding: null,  // the button whose rewind or undo awaits its `rewound`
     };
     $('#chat-title').textContent = opts.title || opts.name;
     const rc = $('#chat-rc');
@@ -212,6 +219,7 @@
       x.ws = null;
       x.paging = false;
       x.uploads.lost();
+      if (x.rewinding) { x.rewinding.disabled = false; x.rewinding = null; }  // the reply went with the socket
       if (e.code === 4000) { x.done = true; x.link = ''; schedule(); return; }
       if (e.code === 4002) { connect(); return; } // fell behind: catch up from the last position now
       retry(x);
@@ -265,6 +273,7 @@
     renderComposer();
   }
 
+  // ponytail: keyed by tmux name and never expire; a later session reusing the name finds the old draft. Expire by age if that shows.
   const draftKey = () => 'cdash-draft:' + c.opts.name;
   // Attachments are not kept: only the text.
   function saveDraft() {
@@ -275,22 +284,23 @@
   // The answer to a rewind or an undo. It comes before the cut's reload, which leaves the box alone.
   function rewound(f) {
     const sheet = $('#chat-sheet');
+    const by = c.rewinding;
+    c.rewinding = null;
     if (!f.ok) {
       c.opts.toast?.(f.error || 'Rewind failed');
-      const go = $('#chat-sheet-body .chat-rewind-go');
-      if (go) go.disabled = false;
+      if (by) by.disabled = false;
       return;
     }
     if (sheet.open && sheet.dataset.kind === 'rewind') sheet.close();
     if (f.text) toBox(f.text);
     const n = f.attachments || 0;
-    if (f.uuid) c.hint = n > 0 ? 'This prompt had ' + n + (n === 1 ? ' attachment' : ' attachments') + '; attach them again' : '';
+    c.hint = f.uuid && n > 0 ? 'This prompt had ' + n + (n === 1 ? ' attachment' : ' attachments') + '; attach them again' : '';
     schedule();
   }
 
   function showRewind(row) {
     const sheet = $('#chat-sheet');
-    if (sheet.open) return;
+    if (sheet.open || c.rewinding) return;
     sheet.dataset.kind = 'rewind';
     $('#chat-sheet-title').textContent = 'Rewind to here?';
     const body = $('#chat-sheet-body');
@@ -310,7 +320,7 @@
     const go = el('button', 'chat-rewind-go', 'Rewind');
     cancel.type = go.type = 'button';
     cancel.onclick = () => sheet.close();
-    go.onclick = () => { if (sendFrame({ t: 'rewind', uuid: row.uuid, files: !!files?.checked })) go.disabled = true; };
+    go.onclick = () => { if (!c.rewinding && sendFrame({ t: 'rewind', uuid: row.uuid, files: !!files?.checked })) { go.disabled = true; c.rewinding = go; } };
     bar.append(cancel, go);
     body.append(bar);
     sheet.showModal();
@@ -486,7 +496,9 @@
         x.nodes.set(r.key, n);
       } else if (n.sig !== sig) {
         const fresh = decorate(r, acted);
+        const focused = document.activeElement === n.el;
         n.el.replaceWith(fresh);
+        if (focused) fresh.focus({ preventScroll: true });  // Enter or Space on a message keeps the keyboard there
         Object.assign(n, { el: fresh, sig });
       }
       const want = prev ? prev.nextSibling : log.firstChild;
@@ -494,6 +506,9 @@
       prev = n.el;
     }
     for (const [k, n] of x.nodes) if (!keep.has(k)) { n.el.remove(); x.nodes.delete(k); }
+    // A cut reuses seqs, so a key that left must not come back opened.
+    if (!keep.has(x.acted)) x.acted = null;
+    for (const k of x.opened) if (!keep.has(k)) x.opened.delete(k);
     renderStatus();
     renderBanner();
     renderTodo();
@@ -515,10 +530,16 @@
     askPage(log);
   }
 
+  function toggleActions(key) {
+    c.acted = c.acted === key ? null : key;
+    schedule();
+  }
+
   function decorate(r, acted) {
     const n = build(r);
     if (!['user', 'text', 'thinking'].includes(r.kind)) return n;
     n.dataset.row = r.key;
+    n.tabIndex = 0;
     if (acted) n.append(actions(r));
     return n;
   }
@@ -528,8 +549,8 @@
     const box = $('#chat-todo');
     const t = cdashChatStore.todo(c.state);
     const sig = t ? JSON.stringify(t.items) + c.todoOpen : '';
-    if (box.dataset.sig === sig) return;
-    box.dataset.sig = sig;
+    if (c.todoSig === sig) return;
+    c.todoSig = sig;
     box.textContent = '';
     box.hidden = !t;
     if (!t) return;
@@ -542,7 +563,7 @@
     const list = el('ul', 'chat-todo-list');
     for (const i of t.items) {
       const li = el('li', i.status === 'completed' ? 'done' : '');
-      li.append(el('span', 'chat-todo-mark', MARK[i.status] ?? '\u25cb'), el('span', '', i.text));
+      li.append(el('span', 'chat-todo-mark', Object.hasOwn(MARK, i.status) ? MARK[i.status] : '\u25cb'), el('span', '', i.text));
       list.append(li);
     }
     box.append(list);
