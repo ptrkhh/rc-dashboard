@@ -333,6 +333,23 @@ this is a supported contract; each item is what this version did.
   after a reply) applied at once with no dialog: `Set effort level to high
   (saved as your default for new sessions)`. Both commands write the default
   into `~/.claude/settings.json`.
+- **A slash command's result reads as a dialog for a moment.** Typed
+  `/effort medium`, `/effort low` and a cold-cache `/model sonnet` each turned
+  the session file to `"status":"waiting"`, `"waitingFor":"dialog open"` for
+  about 100 to 200 ms while the result line was drawn (a `▔▔▔` rule over the
+  box), then back to `idle`, with no dialog on screen. The picker had pressed
+  Escape on that and reported an unexpected dialog, though the setting was
+  applied. `/effort` showed no confirmation a third time.
+- **`/model` to a cheaper model asks the same way.** From sonnet with a warm
+  cache, `/model haiku` opened `Switch model?`, "Your next response will be
+  slower and use more tokens", "This conversation is cached for the current
+  model. Switching to Haiku 5.5 means the full history gets re-read.",
+  `❯ 1. Yes, switch to Haiku 5.5`, `2. No, go back`.
+- **The transcript records the permission mode.** Each prompt record carries
+  `"permissionMode"`, and Claude appends `{"type":"permission-mode",
+  "permissionMode":…}` lines with its metadata; after a plan card was answered
+  in Terminal one read `bypassPermissions`. A shift+tab in Terminal writes
+  nothing until the next prompt.
 - **Slash menu.** The command list came back with 152 commands without
   creating a transcript or a session.
 

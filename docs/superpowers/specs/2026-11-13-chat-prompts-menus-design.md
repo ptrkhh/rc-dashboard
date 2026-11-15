@@ -290,9 +290,11 @@ change) also gets "Restart the session to answer from chat."
   - if the status file shows `waiting` with `dialog open` and the pane
     shows the confirmation that command raises, it presses that dialog's
     "yes" key after checking its text. `/model` can raise "Switch
-    model?", and `/effort` can raise "Change effort level?" (the same
-    component, shown when the prompt cache may be warm);
-  - for any other dialog, it presses Escape and reports failure.
+    model?" when the prompt cache may be warm. `/effort` raised no
+    confirmation on 2.1.325;
+  - the command's own result also reads `waiting` with `dialog open` for
+    about 0.2 s, so only a dialog still open when the watch ends counts:
+    it presses Escape and reports failure.
 - The builder records both confirmations' exact text on a real session,
   backing up `~/.claude/settings.json` first and restoring it after,
   because `/model` and `/effort` rewrite it.
@@ -300,7 +302,9 @@ change) also gets "Restart the session to answer from chat."
   reply (see the slash menu below). Effort levels are low, medium, high,
   xhigh, max and auto.
 - **Current values:** the latest assistant record's `message.model`, and its
-  effort field.
+  effort field. Plan is on when the latest `permissionMode` in the
+  transcript (prompt records and `permission-mode` lines) is `plan`; a
+  hook request and the footer read by the menu update it too.
 
 **Plan.** Claude has no command that leaves plan mode, so the engine presses
 shift+tab (`BTab`) and reads the footer after each press. The footer changes
@@ -473,10 +477,9 @@ mode.
    dialog. A request without a dialog (some subagent calls) is answered
    empty at once, so behaviour stays as it is today instead of a card that
    flashes or a subagent that stalls.
-10. **Chat confirms "Change effort level?" as it confirms "Switch model?".**
-    The owner's choice covered the model and effort pickers, and both
-    confirmations come from the same Claude component, raised by the
-    command chat itself typed.
+10. **Chat confirms "Switch model?" raised by the command it typed.** The
+    owner's choice covered the model and effort pickers; `/effort` turned out
+    to apply without a confirmation on 2.1.325.
 
 ## Left to the builder
 

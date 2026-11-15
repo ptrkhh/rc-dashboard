@@ -182,6 +182,14 @@ pub fn model_effort(line: &str) -> Option<(String, Option<String>)> {
     Some((model.to_string(), v["effort"].as_str().map(String::from)))
 }
 
+/// The top-level `permissionMode` of a transcript line.
+fn permission_mode(line: &str) -> Option<String> {
+    if !line.contains(r#""permissionMode""#) {
+        return None;
+    }
+    serde_json::from_str::<Value>(line).ok()?["permissionMode"].as_str().map(String::from)
+}
+
 /// What the engine and its loop share.
 #[derive(Default)]
 struct Shared {
@@ -204,8 +212,13 @@ impl Engine for ClaudeEngine {
         match picker::route(text) {
             // A paste cannot be confirmed by the TUI; the transcript confirms it.
             picker::Route::Paste => {
+                let ours = self.shared.leftover.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                 picker::clear_leftover(&self.ctx, &self.name, self.pid, &self.shared.leftover).await;
                 let (runner, name) = (&self.ctx.runner, self.name.as_str());
+                // A Terminal draft, or text left before an agent restart, would join the message.
+                if !ours && tmux_io::capture_styled(runner, name).await.ok().and_then(|s| tmux_io::input_text(&s)).is_some_and(|t| !t.is_empty()) {
+                    return Err(rewind::DRAFT.into());
+                }
                 let (images, others): (Vec<_>, Vec<_>) = files.iter().partition(|f| f.kind == Kind::Image);
                 let body = media::with_attached(text, &others.iter().map(|f| f.path.as_path()).collect::<Vec<_>>());
                 if images.is_empty() {
@@ -631,6 +644,10 @@ async fn run(
                 let reply = lines.iter().rev().find(|l| l.contains(r#""type":"assistant""#) && !l.contains(r#""isSidechain":true"#));
                 if let Some((model, effort)) = reply.and_then(|r| model_effort(r)) {
                     (l.model, l.effort) = (Some(model), effort);
+                }
+                // Claude records its mode on prompts and `permission-mode` lines, also after a plan answered in Terminal.
+                if let Some(mode) = lines.iter().rev().filter(|l| !l.contains(r#""isSidechain":true"#)).find_map(|l| permission_mode(l)) {
+                    l.plan = Some(mode == "plan");
                 }
             }
             for line in lines {
@@ -1065,6 +1082,37 @@ pub(crate) mod tests {
             r#"{"type":"assistant","uuid":"k9","isSidechain":true,"effort":"max","message":{"id":"s9","model":"claude-fable-5-2","role":"assistant","content":[{"type":"text","text":"sub"}]}}"#, "\n"));
         let EngineMsg::Settings(s) = next_of(&mut rx, |m| matches!(m, EngineMsg::Settings(s) if s["model"] == "claude-haiku-5-5")).await else { unreachable!() };
         assert_eq!(s, json!({"model":"claude-haiku-5-5","effort":"low","plan":null,"agent":null,"variant":null}), "a subagent's reply is not the session's model");
+    }
+    #[tokio::test]
+    async fn plan_follows_the_permission_mode_claude_records() {
+        // A plan card answered in Terminal left `plan` true while the footer read bypass.
+        let (ctx, dir) = fixture_ctx("perm-mode");
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        engine.live().lock().unwrap().hold(&plan_request("p1", "# P"), std::time::Instant::now()).unwrap();
+        next_of(&mut rx, |m| matches!(m, EngineMsg::Settings(s) if s["plan"] == true)).await;
+        let t = dir.join("projects/-proj/sid-1.jsonl");
+        append(&t, "{\"type\":\"permission-mode\",\"permissionMode\":\"bypassPermissions\",\"sessionId\":\"sid-1\"}\n");
+        next_of(&mut rx, |m| matches!(m, EngineMsg::Settings(s) if s["plan"] == false)).await;
+        append(&t, concat!(r#"{"type":"user","uuid":"u9","permissionMode":"plan","message":{"role":"user","content":"make a plan"}}"#, "\n",
+                           r#"{"type":"user","uuid":"u10","isSidechain":true,"permissionMode":"default","message":{"role":"user","content":"sub"}}"#, "\n"));
+        next_of(&mut rx, |m| matches!(m, EngineMsg::Settings(s) if s["plan"] == true)).await;
+    }
+    #[tokio::test]
+    async fn a_send_onto_a_terminal_draft_is_refused_before_typing() {
+        // A `/compact` left in the box became `/compact Reply with only: k1`.
+        let (ctx, dir) = fixture_with("draft", "\u{1b}[39m❯\u{a0}/compact\u{1b}[0m");
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        assert_eq!(engine.send("Reply with only: k1", false, "c1", &[]).await, Err("Clear the Terminal input first".into()));
+        let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap_or_default();
+        assert!(!args.contains("paste-buffer") && !args.contains("send-keys"), "{args}");
+        // Dim placeholder or suggestion text is no draft.
+        let (ctx, dir) = fixture_with("no-draft", "\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"fix lint errors\"\u{1b}[0m");
+        let (engine, mut rx) = start(ctx, "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        engine.send("hello", false, "c1", &[]).await.unwrap();
+        assert!(std::fs::read_to_string(dir.join("tmux-args")).unwrap().contains("paste-buffer"));
     }
     #[tokio::test]
     async fn a_card_held_while_the_loop_is_parked_is_published_at_once() {

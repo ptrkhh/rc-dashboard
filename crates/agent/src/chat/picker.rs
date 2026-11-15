@@ -161,9 +161,9 @@ async fn run_initialize(ctx: &Arc<Ctx>, cwd: &Path) -> Result<Value, String> {
     if answer.is_object() { Ok(answer) } else { Err("no initialize response".into()) }
 }
 
-/// Claude's confirmation title for each picker command.
-// ponytail: provisional texts until Task 13 records them on a real session.
-pub const CONFIRMS: [(&str, &str); 2] = [("model", "Switch model?"), ("effort", "Change effort level?")];
+/// Claude's confirmation title for each picker command. `/model` asks only
+/// with a warm cache; `/effort` never asked on 2.1.325.
+pub const CONFIRMS: [(&str, &str); 1] = [("model", "Switch model?")];
 
 /// Footer starts and the permission mode each shows, in shift+tab order from bypass.
 const FOOTERS: [(&str, &str); 5] = [
@@ -294,22 +294,22 @@ pub async fn type_setting(ctx: &Arc<Ctx>, name: &str, pid: i32, cmd: &str, value
         if f.waiting_for.as_deref() != Some("dialog open") {
             return Err(WAITING.into());
         }
+        // The command's own result also reads `dialog open`, for about 0.2 s
+        // (`/effort` on 2.1.325); only a dialog still open at the end is unexpected.
         if let Some(title) = title {
-            // The status turns `waiting` about 10 ms before the dialog is drawn.
-            for n in 0..3 {
-                if n > 0 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                if confirm_ready(&tmux_io::capture(&ctx.runner, name).await.unwrap_or_default(), title) {
-                    return tmux_io::key(&ctx.runner, name, "Enter").await;
-                }
+            if confirm_ready(&tmux_io::capture(&ctx.runner, name).await.unwrap_or_default(), title) {
+                return tmux_io::key(&ctx.runner, name, "Enter").await;
             }
         }
-        tmux_io::escape(&ctx.runner, name).await?;
-        return Err("Claude opened an unexpected dialog; closed it".into());
     }
     match status.as_deref() {
         Some("idle" | "shell") => Ok(()),
+        Some("waiting") => {
+            let screen = tmux_io::capture(&ctx.runner, name).await.unwrap_or_default();
+            ctx.host.log.push(format!("chat /{cmd} unexpected dialog {name}:\n{screen}"));
+            tmux_io::escape(&ctx.runner, name).await?;
+            Err("Claude opened an unexpected dialog; closed it".into())
+        }
         _ => Err(format!("Claude did not confirm /{cmd}; check Terminal")),
     }
 }
@@ -475,7 +475,8 @@ esac
     fn confirm_ctx(tag: &str, screen: &str) -> (Arc<Ctx>, PathBuf) {
         let body = r#"put() { cp "$D/$1.json" "$D/sessions/.t" && mv -f "$D/sessions/.t" "$D/sessions/4242.json"; }
 case "$*" in
-  send-keys*Enter) if [ -e "$D/entered" ]; then put idle; else : > "$D/entered"; put waiting; fi ;;
+  send-keys*Enter) if [ -e "$D/entered" ]; then put idle; else : > "$D/entered"; put waiting
+                     if [ -e "$D/transient" ]; then (sleep 0.2; put idle) >/dev/null 2>&1 & fi; fi ;;
   send-keys*Escape) put idle ;;
   paste-buffer*) if [ -f "$D/pasted.json" ]; then put pasted; fi ;;
   capture-pane*) cat "$D/screen" ;;
@@ -550,6 +551,21 @@ esac
         let (ctx, dir) = confirm_ctx("busy-end", "");
         std::fs::write(dir.join("waiting.json"), idle.replace("idle", "busy")).unwrap();
         assert_eq!(type_setting(&ctx, "cdash-a", 4242, "effort", "high", &Leftover::default()).await, Err("Claude did not confirm /effort; check Terminal".into()));
+    }
+    #[tokio::test]
+    async fn a_command_whose_output_briefly_reads_as_a_dialog_succeeds_without_escape() {
+        // 2.1.325: `/effort medium` read `waiting`/`dialog open` for ~175 ms while its result was drawn, then `idle`.
+        for cmd in ["effort", "model"] {
+            let (ctx, dir) = confirm_ctx(&format!("transient-{cmd}"), "❯ /effort medium\n  ⎿  Set effort level to medium (saved as your default for new sessions)\n");
+            std::fs::write(dir.join("transient"), "").unwrap();
+            type_setting(&ctx, "cdash-a", 4242, cmd, "medium", &Leftover::default()).await.unwrap();
+            assert_eq!(sent_keys(&dir), ["send-keys -t =cdash-a: Enter"], "{cmd}: no Escape");
+        }
+    }
+    #[test]
+    fn only_model_asks_for_confirmation() {
+        // `/effort` applied with no dialog three times on 2.1.325.
+        assert_eq!(CONFIRMS.iter().map(|(c, _)| *c).collect::<Vec<_>>(), ["model"]);
     }
     #[tokio::test]
     async fn a_turn_starting_during_the_paste_gets_no_enter_and_the_box_is_cleared() {

@@ -15,7 +15,7 @@ const IDLE_WAIT: Duration = Duration::from_secs(2);
 /// How long after `idle` Claude may take to put the rewound prompt back in the box.
 const BOX_WAIT: Duration = Duration::from_secs(1);
 const FAILED: &str = "rewind failed; use Terminal";
-const DRAFT: &str = "Clear the Terminal input first";
+pub(crate) const DRAFT: &str = "Clear the Terminal input first";
 const RESUMED: &str = "Claude was resumed after a compaction and cannot rewind to before it";
 const SELECTOR_HEAD: &str = "Restore the code and/or conversation to the point before";
 const CONFIRM_HEAD: &str = "Confirm you want to restore to the point before you sent this message:";
