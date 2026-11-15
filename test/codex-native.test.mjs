@@ -514,4 +514,22 @@ test('Codex rewinds: steers are marked, chat reverts and restarts the TUI, any r
   assert.equal(after[0].t, 'hello');
   assert.notEqual(after[0].epoch, c.lines[0].epoch);
   assert.equal(after.find(l => l.t === 'ev').seq, 1);
+  assert.equal(after.find(l => l.t === 'ev' && l.ev.message?.id === 'u3').ev.src, 'steer', 'a reset keeps steers marked');
+  const [first, second] = (await f.messages()).filter(m => m.kind === 'tui');
+  assert.deepEqual(second.args, first.args, 'the restarted TUI connects the same way');
+  f.child.stdin.write('quit\n');
+  await f.wait(() => f.child.exitCode !== null);
+});
+
+test('Codex refuses to rewind while a turn is running', { timeout: 30000 }, async t => {
+  const f = await fixture(t, '', process.platform, true, { history: steered });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  await f.inject({ method: 'turn/started', params: { turn: { id: 't9' } } });
+  const uuid = c.lines.find(l => l.t === 'ev' && l.ev.message?.id === 'u2').ev.uuid;
+  c.write({ t: 'req', rid: 1, op: 'rewind', uuid, files: false });
+  const r = await res(c, 1);
+  assert.deepEqual([r.ok, r.error], [false, 'Stop the turn or wait for it to finish']);
+  assert.equal(f.rpc('thread/revert'), undefined);
 });
