@@ -1,6 +1,6 @@
 //! The WebSocket between one browser and a session's hub.
 
-use super::hub::{ClientFrame, Hub};
+use super::hub::{AsideChunk, ClientFrame, Hub};
 use super::media::Upload;
 use crate::collect::ctx::{Ctx, FocusGuard};
 use crate::collect::term::{send_or_drop, PING_EVERY};
@@ -8,6 +8,10 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc;
+
+/// This socket's running side question: its id and its answer.
+type Aside = Option<(String, mpsc::Receiver<AsideChunk>)>;
 
 /// Close code: the session ended.
 const ENDED: u16 = 4000;
@@ -16,7 +20,13 @@ const BEHIND: u16 = 4002;
 
 pub async fn serve(ctx: Arc<Ctx>, hub: Hub, name: String, after: Option<u64>, epoch: Option<String>, mut ws: WebSocket) {
     ctx.host.log.push(format!("chat open {name}"));
-    if let Some((code, reason)) = pump(&ctx, &name, &hub, after, epoch, &mut ws).await {
+    let mut aside = None;
+    let closing = pump(&ctx, &name, &hub, after, epoch, &mut ws, &mut aside).await;
+    // A side question dies with the socket that asked it.
+    if let Some((id, _)) = aside.take() {
+        hub.aside_cancel(id).await;
+    }
+    if let Some((code, reason)) = closing {
         let _ = ws.send(Message::Close(Some(CloseFrame { code, reason: reason.into() }))).await;
         // Read the browser's Close reply, as `term::bridge` does, so it sees the code.
         let drain = async { while let Some(Ok(_)) = ws.recv().await {} };
@@ -30,12 +40,35 @@ fn refused(ctx: &Ctx, name: &str, reference: &str, e: &str) -> String {
     json!({"t": "uploaded", "ref": reference, "error": e}).to_string()
 }
 
+/// The next piece of the running answer; never, when none runs. A dropped
+/// sender ends the answer as failed.
+async fn next_chunk(aside: &mut Aside) -> AsideChunk {
+    let Some((_, rx)) = aside else { return std::future::pending().await };
+    rx.recv().await.unwrap_or_else(|| AsideChunk { text: String::new(), done: true, error: Some("side question failed".into()) })
+}
+
+fn aside_frame(id: &str, c: &AsideChunk) -> String {
+    let mut v = json!({"t": "aside", "id": id, "text": c.text, "done": c.done});
+    if let Some(e) = &c.error {
+        v["error"] = json!(e);
+    }
+    v.to_string()
+}
+
 fn ends_session(f: &str) -> bool {
     f.contains("\"ended\":true")
         && serde_json::from_str::<serde_json::Value>(f).is_ok_and(|v| v["t"] == "state" && v["ended"] == true)
 }
 
-async fn pump(ctx: &Ctx, name: &str, hub: &Hub, after: Option<u64>, epoch: Option<String>, ws: &mut WebSocket) -> Option<(u16, &'static str)> {
+async fn pump(
+    ctx: &Ctx,
+    name: &str,
+    hub: &Hub,
+    after: Option<u64>,
+    epoch: Option<String>,
+    ws: &mut WebSocket,
+    aside: &mut Aside,
+) -> Option<(u16, &'static str)> {
     let Some(mut sub) = hub.subscribe(after, epoch).await else { return Some((ENDED, "session ended")) };
     let mut ended = false;
     for f in sub.backlog {
@@ -72,6 +105,16 @@ async fn pump(ctx: &Ctx, name: &str, hub: &Hub, after: Option<u64>, epoch: Optio
                 Err(RecvError::Lagged(_)) => return Some((BEHIND, "fell behind")),
                 Err(RecvError::Closed) => return Some((ENDED, "session ended")),
             },
+            c = next_chunk(aside) => {
+                let Some((id, _)) = aside.as_ref() else { continue };
+                let f = aside_frame(id, &c);
+                if c.done {
+                    *aside = None;
+                }
+                if !send_or_drop(ws, Message::Text(f.into())).await {
+                    return None;
+                }
+            }
             msg = ws.recv() => {
                 heard = true;
                 match msg {
@@ -90,6 +133,28 @@ async fn pump(ctx: &Ctx, name: &str, hub: &Hub, after: Option<u64>, epoch: Optio
                                         return None;
                                     }
                                 }
+                            }
+                            continue;
+                        }
+                        if let ClientFrame::Aside { id, text } = frame {
+                            if let Some((old, _)) = aside.take() {
+                                hub.aside_cancel(old).await;
+                            }
+                            match hub.aside(id.clone(), text).await {
+                                Ok(rx) => *aside = Some((id, rx)),
+                                Err(e) => {
+                                    let f = aside_frame(&id, &AsideChunk { text: String::new(), done: true, error: Some(e) });
+                                    if !send_or_drop(ws, Message::Text(f.into())).await {
+                                        return None;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if let ClientFrame::AsideCancel { id } = frame {
+                            if aside.as_ref().is_some_and(|(running, _)| *running == id) {
+                                *aside = None;
+                                hub.aside_cancel(id).await;
                             }
                             continue;
                         }
@@ -311,6 +376,72 @@ mod tests {
         ended.await.expect("the socket closes");
         eventually("the open upload is gone", || std::fs::read_dir(&dir).map_or(true, |d| d.count() == 0)).await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[tokio::test]
+    async fn a_side_answer_reaches_the_asking_socket_and_never_the_log() {
+        use crate::chat::claude::aside_tests::{print_lines, stub_claude, ANSWER};
+        let (b, dir) = chat_server("aside").await;
+        write_session(&dir, &format!(r#"{{"sessionId":"sid-1","cwd":"{}","status":"idle"}}"#, dir.display()));
+        crate::chat::picker::seed(&dir, json!({}));
+        stub_claude(&dir, &print_lines(ANSWER));
+        let mut ws = connect(b.addr, "name=cdash-a", None).await.unwrap();
+        let mut other = connect(b.addr, "name=cdash-a", None).await.unwrap();
+        next_of(&mut ws, "state").await;
+        next_of(&mut other, "state").await;
+        ws.send(WsMsg::Text(r#"{"t":"aside","id":"q1","text":"hi"}"#.into())).await.unwrap();
+        let mut got = Vec::new();
+        loop {
+            let f = next_json(&mut ws).await;
+            assert_ne!(f["t"], "ev", "the answer never enters the log");
+            if f["t"] == "aside" {
+                got.push(f.clone());
+                if f["done"] == true { break; }
+            }
+        }
+        assert_eq!(got, [json!({"t":"aside","id":"q1","text":"You asked about the tests.","done":false}), json!({"t":"aside","id":"q1","text":"","done":true})]);
+        other.send(WsMsg::Text(r#"{"t":"set","what":"agent","value":"x"}"#.into())).await.unwrap();
+        loop {
+            let f = next_json(&mut other).await;
+            assert_ne!(f["t"], "aside", "only the asking socket hears the answer");
+            if f["t"] == "set" { break; }
+        }
+        let log = b.ctx.host.log.lines().join("\n");
+        assert!(log.contains("chat aside cdash-a") && !log.contains(" hi") && !log.contains("tests."), "{log}");
+    }
+    #[tokio::test]
+    async fn cancelling_or_closing_the_socket_kills_the_side_question() {
+        use crate::chat::claude::aside_tests::stub_claude;
+        let (b, dir) = chat_server("aside-kill").await;
+        write_session(&dir, &format!(r#"{{"sessionId":"sid-1","cwd":"{}","status":"idle"}}"#, dir.display()));
+        crate::chat::picker::seed(&dir, json!({}));
+        let tick = dir.join("tick");
+        stub_claude(&dir, &format!("while :; do echo x >> '{}'; sleep 0.05; done", tick.display()));
+        let mut ws = connect(b.addr, "name=cdash-a", None).await.unwrap();
+        next_of(&mut ws, "state").await;
+        let pids = || b.ctx.own_pids.lock().unwrap().len();
+        for (id, close) in [("q1", r#"{"t":"aside_cancel","id":"q1"}"#), ("q2", "")] {
+            ws.send(WsMsg::Text(format!(r#"{{"t":"aside","id":"{id}","text":"why?"}}"#).into())).await.unwrap();
+            eventually("the side question runs", || pids() == 1).await;
+            if close.is_empty() {
+                drop(ws);
+                eventually("closing the socket kills it", || pids() == 0).await;
+                break;
+            }
+            ws.send(WsMsg::Text(close.into())).await.unwrap();
+            eventually("cancel kills it", || pids() == 0).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let size = || std::fs::metadata(&tick).map_or(0, |m| m.len());
+        let after = size();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(size(), after, "no process is left running");
+    }
+    #[tokio::test]
+    async fn an_answer_whose_sender_vanished_ends_as_failed() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        let c = super::next_chunk(&mut Some(("q1".into(), rx))).await;
+        assert_eq!((c.done, c.error.as_deref()), (true, Some("side question failed")));
     }
     #[tokio::test]
     async fn garbage_frames_are_ignored_and_a_bare_terminal_pane_has_no_chat() {

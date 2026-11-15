@@ -2,7 +2,7 @@
 //! file, and types through tmux.
 
 use super::asks::Cards;
-use super::hub::{place_cut, Answer, Attachment, Engine, EngineMsg, Kind, Sent, WINDOW};
+use super::hub::{place_cut, Answer, AsideChunk, Attachment, Engine, EngineMsg, Kind, Sent, WINDOW};
 use super::media;
 use super::picker;
 use super::rewind::{self, Tui};
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
@@ -36,6 +36,43 @@ const ALIVE_EVERY: Duration = Duration::from_secs(2);
 const TURN_END_GRACE: Duration = Duration::from_millis(2500);
 /// How long a pasted image path has to turn into a chip.
 pub const CHIP_WAIT: Duration = Duration::from_secs(5);
+/// The longest a side question may run.
+pub const ASIDE_MAX: Duration = Duration::from_secs(300);
+/// How long a side question that answered has to exit on its own, so it can
+/// remove its `~/.claude/sessions` file, before it is killed.
+const ASIDE_EXIT: Duration = Duration::from_secs(5);
+
+/// `claude -p` arguments for a side question: a fork of the session that is
+/// never saved, with no tools, MCP servers or hooks. The question comes last,
+/// after `--`, as one argument.
+pub fn aside_args(sid: &str, model: Option<&str>, question: &str) -> Vec<String> {
+    let mut a = vec!["-p", "--resume", sid, "--fork-session", "--no-session-persistence", "--tools", "", "--strict-mcp-config"];
+    a.extend(["--mcp-config", r#"{"mcpServers":{}}"#, "--settings", r#"{"disableAllHooks":true}"#]);
+    if let Some(m) = model {
+        a.extend(["--model", m]);
+    }
+    a.extend(["--output-format", "stream-json", "--verbose", "--", question]);
+    a.into_iter().map(String::from).collect()
+}
+
+/// One `stream-json` line as a piece of the answer: an assistant message's
+/// text, or the end on a `result`. Anything else is `None`.
+pub fn aside_chunk(line: &str) -> Option<AsideChunk> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    match v["type"].as_str()? {
+        "assistant" => {
+            let blocks = v["message"]["content"].as_array()?;
+            let text: String = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+            (!text.is_empty()).then_some(AsideChunk { text, done: false, error: None })
+        }
+        "result" => {
+            let error = (v["is_error"] == true)
+                .then(|| v["result"].as_str().filter(|r| !r.is_empty()).unwrap_or("side question failed").to_string());
+            Some(AsideChunk { text: String::new(), done: true, error })
+        }
+        _ => None,
+    }
+}
 
 /// Complete lines appended to a file since the last poll.
 pub struct Tail {
@@ -307,6 +344,58 @@ impl Engine for ClaudeEngine {
     async fn watchers(&self, n: usize) {
         self.shared.watchers.store(n, Ordering::Relaxed);
         self.shared.wake.notify_one();
+    }
+
+    /// Runs `claude -p` on a never-saved fork of the session, in the session's
+    /// folder. Dropping the receiver kills it; there is no other cancel.
+    async fn aside(&self, _id: &str, text: &str) -> Result<mpsc::Receiver<AsideChunk>, String> {
+        let (sid, cwd, model) = {
+            let l = lock(&self.live);
+            (l.sid.clone(), l.cwd.clone(), l.model.clone())
+        };
+        let (Some(sid), Some(cwd)) = (sid, cwd) else { return Err("no session yet".into()) };
+        let args = aside_args(&sid, model.as_deref(), text);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut child = self.ctx.runner.spawn_piped("claude", &args, std::path::Path::new(&cwd)).map_err(|e| e.to_string())?;
+        // An open, silent stdin costs a 3 s wait; closed, it reads as /dev/null.
+        drop(child.stdin.take());
+        let own = picker::OwnPid::new(&self.ctx, child.id().map(|p| p as i32));
+        let stdout = child.stdout.take().ok_or("no stdout")?;
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            let read = async {
+                loop {
+                    let line = tokio::select! {
+                        l = lines.next_line() => l,
+                        () = tx.closed() => return Ok(false),
+                    };
+                    let Ok(Some(line)) = line else { return Err("no answer") };
+                    if let Some(c) = aside_chunk(&line) {
+                        let done = c.done;
+                        if tx.send(c).await.is_err() {
+                            return Ok(false);
+                        }
+                        if done {
+                            return Ok(true);
+                        }
+                    }
+                }
+            };
+            // ponytail: a killed run can leave its `~/.claude/sessions/<pid>.json`; the collector skips dead pids.
+            match tokio::time::timeout(ASIDE_MAX, read).await.unwrap_or(Err("no answer in 5 minutes")) {
+                Ok(true) => {
+                    let _ = tokio::time::timeout(ASIDE_EXIT, child.wait()).await;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = tx.send(AsideChunk { text: String::new(), done: true, error: Some(e.into()) }).await;
+                }
+            }
+            drop(child); // `kill_on_drop` ends it if it still runs
+            drop(own);
+        });
+        Ok(rx)
     }
 }
 
@@ -726,7 +815,7 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.expect("no engine message within 30 s").expect("engine ended")
     }
 
-    async fn collect_until_ready(rx: &mut mpsc::Receiver<EngineMsg>) -> Vec<EngineMsg> {
+    pub(crate) async fn collect_until_ready(rx: &mut mpsc::Receiver<EngineMsg>) -> Vec<EngineMsg> {
         let mut got = Vec::new();
         loop {
             let m = next_msg(rx).await;
@@ -1137,5 +1226,99 @@ pub(crate) mod tests {
         collect_until_ready(&mut rx).await;
         let page = engine.history(1, 4).await.unwrap();
         assert_eq!(page.iter().map(|e| e["uuid"].as_str().unwrap()).collect::<Vec<_>>(), ["b1"]);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod aside_tests {
+    use super::tests::{collect_until_ready, fixture_with, write_session};
+    use super::*;
+    use crate::chat::tmux_io::tests::{eventually, install_stub};
+    use std::path::Path;
+
+    /// A stub `claude` that appends `$PWD|$*` to `<dir>/claude-args`, then runs `script`.
+    pub(crate) fn stub_claude(dir: &Path, script: &str) {
+        install_stub(dir, "claude", &format!("#!/bin/sh\nPATH=/usr/bin:/bin\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> '{}/claude-args'\n{script}\n", dir.display()));
+    }
+    pub(crate) fn print_lines(text: &str) -> String {
+        text.lines().map(|l| format!("printf '%s\\n' '{l}'\n")).collect()
+    }
+    pub(crate) const ANSWER: &str = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"You asked about the tests."}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"You asked about the tests."}"#;
+
+    /// A session whose file's `cwd` is the test folder, with that folder's command list cached so no warm-up runs the stub.
+    pub(crate) fn aside_fixture(tag: &str) -> (Arc<Ctx>, PathBuf) {
+        let (ctx, dir) = fixture_with(tag, "");
+        write_session(&dir, &format!(r#"{{"sessionId":"sid-1","cwd":"{}","status":"busy"}}"#, dir.display()));
+        picker::seed(&dir, json!({}));
+        (ctx, dir)
+    }
+
+    async fn ready(ctx: &Arc<Ctx>) -> (ClaudeEngine, mpsc::Receiver<EngineMsg>) {
+        let (engine, mut rx) = start(Arc::clone(ctx), "cdash-a".into(), 4242);
+        collect_until_ready(&mut rx).await;
+        (engine, rx)
+    }
+
+    #[test]
+    fn side_question_arguments_follow_the_spec_and_put_the_question_last() {
+        let a = aside_args("sid-1", Some("claude-opus-5-5"), "--what did I ask?");
+        assert_eq!(a, ["-p", "--resume", "sid-1", "--fork-session", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
+            "--mcp-config", r#"{"mcpServers":{}}"#, "--settings", r#"{"disableAllHooks":true}"#, "--model", "claude-opus-5-5",
+            "--output-format", "stream-json", "--verbose", "--", "--what did I ask?"]);
+        assert!(!aside_args("sid-1", None, "q").iter().any(|x| x == "--model"));
+    }
+    #[test]
+    fn stream_json_lines_become_chunks() {
+        let c = aside_chunk(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi"}]}}"#).unwrap();
+        assert_eq!((c.text.as_str(), c.done, c.error), ("Hi", false, None));
+        assert!(aside_chunk(r#"{"type":"result","subtype":"success","is_error":false,"result":"Hi"}"#).is_some_and(|c| c.done && c.text.is_empty() && c.error.is_none()));
+        assert!(aside_chunk(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"overloaded"}"#).is_some_and(|c| c.done && c.error.as_deref() == Some("overloaded")));
+        assert!(aside_chunk(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#).is_some_and(|c| c.error.as_deref() == Some("side question failed")));
+        assert!(aside_chunk(r#"{"type":"system","subtype":"init"}"#).is_none() && aside_chunk("garbage").is_none());
+    }
+    #[tokio::test]
+    async fn a_side_question_runs_claude_in_the_session_folder_and_streams_its_answer() {
+        let (ctx, dir) = aside_fixture("aside");
+        stub_claude(&dir, &print_lines(ANSWER));
+        let (engine, _rx) = ready(&ctx).await;
+        let mut answer = engine.aside("q1", "what did I ask first?").await.unwrap();
+        let first = answer.recv().await.unwrap();
+        assert_eq!((first.text.as_str(), first.done), ("You asked about the tests.", false));
+        assert!(answer.recv().await.unwrap().done);
+        let args = std::fs::read_to_string(dir.join("claude-args")).unwrap();
+        assert!(args.starts_with(&format!("{}|-p --resume sid-1 ", dir.display())) && args.trim_end().ends_with("-- what did I ask first?"), "{args}");
+        assert_eq!(args.lines().count(), 1, "one run");
+        eventually("the pid is forgotten once it exits", || ctx.own_pids.lock().unwrap().is_empty()).await;
+    }
+    #[tokio::test]
+    async fn a_stream_without_a_result_ends_with_no_answer_and_no_session_refuses() {
+        let (ctx, dir) = aside_fixture("aside-cut");
+        stub_claude(&dir, &print_lines(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Half"}]}}"#));
+        let (engine, _rx) = ready(&ctx).await;
+        let mut answer = engine.aside("q1", "why?").await.unwrap();
+        assert_eq!(answer.recv().await.unwrap().text, "Half");
+        let end = answer.recv().await.unwrap();
+        assert_eq!((end.done, end.error.as_deref()), (true, Some("no answer")));
+        lock(&engine.live).sid = None;
+        assert_eq!(engine.aside("q2", "why?").await.err().as_deref(), Some("no session yet"));
+    }
+    #[tokio::test]
+    async fn closing_the_answer_kills_the_process_and_forgets_its_pid() {
+        let (ctx, dir) = aside_fixture("aside-kill");
+        let tick = dir.join("tick");
+        stub_claude(&dir, &format!("while :; do echo x >> '{}'; sleep 0.05; done", tick.display()));
+        let (engine, _rx) = ready(&ctx).await;
+        let answer = engine.aside("q1", "why?").await.unwrap();
+        let size = || std::fs::metadata(&tick).map_or(0, |m| m.len());
+        eventually("the process runs", || size() > 0).await;
+        assert_eq!(ctx.own_pids.lock().unwrap().len(), 1, "registered while it runs");
+        drop(answer);
+        eventually("the pid is forgotten", || ctx.own_pids.lock().unwrap().is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = size();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(size(), after, "the process is dead");
     }
 }

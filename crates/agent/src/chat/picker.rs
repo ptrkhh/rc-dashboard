@@ -122,9 +122,18 @@ async fn load(ctx: &Arc<Ctx>, cwd: &Path) -> Result<Value, String> {
 }
 
 /// Registers a pid in `Ctx.own_pids` until dropped.
-struct OwnPid<'a>(&'a Ctx, Option<i32>);
+pub(crate) struct OwnPid(Arc<Ctx>, Option<i32>);
 
-impl Drop for OwnPid<'_> {
+impl OwnPid {
+    pub(crate) fn new(ctx: &Arc<Ctx>, pid: Option<i32>) -> Self {
+        if let Some(p) = pid {
+            ctx.own_pids.lock().unwrap_or_else(|e| e.into_inner()).insert(p);
+        }
+        Self(Arc::clone(ctx), pid)
+    }
+}
+
+impl Drop for OwnPid {
     fn drop(&mut self) {
         if let Some(p) = self.1 {
             self.0.own_pids.lock().unwrap_or_else(|e| e.into_inner()).remove(&p);
@@ -135,11 +144,7 @@ impl Drop for OwnPid<'_> {
 async fn run_initialize(ctx: &Arc<Ctx>, cwd: &Path) -> Result<Value, String> {
     let args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--settings", r#"{"disableAllHooks":true}"#];
     let mut child = ctx.runner.spawn_piped("claude", &args, cwd).map_err(|e| e.to_string())?;
-    let pid = child.id().map(|p| p as i32);
-    if let Some(p) = pid {
-        ctx.own_pids.lock().unwrap_or_else(|e| e.into_inner()).insert(p);
-    }
-    let _own = OwnPid(ctx, pid);
+    let _own = OwnPid::new(ctx, child.id().map(|p| p as i32));
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
     let mut lines = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
     let req = json!({"type": "control_request", "request_id": "1", "request": {"subtype": "initialize"}});

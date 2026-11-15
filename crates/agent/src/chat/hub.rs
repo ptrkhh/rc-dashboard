@@ -166,6 +166,8 @@ enum Cmd {
     Client { frame: ClientFrame, reply: oneshot::Sender<Option<Frame>> },
     Upload { id: String, a: Attachment },
     Folder { reply: oneshot::Sender<Option<String>> },
+    Aside { id: String, text: String, reply: oneshot::Sender<Result<mpsc::Receiver<AsideChunk>, String>> },
+    AsideCancel { id: String },
 }
 
 #[derive(Clone)]
@@ -245,7 +247,8 @@ impl Hub {
     }
 
     /// The reply for `send`, `page`, `answer`, `set`, `menu`, `rewind` and
-    /// `rewind_undo`; `None` for the rest (`ws.rs` routes `aside` itself).
+    /// `rewind_undo`; `None` for the rest (`ws.rs` routes `aside` through
+    /// [`Hub::aside`]).
     pub async fn command(&self, frame: ClientFrame) -> Option<Frame> {
         let (reply, rx) = oneshot::channel();
         self.cmds.send(Cmd::Client { frame, reply }).await.ok()?;
@@ -263,6 +266,17 @@ impl Hub {
         let (reply, rx) = oneshot::channel();
         self.cmds.send(Cmd::Folder { reply }).await.ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// Asks a side question; its answer goes only to the caller.
+    pub async fn aside(&self, id: String, text: String) -> Result<mpsc::Receiver<AsideChunk>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmds.send(Cmd::Aside { id, text, reply }).await.map_err(|_| "session ended")?;
+        rx.await.unwrap_or_else(|_| Err("session ended".into()))
+    }
+
+    pub async fn aside_cancel(&self, id: String) {
+        let _ = self.cmds.send(Cmd::AsideCancel { id }).await;
     }
 
     pub fn is_closed(&self) -> bool {
@@ -441,6 +455,10 @@ impl<E: Engine> Actor<E> {
                     Some(Cmd::Folder { reply }) => {
                         let _ = reply.send(self.usage["cwd"].as_str().map(String::from));
                     }
+                    Some(Cmd::Aside { id, text, reply }) => {
+                        let _ = reply.send(self.aside(&id, &text).await);
+                    }
+                    Some(Cmd::AsideCancel { id }) => self.engine.aside_cancel(&id).await,
                     // Every handle was dropped; nobody can reach this hub.
                     None => return,
                 },
@@ -715,6 +733,20 @@ impl<E: Engine> Actor<E> {
             }
             ClientFrame::Aside { .. } | ClientFrame::AsideCancel { .. } => None,
         }
+    }
+
+    /// A side question reaches the engine and nothing else: no log, no queue.
+    async fn aside(&self, id: &str, text: &str) -> Result<mpsc::Receiver<AsideChunk>, String> {
+        let text = sanitize(text)?;
+        if self.ended {
+            return Err("session ended".into());
+        }
+        let r = self.engine.aside(id, &text).await;
+        match &r {
+            Ok(_) => self.log.push(format!("chat aside {}", self.name)),
+            Err(e) => self.log.push(format!("chat aside failed {}: {e}", self.name)),
+        }
+        r
     }
 
     /// Why the conversation may not be rewound now: only an idle session that
@@ -1013,6 +1045,17 @@ mod tests {
         async fn rewind_undo(&self) -> Result<(), String> {
             self.calls.lock().unwrap().push("undo".into());
             Ok(())
+        }
+        /// Answers `re: <text>`, then `done`.
+        async fn aside(&self, id: &str, text: &str) -> Result<mpsc::Receiver<AsideChunk>, String> {
+            self.calls.lock().unwrap().push(format!("aside:{id}:{text}"));
+            let (tx, rx) = mpsc::channel(2);
+            tx.try_send(AsideChunk { text: format!("re: {text}"), done: false, error: None }).unwrap();
+            tx.try_send(AsideChunk { text: String::new(), done: true, error: None }).unwrap();
+            Ok(rx)
+        }
+        async fn aside_cancel(&self, id: &str) {
+            self.calls.lock().unwrap().push(format!("aside_cancel:{id}"));
         }
     }
 
@@ -1773,6 +1816,33 @@ mod tests {
         settle().await;
         assert_eq!(reply(hub.command(ClientFrame::RewindUndo).await), json!({"t":"rewound","uuid":null,"ok":true}));
         assert_eq!(*calls.lock().unwrap(), ["undo"]);
+    }
+
+    #[tokio::test]
+    async fn a_side_question_never_touches_the_log_or_the_queue() {
+        let (hub, tx, calls) = rig();
+        log6(&tx).await;
+        tx.send(engine_status(true, false)).await.unwrap();
+        settle().await;
+        assert_eq!(reply(hub.command(send("c1", "later")).await)["status"], "held");
+        let before = last_state(&hub.subscribe(None, None).await.unwrap());
+        let mut sub = hub.subscribe(None, None).await.unwrap();
+        let mut rx = hub.aside("q1".into(), "  why?\u{1b}  ".into()).await.unwrap();
+        let first = rx.recv().await.unwrap();
+        assert_eq!((first.text.as_str(), first.done), ("re: why?", false), "sanitised, then passed through");
+        assert!(rx.recv().await.unwrap().done);
+        assert_eq!(hub.aside("q2".into(), " \n ".into()).await.err().as_deref(), Some("empty message"));
+        hub.aside_cancel("q1".into()).await;
+        settle().await;
+        assert!(frames(&mut sub).is_empty(), "no frame reaches the hub's clients");
+        let after = hub.subscribe(None, None).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&after.backlog[0]).unwrap()["head"], 6);
+        assert_eq!((last_state(&after)["held"].clone(), before["held"][0]["text"].as_str()), (before["held"].clone(), Some("later")));
+        assert_eq!(*calls.lock().unwrap(), ["aside:q1:why?", "aside_cancel:q1"]);
+        tx.send(EngineMsg::Ended).await.unwrap();
+        settle().await;
+        assert_eq!(hub.aside("q3".into(), "why?".into()).await.err().as_deref(), Some("session ended"));
+        assert_eq!(calls.lock().unwrap().len(), 2, "an ended session never reaches the engine");
     }
 
     #[tokio::test]
