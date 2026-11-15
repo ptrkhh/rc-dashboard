@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 /// Ceiling for list and count outputs.
 const SMALL_MAX: usize = 16 * 1024 * 1024;
 pub const DIFF_MAX: usize = 2 * 1024 * 1024;
+const WITHHELD_FILTER: &str = "This repo's git config has a filter the dashboard can't switch off safely, so its changes aren't shown.";
+const WITHHELD_GIT: &str = "git couldn't compute this folder's changes.";
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// Prefix of every git call. Repo config must never run code.
 const SAFE: [&str; 6] = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat"];
@@ -47,27 +49,38 @@ async fn small(runner: &Runner, folder: &str, over: &[String], rest: &[&str]) ->
 /// (`-c` splits at the first `=`, so a name containing `=` is out of reach).
 /// Global and system filters stay: they belong to the owner (git-lfs).
 async fn filter_overrides(runner: &Runner, folder: &str) -> Result<Vec<String>, ()> {
-    let c = run(runner, folder, &[], &["config", "-z", "--show-scope", "--get-regexp", r"^filter\..*\.(clean|process)$"], SMALL_MAX)
+    let c = run(runner, folder, &[], &["config", "-z", "--show-scope", "--get-regexp", r"^filter\..*\.(clean|process|required)$"], SMALL_MAX)
         .await
         .map_err(|_| ())?;
     if c.truncated || !matches!(c.code, Some(0 | 1)) {
         return Err(());
     }
-    let mut names = std::collections::BTreeSet::new();
+    let (mut all, mut code) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
     // With -z the entries alternate: "<scope>", then "<key>\n<value>".
     let mut it = c.out.split('\0');
     while let (Some(scope), Some(entry)) = (it.next(), it.next()) {
         let key = entry.split_once('\n').map_or(entry, |(k, _)| k);
-        if scope != "local" && scope != "worktree" {
+        // Fail closed: only the owner's own scopes are trusted.
+        if scope == "system" || scope == "global" {
             continue;
         }
-        let name = key.strip_prefix("filter.").and_then(|k| k.rsplit_once('.')).map(|(n, _)| n).ok_or(())?;
+        let (name, var) = key.strip_prefix("filter.").and_then(|k| k.rsplit_once('.')).ok_or(())?;
         if name.contains('=') {
             return Err(());
         }
-        names.insert(name.to_string());
+        all.insert(name.to_string());
+        if var != "required" {
+            code.insert(name.to_string());
+        }
     }
-    Ok(names.iter().flat_map(|n| ["-c".to_string(), format!("filter.{n}.clean="), "-c".to_string(), format!("filter.{n}.process=")]).collect())
+    // A required filter whose clean is emptied would make git fail, so it stops being required.
+    let off = all.iter().flat_map(|n| ["-c".to_string(), format!("filter.{n}.required=false")]);
+    let empty = code.iter().flat_map(|n| ["-c".to_string(), format!("filter.{n}.clean="), "-c".to_string(), format!("filter.{n}.process=")]);
+    Ok(off.chain(empty).collect())
+}
+
+fn withheld(folder: &str, why: &str) -> Value {
+    json!({ "folder": folder, "repo": true, "files": [], "truncated": false, "withheld": why })
 }
 
 pub async fn diff(runner: &Runner, folder: &str) -> Value {
@@ -78,15 +91,7 @@ pub async fn diff(runner: &Runner, folder: &str) -> Value {
         return none(folder, false);
     }
     let Ok(over) = filter_overrides(runner, folder).await else {
-        // A filter we cannot switch off: list the files from the index and the
-        // folder alone (no diff runs) and withhold every count and patch.
-        let listed = small(runner, folder, &[], &["ls-files", "-z", "--cached", "--others", "--exclude-standard"]).await.unwrap_or_default();
-        let others = small(runner, folder, &[], &["ls-files", "-z", "--others", "--exclude-standard"]).await.unwrap_or_default();
-        let untracked: std::collections::HashSet<&str> = others.split('\0').collect();
-        let files: Vec<Value> = listed.split('\0').filter(|p| !p.is_empty()).map(|p| {
-            json!({ "path": p, "status": if untracked.contains(p) { "untracked" } else { "modified" }, "additions": null, "deletions": null, "patch": null })
-        }).collect();
-        return json!({ "folder": folder, "repo": true, "files": files, "truncated": true });
+        return withheld(folder, WITHHELD_FILTER);
     };
     macro_rules! small {
         ($rest:expr) => {
@@ -96,8 +101,9 @@ pub async fn diff(runner: &Runner, folder: &str) -> Value {
     let base = if small!(&["rev-parse", "--verify", "-q", "HEAD"]).await.is_ok() { "HEAD" } else { EMPTY_TREE };
     let with_base = |extra: &[&'static str]| -> Vec<&str> { d(extra).into_iter().chain([base]).collect() };
 
-    let status = small!(&with_base(&["--name-status", "-z"])).await.unwrap_or_default();
-    let counts = small!(&with_base(&["--numstat", "-z"])).await.unwrap_or_default();
+    let (Ok(status), Ok(counts)) = (small!(&with_base(&["--name-status", "-z"])).await, small!(&with_base(&["--numstat", "-z"])).await) else {
+        return withheld(folder, WITHHELD_GIT);
+    };
     let mut st = status.split('\0');
     let mut cs = counts.split('\0');
     let mut files: Vec<Value> = Vec::new();
@@ -350,10 +356,31 @@ mod tests {
         write(&d, "u.txt", "u\n");
         let v = diff(&runner(), d.to_str().unwrap()).await;
         assert!(!marker.exists());
-        let files = v["files"].as_array().unwrap();
-        assert!(files.iter().any(|f| f["path"] == "u.txt" && f["status"] == "untracked"), "{v}");
-        assert!(files.iter().all(|f| f["patch"].is_null() && f["additions"].is_null()), "{v}");
-        assert_eq!(v["truncated"], json!(true));
+        assert_eq!(v, json!({ "folder": d.to_str().unwrap(), "repo": true, "files": [], "truncated": false, "withheld": WITHHELD_FILTER }));
+    }
+
+    #[tokio::test]
+    async fn a_required_local_filter_with_a_hostile_clean_still_lists_every_change() {
+        let d = repo("required");
+        let marker = d.join("PWNED");
+        git(&d, &["config", "filter.gc.clean", &format!("touch {}", marker.display())]);
+        git(&d, &["config", "filter.gc.required", "true"]);
+        write(&d, ".gitattributes", "*.txt filter=gc\n");
+        write(&d, "a.txt", "one\nTWO\n");
+        write(&d, "gone.txt", "BYE\n");
+        let v = diff(&runner(), d.to_str().unwrap()).await;
+        assert!(!marker.exists(), "repo config ran code");
+        assert_eq!(rows(&v).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["a.txt", "gone.txt", ".gitattributes"], "{v}");
+        assert!(v.get("withheld").is_none(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_status_call_is_withheld_not_reported_as_no_changes() {
+        let d = plain("failing");
+        let script = "#!/bin/sh\ncase \"$*\" in\n*rev-parse*--is-inside-work-tree*) echo true;;\n*name-status*) exit 128;;\nesac\n";
+        let r = Runner::new(install_stub(&d, "git", script), Arc::new(LogBuffer::new()));
+        let v = diff(&r, d.to_str().unwrap()).await;
+        assert_eq!(v, json!({ "folder": d.to_str().unwrap(), "repo": true, "files": [], "truncated": false, "withheld": WITHHELD_GIT }));
     }
 
     #[tokio::test]
