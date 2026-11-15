@@ -187,6 +187,10 @@ async fn embedded_asset(uri: OriginalUri, req: axum::http::HeaderMap) -> Respons
             "text/javascript; charset=utf-8",
             include_bytes!("../../../../public/chat/highlight.js"),
         ),
+        "chat/sheets.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../../../public/chat/sheets.js"),
+        ),
         "chat/md.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("../../../../public/chat/md.js"),

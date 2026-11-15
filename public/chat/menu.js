@@ -6,6 +6,8 @@
   const $ = s => document.querySelector(s);
   const el = (...a) => g.cdashCards.el(...a);
   const MAX = 50;
+  // Every tool gets it: chat answers it in the side sheet (cdashSheets), never in the session.
+  const BTW = { name: 'btw', description: 'Ask aside: answered in a side sheet, never added to the conversation', hint: '<question>' };
   const ui = { send: null, get: null, asked: false, sel: 0, closed: false, list: [], saving: false, sentReply: null, sheetSig: '' };
 
   // "/co" lists commands starting with "co"; once arguments start the menu closes.
@@ -34,7 +36,7 @@
     const box = $('#chat-menu');
     const text = $('#chat-input').value;
     const typing = !!s && !ui.closed && /^\/\S*$/.test(text);
-    ui.list = typing && s.menu ? filter(s.menu.commands, text) : [];
+    ui.list = typing && s.menu ? filter([BTW, ...s.menu.commands], text) : [];
     ui.sel = Math.min(ui.sel, Math.max(0, ui.list.length - 1));
     box.textContent = '';
     box.hidden = !(ui.list.length || (typing && !s.menu));

@@ -520,13 +520,14 @@ test('pin keeps keyboard focus unless the user focuses something else while savi
 test('chat scripts load before app.js and the chat markup exists', () => {
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const at = s => html.indexOf(s);
-  for (const f of ['chat/md.js', 'chat/store.js', 'chat/cards.js', 'chat/menu.js', 'chat/attach.js', 'chat/view.js']) {
+  for (const f of ['chat/highlight.js', 'chat/md.js', 'chat/store.js', 'chat/cards.js', 'chat/menu.js', 'chat/sheets.js', 'chat/attach.js', 'chat/view.js']) {
     assert.ok(at(`<script src="${f}"></script>`) > 0 && at(`<script src="${f}"></script>`) < at('<script src="app.js"></script>'), f);
   }
-  for (const id of ['chat', 'chat-log', 'chat-cards', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'chat-chip', 'chat-menu', 'chat-settings', 'notify-toggle', 'chat-attach', 'chat-file', 'chat-atts', 'chat-viewer', 'chat-viewer-img', 'chat-todo', 'chat-hint'])
+  for (const id of ['chat', 'chat-log', 'chat-cards', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'chat-chip', 'chat-menu', 'chat-settings', 'notify-toggle', 'chat-attach', 'chat-file', 'chat-atts', 'chat-viewer', 'chat-viewer-img', 'chat-todo', 'chat-hint', 'chat-changes', 'chat-usage', 'chat-running'])
     assert.ok(html.includes(`id="${id}"`), id);
   assert.ok(/id="chat"[^>]*\shidden/.test(html), 'chat starts hidden');
   assert.ok(at('<script src="chat/attach.js"></script>') < at('<script src="chat/view.js"></script>'));
+  assert.ok(/id="chat-running"[^>]*\shidden/.test(html), 'the running button starts hidden');
   assert.ok(at('id="chat-menu"') < at('id="chat-atts"') && at('id="chat-atts"') < at('id="chat-form"'), 'menu, then chips, then the form');
 });
 test('attachments never become markup', () => {
@@ -539,7 +540,7 @@ test('the desktop app lets dropped files reach the page', () => {
   assert.equal(conf.app.windows[0].dragDropEnabled, false);
 });
 test('the chat view never builds markup from conversation text', () => {
-  for (const f of ['view.js', 'cards.js']) {
+  for (const f of ['view.js', 'cards.js', 'sheets.js']) {
     const view = readFileSync(new URL('../public/chat/' + f, import.meta.url), 'utf8');
     const uses = view.match(/\.innerHTML\s*=[^;]*;/g) || [];
     assert.ok(uses.length > 0 && uses.every(u => /cdashMd\.render\(|=\s*''/.test(u)), f + uses.join('\n'));
@@ -717,4 +718,12 @@ test('one rewind or undo at a time, a caret not after the code wrapper, and keyb
   assert.ok(!/MARK\[/.test(view) || /Object\.hasOwn\(MARK/.test(view), 'MARK is looked up as own keys only');
   const css = readFileSync(new URL('../public/style.css', import.meta.url), 'utf8');
   for (const rule of css.match(/[^{}]*streaming[^{}]*::after[^{}]*\{/g) || []) assert.ok(rule.includes(':not(.chat-code)') || rule.includes('.chat-code'), rule);
+});
+
+test('/btw opens the side sheet and is never sent; the menu offers it; aside frames reach the sheets', () => {
+  const view = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
+  const submit = view.slice(view.indexOf("$('#chat-form').addEventListener('submit'"), view.indexOf("input.addEventListener('keydown'"));
+  assert.ok(submit.indexOf('cdashSheets.btw(') > 0 && submit.indexOf('cdashSheets.btw(') < submit.indexOf('submitText('), submit);
+  assert.match(view, /cdashSheets\.onFrame\(/);
+  assert.match(readFileSync(new URL('../public/chat/menu.js', import.meta.url), 'utf8'), /name: 'btw'/);
 });

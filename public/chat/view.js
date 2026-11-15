@@ -72,6 +72,9 @@
     });
     cdashMenu.wire(sendFrame, () => c?.state ?? null);
     $('#chat-sheet-close').addEventListener('click', () => $('#chat-sheet').close());
+    $('#chat-changes').addEventListener('click', () => { if (c) cdashSheets.openDiff(c); });
+    $('#chat-usage').addEventListener('click', () => { if (c) cdashSheets.openUsage(c); });
+    $('#chat-running').addEventListener('click', () => { if (c) cdashSheets.openRunning(c); });
     log.addEventListener('click', e => {
       const b = e.target.closest('[data-edit],[data-again],[data-dismiss]');
       if (!b || !c) return;
@@ -100,6 +103,16 @@
       e.preventDefault();
       if (!c) return;
       const text = input.value.trim();
+      // A side question: answered in its sheet, never sent to the session.
+      const q = cdashSheets.btw(text);
+      if (q !== null) {
+        input.value = '';
+        saveDraft();
+        grow();
+        renderComposer();
+        cdashSheets.openAside(c, q);
+        return;
+      }
       const mode = composerMode(c.state, pending(c.state));
       const u = c.uploads;
       if (mode === 'off') return;
@@ -152,8 +165,9 @@
     $('#chat').hidden = false;
     $('#chat-input').value = opts.store.get(draftKey()) || '';
     grow();
-    c.clock = setInterval(() => { if (c?.state.working) renderStatus(); }, 1000);
+    c.clock = setInterval(() => { if (!c) return; if (c.state.working) renderStatus(); cdashSheets.refresh(c); }, 1000);
     const x = c;
+    x.send = f => c === x && sendFrame(f);  // for the sheets: never onto a later chat's socket
     // Read the socket per call: a reconnect replaces x.ws.
     x.uploads = new cdashAttach.Uploads({
       send: d => { if (x.ws?.readyState !== WebSocket.OPEN) return false; x.ws.send(d); return true; },
@@ -203,6 +217,7 @@
       try { f = JSON.parse(e.data); } catch { return; }
       if (f.t === 'uploaded') { x.uploads.onFrame(f); return; }
       if (f.t === 'rewound') { rewound(f); return; }
+      if (f.t === 'aside') { cdashSheets.onFrame(x, f); return; }
       if (f.t === 'hello') { x.attempt = 0; x.link = ''; ws.send(JSON.stringify({ t: 'focus', on: focusNow() })); }
       if (f.t === 'page') { x.paging = false; x.paged = true; }
       const wasWorking = x.state.working;
@@ -220,6 +235,7 @@
       x.paging = false;
       x.uploads.lost();
       if (x.rewinding) { x.rewinding.disabled = false; x.rewinding = null; }  // the reply went with the socket
+      cdashSheets.lost(x);
       if (e.code === 4000) { x.done = true; x.link = ''; schedule(); return; }
       if (e.code === 4002) { connect(); return; } // fell behind: catch up from the last position now
       retry(x);
@@ -512,6 +528,7 @@
     renderStatus();
     renderBanner();
     renderTodo();
+    cdashSheets.refresh(x);
     const hint = $('#chat-hint');
     hint.textContent = x.hint;
     hint.hidden = !x.hint;
@@ -660,12 +677,28 @@
         : typeof input.file_path === 'string' && Object.keys(input).length === 1 ? input.file_path
         : JSON.stringify(input, null, 2);
       sec.append(labelled(el('h3', 'chat-call-name'), cdashChatStore.toolLabel(call.name, input, call.done)));
-      sec.append(el('pre', 'chat-call-input', shown));
+      const d = cdashChatStore.editDiff(call);
+      if (d) sec.append(editLines(d));
+      else sec.append(el('pre', 'chat-call-input', shown));
       if (call.done) sec.append(el('pre', 'chat-call-result' + (call.error ? ' error' : ''), call.result || '(no output)'));
       else sec.append(el('p', 'chat-call-wait', 'Running…'));
       body.append(sec);
     }
     $('#chat-sheet').showModal();
+  }
+
+  // An edit as a diff: per file "path +A −D", then its lines as text.
+  const DIFF_CLS = { '+': 'diff-add', '-': 'diff-del' };
+  function editLines(d) {
+    const box = el('div', 'chat-edit');
+    for (const f of d.files) {
+      const n = t => f.lines.length ? f.lines.filter(l => l.t === t).length : f[t === '+' ? 'add' : 'del'] ?? 0;
+      box.append(el('div', 'chat-diff-head', (f.path ?? '') + ' +' + n('+') + ' \u2212' + n('-')));
+      const lines = el('div', 'chat-diff');
+      for (const l of f.lines) lines.append(el('div', DIFF_CLS[l.t] ?? 'diff-ctx', l.t + l.s));
+      box.append(lines);
+    }
+    return box;
   }
 
   // Focus: a page counts only while visible, focused and used in the last two minutes.
