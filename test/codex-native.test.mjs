@@ -591,8 +591,12 @@ test('a revert drops the plan card, a long task title is clipped, and one answer
   await f.inject({ method: 'item/completed', params: { threadId: sid, turnId: 't5', item: { id: 'p1', type: 'plan', text: '# Plan' } } });
   await f.inject({ method: 'turn/completed', params: { threadId: sid, turn: { id: 't5', status: 'completed' } } });
   await until(() => asksNow(c).length === 1);
+  await f.inject({ method: 'thread/tokenUsage/updated', params: { threadId: sid, tokenUsage: { total: { inputTokens: 9, outputTokens: 1, cachedInputTokens: 0 }, last: { totalTokens: 5000 }, modelContextWindow: 100000 } } });
+  await until(() => c.lines.findLast(l => l.t === 'usage')?.usage.context?.used === 5000);
   await f.inject({ method: 'thread/reverted', params: { threadId: sid } });
   await until(() => asksNow(c).length === 0);
+  await until(() => c.lines.findLast(l => l.t === 'usage').usage.context === null);
+  assert.equal(c.lines.findLast(l => l.t === 'usage').usage.tokens.input, 9, 'tokens spent stay spent');
   await f.inject({ method: 'item/started', params: { threadId: sid, turnId: 't6', item: { id: 'x1', type: 'commandExecution', source: 'unifiedExecStartup', command: 'cat <<EOF\n' + 'y'.repeat(500), status: 'inProgress' } } });
   await until(() => c.lines.findLast(l => l.t === 'tasks')?.tasks.length === 1);
   assert.equal(c.lines.findLast(l => l.t === 'tasks').tasks[0].title.length, 80);

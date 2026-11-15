@@ -903,6 +903,7 @@ async function nativeLauncher(statePath, state, script) {
   const reread = () => {
     for (const id of asks.keys()) if (id.startsWith('implement:')) { asks.delete(id); feed.dropAsk(id); } // the plan may be gone
     lastPlan = null;
+    if (usage.context) { usage = { ...usage, context: null }; feed.setUsage(usage); } // Codex resends no usage on a revert; the next turn refills it
     feed.reset();
     firstOf.clear(); prompts.clear();
     for (const [id, t] of running) if (t.kind === 'shell') running.delete(id); // a revert kills background terminals
