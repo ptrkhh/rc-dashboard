@@ -168,7 +168,7 @@ else {
 
 // A supervisor over a fake OpenCode server that also serves the chat feed's
 // reads (messages, forms, permissions) and records prompts and interrupts.
-async function fixture(t, { flakyMessages = false, withFiles = '', mediaDir = null } = {}) {
+async function fixture(t, { flakyMessages = false, withFiles = '', mediaDir = null, rows: testRows = null } = {}) {
   const { readFileSync, existsSync } = await import('node:fs');
   const { rename } = await import('node:fs/promises');
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-chat-'));
@@ -181,7 +181,7 @@ const log=x=>fs.appendFileSync(process.env.CDASH_TEST_LOG,JSON.stringify(x)+'\\n
 if(process.argv.includes('--server')) {log({kind:'tui',pid:process.pid}); process.stdin.resume();setInterval(()=>{},1000);}
 else {
  log({kind:'server',pid:process.pid});
- const streams=new Set();
+ const streams=new Set();let revert=null;
  setInterval(()=>{const m=process.env.CDASH_TEST_MARKER;if(fs.existsSync(m)){const e=fs.readFileSync(m,'utf8');fs.unlinkSync(m);for(const s of streams)s.write('data: '+e+'\\n\\n');}},30);
  const send=(res,data)=>res.end(JSON.stringify(data));
  const server=http.createServer(async(req,res)=>{let raw='';for await(const c of req)raw+=c;const body=raw?JSON.parse(raw):null;const path=req.url.split('?')[0];log({kind:'api',method:req.method,path,body});
@@ -190,8 +190,11 @@ else {
  if(path==='/api/session'&&req.method==='POST')return send(res,{data:{id:'ses_fixture'}});
  if(path==='/api/session/ses_fixture/message'&&process.env.CDASH_TEST_FLAKY&&!fs.existsSync(process.env.CDASH_TEST_FLAKY)){fs.writeFileSync(process.env.CDASH_TEST_FLAKY,'1');return send(res,{data:'broken'});}
  if(path==='/api/session/ses_fixture/message'&&fs.existsSync(process.env.CDASH_TEST_FAILMSG)){fs.unlinkSync(process.env.CDASH_TEST_FAILMSG);return send(res,{data:'broken'});}
+ if(path.endsWith('/revert/stage')){revert={messageID:body.messageID};return send(res,{data:revert});}
+ if(path.endsWith('/revert')&&req.method==='DELETE'){revert=null;res.writeHead(204);return res.end();}
  const rowFiles=process.env.CDASH_TEST_FILES==='bad'?[{data:'AAAA',mime:'image/png',name:'x.png'},{mime:'image/png'},'junk',null,{data:5,mime:'application/pdf'}]:[{data:'${PNG.toString('base64')}',mime:'image/png',name:'a.png',source:{type:'inline'}},{data:'${PDF.toString('base64')}',mime:'application/pdf',name:'r.pdf',source:{type:'uri',uri:'file:///x/r.pdf'}}];
  const extra=process.env.CDASH_TEST_FILES?[{id:'msg_f',type:'user',text:'see\\nAttached: /h/.cache/cdash/uploads/cdash-fixture/0123456789abcdef/n.txt',files:rowFiles}]:[];
+ if(path==='/api/session/ses_fixture/message'&&process.env.CDASH_TEST_ROWS)return send(res,{data:JSON.parse(process.env.CDASH_TEST_ROWS),cursor:{}});
  if(path==='/api/session/ses_fixture/message')return send(res,{data:[{id:'msg_u',type:'user',text:'hello'},{id:'msg_a',type:'assistant',time:{completed:1},content:[{type:'text',text:'hi there'}]},...extra],cursor:{}});
  if(path.includes('/form/')&&path.endsWith('/reply')){res.writeHead(path.includes('/frm_done/')?409:204);return res.end();}
  if(path==='/api/command')return send(res,{data:[{name:'review',description:'Review changes'}]});
@@ -201,14 +204,14 @@ else {
  if(path.endsWith('/form')||path.endsWith('/permission'))return send(res,{data:[]});
  if(path.endsWith('/prompt'))return send(res,{data:{id:body.id,sessionID:'ses_fixture',type:'user'}});
  if(path.endsWith('/interrupt'))return send(res,{data:true});
- return send(res,{data:{id:'ses_fixture',metadata:{cdash_owner:true},time:{},model:{id:'model',providerID:'fixture'}}});});
+ return send(res,{data:{id:'ses_fixture',metadata:{cdash_owner:true},time:{},model:{id:'model',providerID:'fixture'},...(revert&&{revert})}});});
  server.listen(0,'127.0.0.1',()=>console.log(JSON.stringify({url:'http://127.0.0.1:'+server.address().port})));
  process.stdin.resume();process.stdin.on('end',()=>server.closeAllConnections()||server.close());
 }
 `, { mode: 0o700 });
   await writeFile(join(dir, 'claude'), `#!${process.execPath}\nprocess.exit(1);`, { mode: 0o700 });
   const child = spawn(process.execPath, [resolve('crates/agent/src/collect/opencode-remote.mjs'), '--state', state, '--name', 'cdash-fixture'], {
-    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_MEDIA_DIR: mediaDir ?? join(dir, 'media'), ...(withFiles && { CDASH_TEST_FILES: withFiles === true ? '1' : withFiles }), CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_MEDIA_DIR: mediaDir ?? join(dir, 'media'), ...(testRows && { CDASH_TEST_ROWS: JSON.stringify(testRows) }), ...(withFiles && { CDASH_TEST_FILES: withFiles === true ? '1' : withFiles }), CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   let output = '';
   child.stdout.on('data', b => { output += b; });
@@ -227,6 +230,7 @@ else {
     dir, wait, output: () => output,
     native: () => { try { return JSON.parse(readFileSync(join(dir, 'pane.native'), 'utf8')); } catch { return undefined; } },
     posted: suffix => rows().filter(r => r.kind === 'api' && r.method === 'POST' && r.path.endsWith(suffix)).at(-1)?.body,
+    deleted: suffix => rows().some(r => r.kind === 'api' && r.method === 'DELETE' && r.path.endsWith(suffix)),
     emit: async event => {
       await wait(() => !existsSync(marker));
       await writeFile(marker + '.tmp', JSON.stringify(event));
@@ -403,4 +407,32 @@ test('an unwritable media folder or a malformed data part gives chips, and the s
     await until(() => c.lines.some(l => l.t === 'ready'));
     c.close();
   }
+});
+
+const four = [{ id: 'msg_01', type: 'user', text: 'hello' }, { id: 'msg_02', type: 'assistant', time: { completed: 1 }, content: [{ type: 'text', text: 'hi there' }] },
+  { id: 'msg_03', type: 'user', text: 'second' }, { id: 'msg_04', type: 'assistant', time: { completed: 2 }, content: [{ type: 'text', text: 'ok' }] }];
+test('OpenCode rewinds: stage from chat, show it as staged with Undo, and follow reverts made anywhere', { timeout: 20000 }, async t => {
+  const f = await fixture(t, { rows: four });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const u2 = c.lines.find(l => l.t === 'ev' && l.ev.message?.id === 'msg_03').ev.uuid;
+  c.write({ t: 'req', rid: 1, op: 'rewind', uuid: u2, files: true });
+  await until(() => c.lines.some(l => l.rid === 1));
+  assert.deepEqual(f.posted('/revert/stage'), { messageID: 'msg_03', files: true });
+  assert.deepEqual(c.lines.find(l => l.rid === 1).data, { text: 'second' });
+  let mark = c.lines.length;
+  await f.emit({ type: 'session.revert.staged', data: { sessionID: 'ses_fixture', revert: { messageID: 'msg_03' } } });
+  await until(() => c.lines.slice(mark).some(l => l.t === 'ready'));
+  const staged = c.lines.slice(mark);
+  assert.equal(staged[0].t, 'hello');
+  assert.deepEqual(staged.filter(l => l.t === 'ev').map(l => l.ev.subtype ?? l.ev.message.content[0].text), ['hello', 'hi there', 'staged']);
+  assert.equal(staged.find(l => l.ev?.subtype === 'staged').ev.messages, 2);
+  c.write({ t: 'req', rid: 2, op: 'rewind_undo' });
+  await until(() => f.deleted('/revert'));
+  mark = c.lines.length;
+  await f.emit({ type: 'session.revert.cleared', data: { sessionID: 'ses_fixture' } });
+  await until(() => c.lines.slice(mark).some(l => l.t === 'ready'));
+  assert.equal(c.lines.slice(mark).filter(l => l.t === 'ev').length, 4, 'everything is back; no staged row');
+  c.close();
 });

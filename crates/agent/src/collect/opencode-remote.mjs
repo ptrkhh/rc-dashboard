@@ -445,7 +445,16 @@ async function supervise(statePath, name) {
     // The agents the TUI's Tab cycle keeps.
     const agents = async () => (await list('/api/agent')).filter(a => a.mode !== 'subagent' && !a.hidden);
     const models = async () => normalizeModels(await client.request('/api/model'));
+    const promptRows = new Map(); // chat row uuid -> {id, text}, the prompts a rewind can stage
     const ops = {
+      rewind: async ({ uuid, files }) => {
+        const row = promptRows.get(uuid);
+        if (!row) throw new Error('this prompt cannot be rewound');
+        try { await client.request(`${sessionPath}/revert/stage`, { method: 'POST', body: { messageID: row.id, files: !!files } }); }
+        catch (error) { throw error.status === 409 ? new Error('the session is busy') : error; }
+        return { text: row.text };
+      },
+      rewind_undo: async () => { await client.request(`${sessionPath}/revert`, { method: 'DELETE' }); },
       answer: async ({ id, answer }) => {
         const form = forms.get(id);
         if (!form) throw new Error('already answered');
@@ -499,20 +508,49 @@ async function supervise(statePath, name) {
     // The bridge reports a stopped turn as a failed one; chat must tell them
     // apart so a stop from any door holds the queue.
     let lastExecution = '';
+    let held = null; // events that arrive while rebuild() replays are kept and follow it
+    const emit = async m => {
+      if (m.type === 'user' && m.message?.content?.[0]?.type !== 'tool_result') {
+        m = await chatPrompt(m, rowFiles.get(m.message?.id));
+        if (m.uuid) promptRows.set(m.uuid, { id: m.message.id, text: m.message.content[0]?.text ?? '' });
+      }
+      return feed.accept(m.type === 'result' && lastExecution === 'session.execution.interrupted' ? { ...m, subtype: 'interrupted' } : m);
+    };
     const sink = {
       sid: 'cdash-chat',
-      event: async m => {
-        if (m.type === 'user' && m.message?.content?.[0]?.type !== 'tool_result') m = await chatPrompt(m, rowFiles.get(m.message?.id));
-        return feed.accept(m.type === 'result' && lastExecution === 'session.execution.interrupted' ? { ...m, subtype: 'interrupted' } : m);
-      },
+      event: async m => held ? void held.push(m) : emit(m),
       state: async status => feed.setState({ working: status === 'running', waiting: status === 'requires_action' }),
     };
-    const rowFiles = new Map(); // user row id -> its files, only while emitHistory runs
-    class ChatBridge extends RemoteBridge {
-      async emitHistory(row, onlyTools) {
-        if (row.type === 'user' && row.files) rowFiles.set(row.id, row.files);
-        try { await super.emitHistory(row, onlyTools); } finally { rowFiles.delete(row.id); }
+    const rowFiles = new Map(); // user row id -> its files, only while a row is replayed
+    const withRowFiles = async (row, fn) => {
+      if (row.type === 'user' && row.files) rowFiles.set(row.id, row.files);
+      try { return await fn(); } finally { rowFiles.delete(row.id); }
+    };
+    // The chat as the session shows it now: rows from a staged revert on are
+    // hidden and one `staged` row stands for them. RemoteBridge.emitHistory is
+    // not used: its `sent` set would skip rows already shown once.
+    const rebuild = async () => {
+      held = [];
+      try {
+        feed.reset();
+        const at = (await client.request(sessionPath)).data?.revert?.messageID;
+        const rows = await client.messages(state.sid);
+        const shown = at ? rows.filter(r => r.id < at) : rows; // ids ascend
+        for (const row of shown) {
+          const onlyTools = row.type === 'assistant' && !row.time?.completed;
+          await withRowFiles(row, async () => {
+            for (const p of historyMessages(row, state.sid, sink.sid)) if (!onlyTools || ['tool_use', 'tool_result'].includes(p.message?.content?.[0]?.type)) await emit(p);
+          });
+        }
+        if (at) feed.accept({ type: 'cdash', subtype: 'staged', messages: rows.length - shown.length });
+      } finally {
+        while (held.length) await emit(held.shift());
+        held = null;
+        feed.ready();
       }
+    };
+    class ChatBridge extends RemoteBridge {
+      emitHistory(row, onlyTools) { return withRowFiles(row, () => super.emitHistory(row, onlyTools)); }
       async nativeEvent(event) {
         const data = event.data || {};
         if (event.type?.startsWith('session.execution.')) lastExecution = event.type;
@@ -572,6 +610,7 @@ async function supervise(statePath, name) {
     void client.subscribe(event => enqueue(async () => {
       const data = event.data || {};
       if (data.sessionID !== state.sid) return;
+      if (['session.revert.staged', 'session.revert.cleared', 'session.revert.committed'].includes(event.type)) return rebuild();
       if (event.type === 'session.execution.started') state.working = true;
       else if (['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type)) { state.working = false; state.ts = Date.now(); }
       else if (event.type === 'session.text.ended') state.last_message = data.text;
