@@ -562,3 +562,17 @@ test('Codex facts: usage, running shells and agents, thinking, checklist and tim
   await until(() => evs().some(e => e.subtype === 'todo'));
   assert.deepEqual(evs().find(e => e.subtype === 'todo').items, [{ text: 'Read', status: 'completed' }, { text: 'Fix', status: 'in_progress' }]);
 });
+
+test('a reread drops shell tasks and keeps agent tasks', { timeout: 20000 }, async t => {
+  const sid = '01234567-1234-1234-1234-0123456789ab';
+  const f = await fixture(t, '', process.platform, true, { history: steered });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  await f.inject({ method: 'item/started', params: { threadId: sid, turnId: 't2', item: { id: 'x1', type: 'commandExecution', source: 'unifiedExecStartup', command: 'npm run dev', status: 'inProgress' } } });
+  await f.inject({ method: 'thread/status/changed', params: { threadId: 'child-1', status: { type: 'active', activeFlags: [] } } });
+  await until(() => c.lines.findLast(l => l.t === 'tasks')?.tasks.length === 2);
+  await f.inject({ method: 'thread/reverted', params: { threadId: sid } });
+  await until(() => c.lines.findLast(l => l.t === 'tasks').tasks.length === 1);
+  assert.deepEqual(c.lines.findLast(l => l.t === 'tasks').tasks.map(x => [x.id, x.kind]), [['child-1', 'agent']]);
+});

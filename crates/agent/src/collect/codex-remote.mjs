@@ -240,7 +240,7 @@ async function chatMessages(m, sid) {
       const content = thinkingOf(item);
       if (content) out = [{ type: 'assistant', message: { id: item.id, role: 'assistant', content } }];
     } else out = toolMessages(item);
-  } else if (m.method === 'turn/plan/updated') {
+  } else if (m.method === 'turn/plan/updated') { // live only: a reread or restart clears the checklist until the next plan update
     out = [{ type: 'cdash', subtype: 'todo', items: (p.plan || []).map(s => ({ text: s.step, status: s.status === 'inProgress' ? 'in_progress' : s.status })) }];
   } else if (m.method === 'turn/completed') {
     const status = p.turn?.status;
@@ -551,6 +551,7 @@ async function nativeLauncher(statePath, state, script) {
   };
   // Every chat message reaches the feed here, live or replayed: it tracks each turn's first prompt, the only one that can be rewound.
   const firstOf = new Map(), prompts = new Map();
+  const stamp = (msg, turn) => msg.ts ? msg : { ...msg, ts: new Date(turn?.startedAt ? turn.startedAt * 1000 : Date.now()).toISOString() };
   const accept = (msg, turn) => {
     const turnId = turn?.id;
     if (msg.type === 'user' && !msg.message.content.some(b => b.type === 'tool_result')) {
@@ -558,7 +559,7 @@ async function nativeLauncher(statePath, state, script) {
       prompts.set(msg.uuid, { turnId, text: msg.message.content.find(b => b.type === 'text')?.text ?? '' });
       if (firstOf.get(turnId) !== msg.uuid) msg = { ...msg, src: 'steer' };
     }
-    feed.accept(msg.ts ? msg : { ...msg, ts: new Date(turn?.startedAt ? turn.startedAt * 1000 : Date.now()).toISOString() });
+    feed.accept(stamp(msg, turn));
   };
   const ops = {
     rewind: async ({ uuid }) => {
@@ -726,10 +727,10 @@ async function nativeLauncher(statePath, state, script) {
     if (m.method === 'thread/status/changed' && !mainThread(m, state.sid)) {
       let kid = children.get(p.threadId);
       if (!kid) {
-        const t = (await control.call('thread/read', { threadId: p.threadId, includeTurns: false }).catch(() => ({}))).thread || {};
-        children.set(p.threadId, kid = { agent: t.parentThreadId === state.sid, title: t.agentNickname || t.agentRole || t.name || t.preview || 'agent' });
+        const t = (await control.call('thread/read', { threadId: p.threadId, includeTurns: false }, 10_000).catch(() => null))?.thread;
+        if (t) children.set(p.threadId, kid = { agent: t.parentThreadId === state.sid, title: t.agentNickname || t.agentRole || t.name || t.preview || 'agent' }); // a failed read is not cached: the next status change retries
       }
-      if (kid.agent) {
+      if (kid?.agent) {
         if (p.status?.type === 'active') { if (!running.has(p.threadId)) running.set(p.threadId, { id: p.threadId, kind: 'agent', title: kid.title, started: Date.now() }); }
         else running.delete(p.threadId);
         publishTasks();
@@ -738,12 +739,14 @@ async function nativeLauncher(statePath, state, script) {
     if (!mainThread(m, state.sid)) return; // a subagent's turns and items are not this conversation; its questions (above) still are
     if (state.sid) {
       const chat = await chatMessages(m, state.sid);
-      for (const msg of chat) if (replayed) replayed.push([msg, p.turn ?? { id: p.turnId }]); else accept(msg, p.turn ?? { id: p.turnId });
+      const turn = p.turn ?? { id: p.turnId };
+      for (const msg of chat) if (replayed) replayed.push([stamp(msg, turn), turn]); // stamped on arrival, not on flush
+      else accept(msg, turn);
     }
     const shell = p.item?.type === 'commandExecution' && p.item.source === 'unifiedExecStartup';
     if (shell && m.method === 'item/started') { running.set(p.item.id, { id: p.item.id, kind: 'shell', title: p.item.command, started: Date.now() }); publishTasks(); }
     if (shell && m.method === 'item/completed' && running.delete(p.item.id)) publishTasks();
-    if (m.method === 'thread/tokenUsage/updated') {
+    if (m.method === 'thread/tokenUsage/updated' && p.tokenUsage?.total && p.tokenUsage.last) {
       const { total, last, modelContextWindow } = p.tokenUsage;
       usage = { ...usage, context: { used: last.totalTokens, window: modelContextWindow ?? null },
         tokens: { input: total.inputTokens, output: total.outputTokens, cache_read: total.cachedInputTokens, cache_write: total.cacheWriteInputTokens ?? 0 } };
