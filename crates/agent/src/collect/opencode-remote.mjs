@@ -39,9 +39,20 @@ function messageUuid(remoteSid, nativeSid, messageId, part) {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-8${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 
-export function historyMessages(row, nativeSid, remoteSid, submitted = new Set()) {
+// The edit tool's file list as chat diffs. ponytail: patches are cut so one event's patch text stays under 16 KiB (the socket's line limit is 64 KiB); the rest keep counts only.
+function editFiles(files) {
+  let room = 16 * 1024;
+  return files.filter(f => f && typeof f === 'object').map(f => {
+    const out = { file: f.file ?? f.relativePath ?? f.filePath, additions: f.additions ?? 0, deletions: f.deletions ?? 0 };
+    if (typeof f.patch === 'string' && f.patch.length <= room) { out.patch = f.patch; room -= f.patch.length; }
+    return out;
+  });
+}
+
+export function historyMessages(row, nativeSid, remoteSid, submitted = new Set(), { chat = false } = {}) {
   const messages = [];
-  const emit = (part, payload) => messages.push({ ...payload, uuid: messageUuid(remoteSid, nativeSid, row.id, part) });
+  const ts = chat && row.time?.created ? { ts: new Date(row.time.created).toISOString() } : {};
+  const emit = (part, payload) => messages.push({ ...payload, ...ts, uuid: messageUuid(remoteSid, nativeSid, row.id, part) });
   if (row.type === 'user' && typeof row.text === 'string' && !submitted.has(row.id)) {
     emit('user', { type: 'user', message: { id: row.id, role: 'user', content: [{ type: 'text', text: row.text }] } });
   }
@@ -50,6 +61,9 @@ export function historyMessages(row, nativeSid, remoteSid, submitted = new Set()
     if (part.type === 'text' && typeof part.text === 'string' && part.text) {
       emit(`text:${index}`, { type: 'assistant', message: { id: `${row.id}-text-${index}`, role: 'assistant', content: [{ type: 'text', text: part.text }], stop_reason: null } });
     }
+    if (chat && part.type === 'reasoning' && typeof part.text === 'string' && part.text) {
+      emit(`reasoning:${index}`, { type: 'assistant', message: { id: `${row.id}-reasoning-${index}`, role: 'assistant', content: [{ type: 'thinking', thinking: part.text }], stop_reason: null } });
+    }
     if (part.type !== 'tool' || !part.state || !part.id) continue;
     const tool = part.state, name = ['shell', 'bash'].includes(part.name) ? 'Bash' : part.name;
     const input = tool.input && typeof tool.input === 'object' && !Array.isArray(tool.input) ? tool.input : {};
@@ -57,7 +71,8 @@ export function historyMessages(row, nativeSid, remoteSid, submitted = new Set()
     if (!['completed', 'error'].includes(tool.status)) continue;
     // shortcut: tool results are capped at 65,536 characters; use Terminal for larger output.
     const output = (tool.content || []).filter(item => item.type === 'text' && typeof item.text === 'string').map(item => item.text).join('\n').slice(0, 65536);
-    emit(`tool:${part.id}:result`, { type: 'user', parent_tool_use_id: null, message: { id: `${part.id}-tool-result`, role: 'user', content: [{ type: 'tool_result', tool_use_id: part.id, content: output || (tool.status === 'error' ? 'Tool failed' : ''), is_error: tool.status === 'error' }] } });
+    const files = chat && Array.isArray(tool.metadata?.files) ? editFiles(tool.metadata.files) : null;
+    emit(`tool:${part.id}:result`, { type: 'user', ...(files?.length && { diff: files }), parent_tool_use_id: null, message: { id: `${part.id}-tool-result`, role: 'user', content: [{ type: 'tool_result', tool_use_id: part.id, content: output || (tool.status === 'error' ? 'Tool failed' : ''), is_error: tool.status === 'error' }] } });
   }
   return messages;
 }
@@ -92,7 +107,7 @@ async function chatPrompt(m, rowFiles) {
 export class RemoteBridge {
   constructor(client, remote, state, save) {
     this.client = client; this.remote = remote; this.state = state; this.save = save;
-    this.approvals = new Map(); this.forms = new Set(); this.sent = new Set(); this.activity = false; this.completedSinceStart = false;
+    this.approvals = new Map(); this.forms = new Set(); this.sent = new Set(); this.activity = false; this.completedSinceStart = false; this.chat = false;
     this.path = `/api/session/${encodeURIComponent(state.sid)}`;
   }
   connect(signal, onError = () => {}, beforeReplay = Promise.resolve()) {
@@ -116,7 +131,7 @@ export class RemoteBridge {
   async emitHistory(row, onlyTools = false) {
     const prefix = `${this.remote.sid || ''}:`;
     const submitted = new Set(Object.entries(this.state.remote_inputs || {}).filter(([key]) => key.startsWith(prefix)).map(([, value]) => value.id));
-    for (const payload of historyMessages(row, this.state.sid, this.remote.sid || '', submitted)) {
+    for (const payload of historyMessages(row, this.state.sid, this.remote.sid || '', submitted, { chat: this.chat })) {
       if (onlyTools && !['tool_use', 'tool_result'].includes(payload.message?.content?.[0]?.type)) continue;
       if (this.sent.has(payload.uuid)) continue;
       await this.remote.event(payload);
@@ -537,11 +552,12 @@ async function supervise(statePath, name) {
         const at = (await client.request(sessionPath)).data?.revert?.messageID ?? null;
         const rows = await client.messages(state.sid);
         const shown = at ? rows.filter(r => r.id < at) : rows; // ids ascend
-        stagedAt = at; promptRows.clear(); feed.reset();
+        stagedAt = at; promptRows.clear(); lastTokens = null; feed.reset();
         for (const row of shown) {
+          if (row.type === 'assistant' && row.tokens) lastTokens = row.tokens;
           const onlyTools = row.type === 'assistant' && !row.time?.completed;
           await withRowFiles(row, async () => {
-            for (const p of historyMessages(row, state.sid, sink.sid)) {
+            for (const p of historyMessages(row, state.sid, sink.sid, new Set(), { chat: true })) {
               if (!onlyTools || ['tool_use', 'tool_result'].includes(p.message?.content?.[0]?.type) || bridge?.sent.has(p.uuid)) await emit(p);
             }
           });
@@ -552,11 +568,57 @@ async function supervise(statePath, name) {
       } finally {
         while (held.length) await emit(held.shift());
         held = null;
+        await readUsage().catch(error => log.write('chat usage: ' + error.message + '\n').catch(() => {}));
         feed.ready();
       }
     };
+    // Usage, as OpenCode's TUI counts it: the context is every token of the last call.
+    const num = x => Number(x) || 0;
+    const usedOf = t => num(t.input) + num(t.output) + num(t.reasoning) + num(t.cache?.read) + num(t.cache?.write);
+    const tokensOf = t => ({ input: num(t.input), output: num(t.output) + num(t.reasoning), cache_read: num(t.cache?.read), cache_write: num(t.cache?.write) });
+    let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
+    let lastTokens = null; // tokens of the last visible assistant row, seen as rows replay
+    let modelList = null; // GET /api/model, read once
+    const windowOf = model => modelList?.find(m => `${m.providerID}/${m.id}` === model)?.limit?.context ?? null;
+    const publishUsage = patch => { usage = { ...usage, ...patch }; feed.setUsage(usage); };
+    const readUsage = async () => {
+      const session = (await client.request(sessionPath)).data;
+      modelList ??= await list('/api/model');
+      publishUsage({ cwd: session?.location?.directory ?? usage.cwd, ...(session?.tokens && { tokens: tokensOf(session.tokens) }), ...(session?.cost != null && { cost: session.cost }),
+        context: lastTokens ? { used: usedOf(lastTokens), window: windowOf(usage.model) } : usage.context });
+    };
+    // The running list: shells of the session or its subagents, and the subagents themselves.
+    const children = new Map(); // child session id -> title
+    const shells = new Map(), subagents = new Map();
+    const publishTasks = () => feed.setTasks([...shells.values(), ...subagents.values()]);
+    const addShell = info => {
+      if (info?.id && info.status === 'running' && (info.metadata?.sessionID === state.sid || children.has(info.metadata?.sessionID)))
+        shells.set(info.id, { id: info.id, kind: 'shell', title: info.command, started: new Date(info.time?.started ?? Date.now()).toISOString() });
+    };
+    const addAgent = id => subagents.set(id, { id, kind: 'agent', title: children.get(id) ?? id, started: new Date().toISOString() });
+    const loadTasks = async () => {
+      for (const c of await list('/api/session?' + new URLSearchParams({ parentID: state.sid }))) children.set(c.id, c.title ?? c.id);
+      shells.clear(); subagents.clear();
+      for (const sh of await list('/api/shell')) addShell(sh);
+      for (const id of Object.keys((await client.request('/api/session/active')).data ?? {})) if (children.has(id)) addAgent(id);
+      publishTasks();
+    };
+    const taskEvent = (type, data) => {
+      if (type === 'session.created' && data.parentID === state.sid) children.set(data.sessionID ?? data.id, data.title ?? data.sessionID ?? data.id);
+      else if (type === 'shell.created') addShell(data.info ?? data);
+      else if (type === 'shell.exited' || type === 'shell.deleted') { if (!shells.delete(data.id)) return; }
+      else if (children.has(data.sessionID) && type === 'session.execution.started') addAgent(data.sessionID);
+      else if (children.has(data.sessionID) && ['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(type)) { if (!subagents.delete(data.sessionID)) return; }
+      else return;
+      publishTasks();
+    };
     class ChatBridge extends RemoteBridge {
-      emitHistory(row, onlyTools) { return stagedAt && row.id >= stagedAt ? undefined : withRowFiles(row, () => super.emitHistory(row, onlyTools)); }
+      chat = true;
+      emitHistory(row, onlyTools) {
+        if (stagedAt && row.id >= stagedAt) return;
+        if (row.type === 'assistant' && row.tokens) lastTokens = row.tokens;
+        return withRowFiles(row, () => super.emitHistory(row, onlyTools));
+      }
       async nativeEvent(event) {
         const data = event.data || {};
         if (event.type?.startsWith('session.execution.')) lastExecution = event.type;
@@ -570,6 +632,7 @@ async function supervise(statePath, name) {
       }
       async reconcile() {
         await super.reconcile();
+        await readUsage().catch(error => log.write('chat usage: ' + error.message + '\n').catch(() => {}));
         this.state.agent = (await this.client.request(this.path)).data?.agent ?? null;
         publishSettings();
       }
@@ -617,7 +680,11 @@ async function supervise(statePath, name) {
     const enqueue = operation => { updates = updates.then(operation).catch(() => {}); };
     void client.subscribe(event => enqueue(async () => {
       const data = event.data || {};
+      taskEvent(event.type, data);
       if (data.sessionID !== state.sid) return;
+      if (event.type === 'session.usage.updated') publishUsage({ tokens: tokensOf(data.tokens ?? {}), cost: data.cost ?? usage.cost });
+      else if (event.type === 'session.step.ended' && data.tokens) publishUsage({ context: { used: usedOf(data.tokens), window: usage.context?.window ?? windowOf(usage.model) } });
+      else if (event.type === 'session.model.selected' && data.model) { const model = `${data.model.providerID}/${data.model.id}`; publishUsage({ model, ...(usage.context && { context: { ...usage.context, window: windowOf(model) } }) }); }
       if (['session.revert.staged', 'session.revert.cleared', 'session.revert.committed'].includes(event.type)) return rebuild();
       if (event.type === 'session.execution.started') state.working = true;
       else if (['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type)) { state.working = false; state.ts = Date.now(); }
@@ -631,6 +698,7 @@ async function supervise(statePath, name) {
       state.working = Boolean(active?.[state.sid]);
       if (session?.model) updateModel(state, session.model);
       await saveNative();
+      await loadTasks().catch(error => log.write('chat tasks: ' + error.message + '\n').catch(() => {}));
     }), events.signal);
     tui = spawn('opencode', ['--server', client.url, '--session', state.sid, '--auto'], { cwd: state.dir, env: { ...nativeEnv(), OPENCODE_PASSWORD: client.password }, stdio: 'inherit' });
     tui.once('error', () => stop().then(() => process.exit(1)));

@@ -169,7 +169,7 @@ else {
 
 // A supervisor over a fake OpenCode server that also serves the chat feed's
 // reads (messages, forms, permissions) and records prompts and interrupts.
-async function fixture(t, { flakyMessages = false, withFiles = '', mediaDir = null, rows: testRows = null, revert: startRevert = null } = {}) {
+async function fixture(t, { flakyMessages = false, withFiles = '', mediaDir = null, rows: testRows = null, revert: startRevert = null, active = false } = {}) {
   const { readFileSync, existsSync } = await import('node:fs');
   const { rename } = await import('node:fs/promises');
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-chat-'));
@@ -187,7 +187,9 @@ else {
  const send=(res,data)=>res.end(JSON.stringify(data));
  const server=http.createServer(async(req,res)=>{let raw='';for await(const c of req)raw+=c;const body=raw?JSON.parse(raw):null;const path=req.url.split('?')[0];log({kind:'api',method:req.method,path,body});
  if(path==='/api/event'){res.writeHead(200,{'content-type':'text/event-stream'});res.write('data: {"type":"server.connected","data":{}}\\n\\n');streams.add(res);req.on('close',()=>streams.delete(res));return;}
- if(path==='/api/session/active')return send(res,{data:{}});
+ if(path==='/api/session/active')return send(res,{data:process.env.CDASH_TEST_ACTIVE?{ses_child:{type:'running'}}:{}});
+ if(path==='/api/session'&&req.method==='GET')return send(res,{data:[{id:'ses_child',parentID:'ses_fixture',title:'Explore the repo'}]});
+ if(path==='/api/shell')return send(res,{data:[{id:'sh_1',status:'running',command:'sleep 60',metadata:{sessionID:'ses_fixture'},time:{started:1789000000000}}]});
  if(path==='/api/session'&&req.method==='POST')return send(res,{data:{id:'ses_fixture'}});
  if(path==='/api/session/ses_fixture/message'&&process.env.CDASH_TEST_FLAKY&&!fs.existsSync(process.env.CDASH_TEST_FLAKY)){fs.writeFileSync(process.env.CDASH_TEST_FLAKY,'1');return send(res,{data:'broken'});}
  if(path==='/api/session/ses_fixture/message'&&fs.existsSync(process.env.CDASH_TEST_FAILMSG)){fs.unlinkSync(process.env.CDASH_TEST_FAILMSG);return send(res,{data:'broken'});}
@@ -197,23 +199,23 @@ else {
  const rowFiles=process.env.CDASH_TEST_FILES==='bad'?[{data:'AAAA',mime:'image/png',name:'x.png'},{mime:'image/png'},'junk',null,{data:5,mime:'application/pdf'}]:[{data:'${PNG.toString('base64')}',mime:'image/png',name:'a.png',source:{type:'inline'}},{data:'${PDF.toString('base64')}',mime:'application/pdf',name:'r.pdf',source:{type:'uri',uri:'file:///x/r.pdf'}}];
  const extra=process.env.CDASH_TEST_FILES?[{id:'msg_f',type:'user',text:'see\\nAttached: /h/.cache/cdash/uploads/cdash-fixture/0123456789abcdef/n.txt',files:rowFiles}]:[];
  if(path==='/api/session/ses_fixture/message'&&process.env.CDASH_TEST_ROWS)return send(res,{data:JSON.parse(process.env.CDASH_TEST_ROWS),cursor:{}});
- if(path==='/api/session/ses_fixture/message')return send(res,{data:[{id:'msg_u',type:'user',text:'hello'},{id:'msg_a',type:'assistant',time:{completed:1},content:[{type:'text',text:'hi there'}]},...extra],cursor:{}});
+ if(path==='/api/session/ses_fixture/message')return send(res,{data:[{id:'msg_u',type:'user',text:'hello'},{id:'msg_a',type:'assistant',time:{completed:1},tokens:{input:3,output:2,reasoning:0,cache:{read:40,write:5}},content:[{type:'text',text:'hi there'}]},...extra],cursor:{}});
  if(path.includes('/form/')&&path.endsWith('/reply')){res.writeHead(path.includes('/frm_done/')?409:204);return res.end();}
  if(path==='/api/command')return send(res,{data:[{name:'review',description:'Review changes'}]});
  if(path==='/api/agent')return send(res,{data:[{id:'build',name:'build',mode:'primary',hidden:false},{id:'plan',name:'plan',mode:'primary',hidden:false},{id:'explore',name:'explore',mode:'subagent',hidden:false},{id:'title',name:'title',mode:'primary',hidden:true}]});
- if(path==='/api/model')return send(res,{data:[{providerID:'fixture',id:'model',name:'Model',variants:[{id:'high'}]},{providerID:'fixture',id:'other',name:'Other',variants:[]}]});
+ if(path==='/api/model')return send(res,{data:[{providerID:'fixture',id:'model',name:'Model',variants:[{id:'high'}],limit:{context:200000}},{providerID:'fixture',id:'other',name:'Other',variants:[]}]});
  if(req.method==='POST'&&/\\/(agent|model|command)$/.test(path)){res.writeHead(204);return res.end();}
  if(path.endsWith('/form')||path.endsWith('/permission'))return send(res,{data:[]});
  if(path.endsWith('/prompt'))return send(res,{data:{id:body.id,sessionID:'ses_fixture',type:'user'}});
  if(path.endsWith('/interrupt'))return send(res,{data:true});
- return send(res,{data:{id:'ses_fixture',metadata:{cdash_owner:true},time:{},model:{id:'model',providerID:'fixture'},...(revert&&{revert})}});});
+ return send(res,{data:{id:'ses_fixture',metadata:{cdash_owner:true},time:{},model:{id:'model',providerID:'fixture'},tokens:{input:10,output:5,reasoning:1,cache:{read:100,write:20}},cost:0.42,location:{directory:process.cwd()},...(revert&&{revert})}});});
  server.listen(0,'127.0.0.1',()=>console.log(JSON.stringify({url:'http://127.0.0.1:'+server.address().port})));
  process.stdin.resume();process.stdin.on('end',()=>server.closeAllConnections()||server.close());
 }
 `, { mode: 0o700 });
   await writeFile(join(dir, 'claude'), `#!${process.execPath}\nprocess.exit(1);`, { mode: 0o700 });
   const child = spawn(process.execPath, [resolve('crates/agent/src/collect/opencode-remote.mjs'), '--state', state, '--name', 'cdash-fixture'], {
-    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_MEDIA_DIR: mediaDir ?? join(dir, 'media'), ...(startRevert && { CDASH_TEST_REVERT: startRevert }), ...(testRows && { CDASH_TEST_ROWS: JSON.stringify(testRows) }), ...(withFiles && { CDASH_TEST_FILES: withFiles === true ? '1' : withFiles }), CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CDASH_TEST_MARKER: marker, CDASH_MEDIA_DIR: mediaDir ?? join(dir, 'media'), ...(startRevert && { CDASH_TEST_REVERT: startRevert }), ...(active && { CDASH_TEST_ACTIVE: '1' }), ...(testRows && { CDASH_TEST_ROWS: JSON.stringify(testRows) }), ...(withFiles && { CDASH_TEST_FILES: withFiles === true ? '1' : withFiles }), CDASH_TEST_FAILMSG: join(dir, 'fail-msg'), ...(flakyMessages && { CDASH_TEST_FLAKY: join(dir, 'failed-once') }) }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   let output = '';
   child.stdout.on('data', b => { output += b; });
@@ -488,4 +490,19 @@ test('a committed revert rebuilds, a busy session and an unknown prompt are refu
   assert.equal(c.lines.slice(mark).filter(l => l.t === 'hello').length, 1);
   assert.equal(afterReset(c.lines).length, 5);
   c.close();
+});
+
+test('OpenCode facts: usage, running shells and subagents', { timeout: 20000 }, async t => {
+  const f = await fixture(t, { active: true });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  await until(() => c.lines.some(l => l.t === 'usage' && l.usage.context) && c.lines.some(l => l.t === 'tasks'));
+  assert.deepEqual(c.lines.findLast(l => l.t === 'usage').usage, { cwd: f.dir, model: 'fixture/model', context: { used: 50, window: 200000 },
+    tokens: { input: 10, output: 6, cache_read: 100, cache_write: 20 }, cost: 0.42 });
+  assert.deepEqual(c.lines.findLast(l => l.t === 'tasks').tasks.map(x => [x.id, x.kind, x.title]), [['sh_1', 'shell', 'sleep 60'], ['ses_child', 'agent', 'Explore the repo']]);
+  await f.emit({ type: 'shell.exited', data: { id: 'sh_1', status: 'exited' } });
+  await f.emit({ type: 'session.execution.succeeded', data: { sessionID: 'ses_child' } });
+  await until(() => c.lines.findLast(l => l.t === 'tasks').tasks.length === 0);
+  await f.emit({ type: 'session.usage.updated', data: { sessionID: 'ses_fixture', cost: 0.5, tokens: { input: 20, output: 5, reasoning: 0, cache: { read: 100, write: 20 } } } });
+  await until(() => c.lines.findLast(l => l.t === 'usage').usage.cost === 0.5);
 });
