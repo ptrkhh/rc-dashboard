@@ -112,9 +112,15 @@ export class ChatFeed {
 
   // A side answer is live only; long text is split so no line passes LINE_MAX.
   pushAside(id, text, done, error) {
-    const PART = 16 * 1024; // 16K UTF-16 units is at most 48 KiB of UTF-8, under LINE_MAX
+    const PART = 8 * 1024; // UTF-16 units: at most 24 KiB raw, under LINE_MAX even with 6x JSON escaping
     const parts = [];
-    for (let i = 0; i < text.length; i += PART) parts.push(text.slice(i, i + PART));
+    for (let i = 0; i < text.length;) {
+      let end = Math.min(i + PART, text.length);
+      const c = text.charCodeAt(end - 1);
+      if (end < text.length && c >= 0xd800 && c <= 0xdbff) end--; // keep a surrogate pair whole
+      parts.push(text.slice(i, end));
+      i = end;
+    }
     if (!parts.length) parts.push('');
     parts.forEach((part, i) => {
       const last = i === parts.length - 1;

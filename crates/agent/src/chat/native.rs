@@ -258,7 +258,11 @@ async fn run(sock: PathBuf, shared: Arc<Shared>, tx: mpsc::Sender<EngineMsg>, lo
                     };
                     if let Some(tx) = sender {
                         let chunk = AsideChunk { text: v["text"].as_str().unwrap_or_default().to_string(), done, error: v["error"].as_str().map(str::to_string) };
-                        let _ = tx.send(chunk).await;
+                        // Never wait on the asker: this reader also routes the hub's responses.
+                        // A full or closed channel drops the sender, which the socket reads as a failure.
+                        if tx.try_send(chunk).is_err() {
+                            shared.asides.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                        }
                     }
                     continue;
                 }
@@ -510,7 +514,7 @@ mod tests {
         sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
         sup.write_line(r#"{"t":"usage","usage":{"cwd":"/w"}}"#).await;
         sup.write_line(r#"{"t":"tasks","tasks":[{"id":"b1"}]}"#).await;
-        assert!(matches!(rx.recv().await, Some(EngineMsg::Usage(u)) if u["cwd"] == "/w"));
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(30), rx.recv()).await, Ok(Some(EngineMsg::Usage(u))) if u["cwd"] == "/w"));
         assert!(matches!(rx.recv().await, Some(EngineMsg::Tasks(t)) if t.len() == 1));
         let asking = tokio::spawn(async move { let r = engine.aside("q1", "why?").await; (r, engine) });
         let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
@@ -576,5 +580,31 @@ mod tests {
         assert_eq!(req["op"].as_str(), Some("rewind_undo"));
         sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":false,"error":"nothing to undo"}).to_string()).await;
         assert_eq!(undoing.await.unwrap(), Err("nothing to undo".to_string()));
+    }
+    #[tokio::test]
+    async fn an_asker_that_never_reads_cannot_stall_the_reader() {
+        let (sock, mut sup) = fake_supervisor("p5-slow");
+        let (engine, _rx) = start(sock, log(), "cdash-a".into());
+        let engine = Arc::new(engine);
+        sup.read_line().await;
+        sup.write_line(r#"{"t":"hello","epoch":"e1","head":0}"#).await;
+        let e = Arc::clone(&engine);
+        let asking = tokio::spawn(async move { e.aside("q1", "why?").await });
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":true}).to_string()).await;
+        let mut answer = asking.await.unwrap().unwrap(); // never read until the end
+        for _ in 0..70 {
+            sup.write_line(r#"{"t":"aside","id":"q1","text":"x","done":false}"#).await;
+        }
+        let e = Arc::clone(&engine);
+        let setting = tokio::spawn(async move { e.set("plan", &json!(true)).await });
+        let req: Value = serde_json::from_str(&sup.read_line().await).unwrap();
+        sup.write_line(&json!({"t":"res","rid":req["rid"],"ok":true}).to_string()).await;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(30), setting).await.expect("the reader still routes responses").unwrap(), Ok(()));
+        let mut n = 0;
+        while answer.recv().await.is_some() {
+            n += 1;
+        }
+        assert!(n <= 64, "the sender was dropped once the asker fell behind");
     }
 }

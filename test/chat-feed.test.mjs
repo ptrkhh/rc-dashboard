@@ -202,9 +202,24 @@ test('usage and tasks are replayed after hello; aside lines are not; cdash event
   await until(() => a.lines.filter(l => l.t === 'tasks').length === 2);
   assert.deepEqual(a.lines.filter(l => l.t === 'tasks').at(-1).tasks, []);
   feed.pushAside('q2', 'x'.repeat(100 * 1024), true);
-  await until(() => a.lines.filter(l => l.t === 'aside' && l.id === 'q2').length >= 7);
+  await until(() => a.lines.filter(l => l.t === 'aside' && l.id === 'q2').length >= 13);
   const q2 = a.lines.filter(l => l.t === 'aside' && l.id === 'q2');
-  assert.deepEqual(q2.map(l => l.done), [false, false, false, false, false, false, true], 'a long answer is split under the line limit, done only on the last');
+  assert.deepEqual(q2.map(l => l.done), [...Array(12).fill(false), true], 'a long answer is split under the line limit, done only on the last');
   assert.equal(q2.map(l => l.text).join('').length, 100 * 1024);
+  a.close();
+});
+
+test('a long answer is never cut inside a surrogate pair', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cdash-feed-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const feed = new ChatFeed({ send: async () => {}, stop: async () => {} }); t.after(() => feed.close());
+  const a = await client(await feed.listen(dir), { after: 0, epoch: null });
+  await until(() => a.lines.some(l => l.t === 'asks'));
+  const text = 'a'.repeat(8 * 1024 - 1) + '\u{1F600}' + 'b'.repeat(10);
+  feed.pushAside('q', text, true);
+  await until(() => a.lines.some(l => l.t === 'aside' && l.done));
+  const parts = a.lines.filter(l => l.t === 'aside');
+  assert.equal(parts.length, 2);
+  assert.equal(parts.map(l => l.text).join(''), text);
+  for (const l of parts) assert.ok(!/[\ud800-\udbff]$|^[\udc00-\udfff]/.test(l.text), 'no lone surrogate at a piece edge');
   a.close();
 });
