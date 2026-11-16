@@ -4,7 +4,7 @@
 // here: a second copy of the text could drift from the one that ships.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, mkdtempSync, chmodSync, copyFileSync, existsSync, statSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, chmodSync, copyFileSync, existsSync, statSync, rmSync, readdirSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import vm from 'node:vm';
@@ -56,6 +56,30 @@ async function closedPort() {
   const { port } = probe.address();
   await new Promise(r => probe.close(r));
   return port;
+}
+
+/** Resolves to the signal `child` died of, or null if it is still alive after `ms`. */
+async function stopSignal(child, ms) {
+  const deadline = Date.now() + ms;
+  while (child.signalCode === null && child.exitCode === null && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return child.signalCode;
+}
+
+/** Live processes whose name or command line contains `needle`, as the kernel reports them. */
+function procsNamed(needle) {
+  const found = readdirSync('/proc').filter(d => /^\d+$/.test(d)).flatMap(pid => {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const [, comm, state] = /^\d+ \((.*)\) (\S)/.exec(stat);
+      const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim();
+      return comm.includes(needle) || cmd.includes(needle) ? [`${pid} ${state} [${cmd}]`] : [];
+    } catch {
+      return [];
+    }
+  });
+  return found.length ? found.join('; ') : 'none';
 }
 
 /** Everything after the fetch is identical on both platforms, so assert it once. */
@@ -172,13 +196,17 @@ test('pasting again replaces an agent that is running, and stops the old one', a
     await Promise.all([once(running, 'spawn'), once(decoy, 'spawn')]);
     const file = join(mkdtempSync(join(tmpdir(), 'cdash-paste-')), 'setup.sh');
     writeFileSync(file, setupScript('curl', url));
-    await run('bash', [file], { env: { ...process.env, HOME } });
+    // -x traces every step to stderr, so a failure below shows which kill ran.
+    const { stderr } = await run('bash', ['-x', file], { env: { ...process.env, HOME }, maxBuffer: 16 * 1024 * 1024 });
     assert.equal(readFileSync(agent, 'utf8'), AGENT, 'the new agent is in place');
     assert.ok(!existsSync(`${agent}.new`), 'no staging file left behind');
     // Left running, the old agent keeps answering the health check and the
     // startup guard never starts the new one — the stale-agent bug.
-    const exit = running.signalCode ?? (await once(running, 'exit', { signal: AbortSignal.timeout(10_000) }))[1];
-    assert.equal(exit, 'SIGTERM', 'the old agent was stopped');
+    const stopped = await stopSignal(running, 10_000);
+    const trace = stderr.split('\n').filter(l => l.includes('cdash-agent')).slice(0, 12).join(' | ');
+    assert.equal(stopped, 'SIGTERM',
+      `the old agent was stopped. HOME=${HOME} pid=${running.pid} exitCode=${running.exitCode} ` +
+      `processes now: ${procsNamed('cdash-agent')}. Script trace: ${trace || 'none'}`);
     assert.equal(decoy.exitCode ?? decoy.signalCode, null, 'a process that only names the path was left alone');
   } finally {
     running.kill();
