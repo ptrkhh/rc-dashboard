@@ -185,17 +185,22 @@ test('pasting again replaces an agent that is running, and stops the old one', a
   const HOME = mkdtempSync(join(tmpdir(), 'cdash-home-'));
   const agent = join(HOME, 'cdash-agent');
   // A real executable: Linux refuses to open a *running* binary for writing
-  // ("Text file busy"), which a shell-script stub would never show.
-  copyFileSync('/bin/sleep', agent);
+  // ("Text file busy"), which a shell-script stub would never show. Not a copy
+  // of sleep: a multicall coreutils picks its program from the name it was
+  // started as, so "cdash-agent" exits at once ("unknown program"). sh has no
+  // such dispatch, and its loop keeps the process alive until it is stopped.
+  copyFileSync('/bin/sh', agent);
   chmodSync(agent, 0o755);
-  const running = spawn(agent, ['30'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const running = spawn(agent, ['-c', 'while :; do sleep 1; done'], { stdio: ['ignore', 'ignore', 'pipe'] });
   let runStderr = '';
   running.stderr.on('data', d => { runStderr += d; });
   let runExit = 'alive';
   running.once('exit', (code, signal) => { runExit = `code=${code} signal=${signal}`; });
   // Mentions the agent's path but is not the agent — an editor on its log, say.
   // The stop is anchored on the full command line, so this must survive.
-  const decoy = spawn('/bin/sh', ['-c', 'sleep 30', 'tail', `${agent}.log`], { stdio: 'ignore' });
+  // "sleep 30; :" is not exec'd by the shell. A lone command is, and on dash
+  // that drops the path from its command line, so the decoy would not mention it.
+  const decoy = spawn('/bin/sh', ['-c', 'sleep 30; :', 'tail', `${agent}.log`], { stdio: 'ignore' });
   try {
     await Promise.all([once(running, 'spawn'), once(decoy, 'spawn')]);
     const before = procsNamed('cdash-agent');
