@@ -44,7 +44,7 @@
         let body = '';
         for (i++; i < lines.length && !/^\s*```\s*$/.test(lines[i]); i++) body += lines[i] + '\n';
         i++;
-        out += '<pre><code' + (lang ? ' class="lang-' + lang + '"' : '') + '>' + body + '</code></pre>';
+        out += '<pre><code' + (lang ? ' class="lang-' + lang + '"' : '') + '>' + (g.cdashHighlight?.html(unesc(body), lang) ?? body) + '</code></pre>';
         continue;
       }
       let m = l.match(HEADING);

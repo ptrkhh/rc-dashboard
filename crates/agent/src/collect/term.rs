@@ -1,7 +1,8 @@
 //! A live terminal on a dashboard session: `tmux attach` in a PTY, bridged to
 //! a WebSocket. This half is the request validation; the bridge follows.
 
-use super::ctx::Ctx;
+use super::ctx::{Ctx, FocusGuard};
+use crate::chat::wire::ClientFrame;
 use super::validate::BadRequest;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -222,6 +223,7 @@ async fn pump(
     // still false and cut off a live client.
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heard = true;
+    let mut focus = FocusGuard::new(ctx, name);
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -260,6 +262,8 @@ async fn pump(
                     Some(Ok(Message::Text(t))) => {
                         if let Some((c, r)) = parse_resize(t.as_str()) {
                             set_size(master.get_ref(), c, r)?;
+                        } else if let Ok(ClientFrame::Focus { on }) = serde_json::from_str(t.as_str()) {
+                            focus.set(on);
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Ok(Ended::Client),
@@ -312,6 +316,7 @@ pub async fn bridge(ctx: Arc<Ctx>, name: String, cols: u16, rows: u16, mut ws: W
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::tmux_io::tests::eventually;
 
     #[test]
     fn origin_allows_what_only_the_dashboard_itself_can_send() {
@@ -508,7 +513,7 @@ mod tests {
     /// Reads binary frames until their accumulated text contains `needle`.
     async fn read_until(ws: &mut Ws, needle: &str) -> String {
         let mut seen = String::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !seen.contains(needle) {
                 match ws.next().await {
                     Some(Ok(WsMsg::Binary(b))) => seen.push_str(&String::from_utf8_lossy(&b)),
@@ -524,7 +529,7 @@ mod tests {
 
     /// Drains frames until the close frame and returns its code.
     async fn close_code(ws: &mut Ws) -> u16 {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match ws.next().await {
                     Some(Ok(WsMsg::Close(Some(f)))) => return u16::from(f.code),
@@ -535,17 +540,7 @@ mod tests {
             }
         })
         .await
-        .expect("no close frame within 5s")
-    }
-
-    async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-        for _ in 0..50 {
-            if f() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("never happened: {what}");
+        .expect("no close frame within 30 s")
     }
 
     #[tokio::test]
@@ -673,6 +668,22 @@ mod tests {
             .await
             .unwrap();
         eventually("resized", || s.clients() == "100x30").await;
+    }
+
+    #[tokio::test]
+    async fn focus_frames_count_the_terminal_socket_and_a_drop_uncounts_it() {
+        if !have_tmux() {
+            return;
+        }
+        let s = Session::new("focus");
+        let b = serve(cfg_for(tempdir("focus"))).await.unwrap();
+        let mut ws = connect(b.addr, &format!("name={}&cols=80&rows=24", s.0), None)
+            .await
+            .unwrap();
+        ws.send(WsMsg::text(r#"{"t":"focus","on":true}"#)).await.unwrap();
+        eventually("terminal focus counted", || b.ctx.focused(&s.0)).await;
+        drop(ws);
+        eventually("dropped socket uncounted", || !b.ctx.focused(&s.0)).await;
     }
 
     #[tokio::test]

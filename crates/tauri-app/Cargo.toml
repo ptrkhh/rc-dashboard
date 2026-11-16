@@ -32,9 +32,19 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 [target.'cfg(all(not(windows), not(target_os = "android")))'.dependencies]
 cdash-agent = { path = "../agent" }
 
+# Desktop system notifications. 2.6+ needs tauri ^2.12.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-notification = "2.6"
+# The watcher sleeps between reconnects; tauri's runtime is tokio but does not re-export `time`.
+tokio = { version = "1", features = ["time"] }
+
+# Android notifications: a foreground service holding the agent's note stream.
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-cdash-watch = { path = "../tauri-plugin-cdash-watch" }
+
 # "test" only unifies into dev/test builds; release binaries never see it.
-# tokio is here and not above because nothing outside #[tokio::test] uses it —
-# tauri brings its own runtime and reqwest brings its own tokio features.
+# The test-only tokio features (runtime, macros) live here; the desktop
+# dependency above adds `time` for the notification watcher.
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

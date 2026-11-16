@@ -161,6 +161,7 @@ The desktop and Android apps’ saved remote profiles currently support **auth: 
 |---|---|---|
 | **PORT** | 23274 | Listening port. Set to 0 to choose an available port. |
 | **CDASH_BIND** | 127.0.0.1 | Listen address. Network access requires an explicit bind address. |
+| **CDASH_HOOK_PORT** | 23275 | Loopback port where Claude Code sessions send questions and plan approvals to chat. If another agent holds it, new sessions answer in Terminal. |
 | **CLAUDE_DIR** | ~/.claude | Claude configuration and project directory. |
 | **DISK_EXTRA** | — | Optional second disk mount to report, such as /mnt/d. |
 | **ANTHROPIC_BASE_URL** | https://api.anthropic.com | HTTPS base URL for Claude usage lookup. |
@@ -203,11 +204,26 @@ External sessions without a Claude link show instructions instead of a waiting s
 - Each tool call is one line; tap it for the command, input, output and any error.
 - A message sent while the session works is held by the dashboard and listed above the composer with **Send now**, **Edit** and **Remove**. When a turn ends on its own, the next held message goes out, one per turn.
 - **Stop** interrupts the running turn. After a stop, from any door, held messages stay held until you choose what to do with each. A Claude Code prompt stopped before any reply is marked not sent and its text can be edited.
-- When the session waits for an answer (a permission, a question, a plan approval), chat says so and points to Terminal.
+- Questions and plan approvals appear as cards above the composer and can be answered from chat; the first answer from any door wins and the card closes everywhere. Permission prompts and other dialogs still point to Terminal, as do Claude Code sessions started before upgrading until they are restarted.
+- Type `/` for the session's commands. The chip at the top shows the model, effort and plan mode (for OpenCode, the variant and agent); tap it to change them. Claude Code's pickers work while the session is idle, and a model or effort change there also becomes the default for new Claude sessions; Codex applies changes from the next turn.
+- Attach images and files with the paperclip, by pasting into the message box or by dropping them on the chat (20 MB per file, 10 per message). Images in the conversation show as thumbnails; tap one to see it full screen. Claude Code gets images as pasted attachments, Codex gets images and OpenCode images and PDFs as their own attachments, and every other file goes to the tool as a path it reads itself.
+- Uploads stay on the host in `~/.cache/cdash/uploads/<session>` (or under `$XDG_CACHE_HOME`), readable only by you, and are deleted when the session ends and after 7 days. Images seen in history are kept in `~/.cache/cdash/media` and removed after 7 days unused. Codex and OpenCode sessions started before upgrading need a restart to show images.
 - Chat reconnects on its own and catches up without gaps or repeats. Held messages live in the agent's memory; if the agent restarts, the device that wrote them shows them as not sent.
 - Codex and OpenCode sessions started before upgrading need a restart before **Chat** appears on their cards.
 
 A Claude Code card whose Remote Control link has not arrived 30 seconds after launch says the link is unavailable instead of waiting; Chat and Terminal still work.
+
+## Notifications
+
+Each device has its own switch, **Notifications on this device**, in the dashboard; a device that leaves it off sees no change.
+
+- A browser needs HTTPS or 127.0.0.1. On any other page the switch is disabled and says `needs HTTPS or 127.0.0.1`.
+- The Windows app registers its app ID (`HKCU\Software\Classes\AppUserModelId\dev.cdash.app`, no admin rights) while notifications are on, and removes it when they are off.
+- The Android app keeps a background service running with a quiet permanent notification (`Watching for replies`) and asks for the Android notification permission and to be exempt from battery optimisation so replies still reach you. If you decline the exemption the service still runs, but Android may cut the connection while the phone sleeps.
+- A notification appears when a session finishes a turn, stops with an error, or needs your answer. The title is the project folder.
+- Push services see only encrypted payloads, and the payload they carry holds only a session name, a project folder name, a kind and a time. No message text, tool names or file names.
+
+Windows and Android notification behaviour is not yet checked on real devices.
 
 ## Technical reference
 

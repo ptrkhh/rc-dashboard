@@ -5,6 +5,8 @@ pub struct Held {
     pub id: String,
     pub cid: String,
     pub text: String,
+    /// Upload ids, resolved again when the message leaves.
+    pub files: Vec<String>,
     /// Leaves on its own when a turn ends. Cleared by Stop: after a stop
     /// nothing runs that the owner did not confirm.
     pub auto: bool,
@@ -17,10 +19,10 @@ pub struct Queue {
 }
 
 impl Queue {
-    pub fn hold(&mut self, cid: String, text: String) -> String {
+    pub fn hold(&mut self, cid: String, text: String, files: Vec<String>) -> String {
         self.next += 1;
         let id = format!("h{}", self.next);
-        self.items.push(Held { id: id.clone(), cid, text, auto: true });
+        self.items.push(Held { id: id.clone(), cid, text, files, auto: true });
         id
     }
 
@@ -59,17 +61,17 @@ mod tests {
     #[test]
     fn held_messages_leave_in_order_and_only_while_nothing_was_stopped() {
         let mut q = Queue::default();
-        let (a, b) = (q.hold("c1".into(), "one".into()), q.hold("c2".into(), "two".into()));
+        let (a, b) = (q.hold("c1".into(), "one".into(), vec![]), q.hold("c2".into(), "two".into(), vec![]));
         assert_eq!((a.as_str(), b.as_str()), ("h1", "h2"));
         assert_eq!(q.next_auto().unwrap().text, "one");
         q.stop_all();
         assert!(q.next_auto().is_none(), "after Stop nothing leaves on its own");
-        let c = q.hold("c3".into(), "three".into());
+        let c = q.hold("c3".into(), "three".into(), vec![]);
         assert!(q.next_auto().is_none(), "a newer message does not jump an older held one");
         assert_eq!(q.take(&b).unwrap().cid, "c2");
         assert_eq!(q.next_auto().unwrap().text, "three");
         assert!(q.take(&c).is_none() && q.take("h9").is_none());
-        q.hold("c4".into(), "four".into());
+        q.hold("c4".into(), "four".into(), vec![]);
         assert_eq!(q.clear().len(), 1);
         assert!(q.list().is_empty());
     }

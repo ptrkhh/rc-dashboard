@@ -142,7 +142,7 @@ test('cards offer the session ID for copying once one exists', () => {
 test('copy reports success and shows the ID when the clipboard APIs fail', async () => {
   const app = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
   const code = app.slice(app.indexOf('async function copyText('), app.indexOf('function toast('));
-  const run = async (write, exec) => {
+  const run = async (write, exec, args = ['sid-123']) => {
     let toastMsg;
     const field = { style: {}, select() {}, remove() {} };
     const context = {
@@ -151,12 +151,20 @@ test('copy reports success and shows the ID when the clipboard APIs fail', async
       toast: msg => { toastMsg = msg; },
     };
     runInNewContext(`${code}; this.copy = copyText;`, context);
-    await context.copy('sid-123');
+    await context.copy(...args);
     return toastMsg;
   };
   assert.equal(await run(async () => {}, false), 'Session ID copied');
   assert.equal(await run(async () => { throw Error('denied'); }, true), 'Session ID copied');
   assert.equal(await run(async () => { throw Error('denied'); }, false), 'Session ID: sid-123');
+  assert.equal(await run(async () => {}, false, ['x', 'Text']), 'Text copied');
+  assert.equal(await run(async () => { throw Error('denied'); }, false, ['x', 'Text']), 'Text: x');
+});
+
+test('chat gets the store, copy, api and limits', () => {
+  const app = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const open = app.slice(app.indexOf('function openChat('), app.indexOf('function closeChat('));
+  for (const s of ['store,', 'copy:', 'api,', 'limits:']) assert.ok(open.includes(s), s);
 });
 
 test('external sessions without a link explain how to enable Remote Control instead of waiting forever', () => {
@@ -512,18 +520,37 @@ test('pin keeps keyboard focus unless the user focuses something else while savi
 test('chat scripts load before app.js and the chat markup exists', () => {
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const at = s => html.indexOf(s);
-  for (const f of ['chat/md.js', 'chat/store.js', 'chat/view.js']) {
+  for (const f of ['chat/highlight.js', 'chat/md.js', 'chat/store.js', 'chat/cards.js', 'chat/menu.js', 'chat/sheets.js', 'chat/attach.js', 'chat/view.js']) {
     assert.ok(at(`<script src="${f}"></script>`) > 0 && at(`<script src="${f}"></script>`) < at('<script src="app.js"></script>'), f);
   }
-  for (const id of ['chat', 'chat-log', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet'])
+  for (const id of ['chat', 'chat-log', 'chat-cards', 'chat-held', 'chat-form', 'chat-input', 'chat-go', 'chat-banner', 'chat-jump', 'chat-sheet', 'chat-chip', 'chat-menu', 'chat-settings', 'notify-toggle', 'chat-attach', 'chat-file', 'chat-atts', 'chat-viewer', 'chat-viewer-img', 'chat-todo', 'chat-hint', 'chat-changes', 'chat-usage', 'chat-running'])
     assert.ok(html.includes(`id="${id}"`), id);
   assert.ok(/id="chat"[^>]*\shidden/.test(html), 'chat starts hidden');
+  assert.ok(at('<script src="chat/attach.js"></script>') < at('<script src="chat/view.js"></script>'));
+  assert.ok(/id="chat-running"[^>]*\shidden/.test(html), 'the running button starts hidden');
+  assert.ok(at('id="chat-menu"') < at('id="chat-atts"') && at('id="chat-atts"') < at('id="chat-form"'), 'menu, then chips, then the form');
+});
+test('attachments never become markup', () => {
+  const attach = readFileSync(new URL('../public/chat/attach.js', import.meta.url), 'utf8');
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|eval\(/.test(attach));
+  assert.match(readFileSync(new URL('../public/index.html', import.meta.url), 'utf8'), /<input id="chat-file" type="file" multiple hidden>/);
+});
+test('the desktop app lets dropped files reach the page', () => {
+  const conf = JSON.parse(readFileSync(new URL('../crates/tauri-app/tauri.conf.json', import.meta.url), 'utf8'));
+  assert.equal(conf.app.windows[0].dragDropEnabled, false);
 });
 test('the chat view never builds markup from conversation text', () => {
-  const view = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
-  const uses = view.match(/\.innerHTML\s*=[^;]*;/g) || [];
-  assert.ok(uses.length > 0 && uses.every(u => /cdashMd\.render\(|=\s*''/.test(u)), uses.join('\n'));
-  assert.ok(!/insertAdjacentHTML|document\.write|eval\(/.test(view));
+  for (const f of ['view.js', 'cards.js', 'sheets.js']) {
+    const view = readFileSync(new URL('../public/chat/' + f, import.meta.url), 'utf8');
+    const uses = view.match(/\.innerHTML\s*=[^;]*;/g) || [];
+    assert.ok(uses.length > 0 && uses.every(u => /cdashMd\.render\(|=\s*''/.test(u)), f + uses.join('\n'));
+    assert.ok(!/insertAdjacentHTML|document\.write|eval\(/.test(view));
+  }
+  // Drafts go through app.js's guarded store, never straight to storage.
+  assert.ok(!readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8').includes('localStorage'));
+});
+test('the menu shows tool-supplied names as text only', () => {
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|eval\(/.test(readFileSync(new URL('../public/chat/menu.js', import.meta.url), 'utf8')));
 });
 test('the composer follows the session: send, stop, or off', async () => {
   globalThis.document = undefined;                              // the helper must not touch the DOM
@@ -572,4 +599,131 @@ test('running cards put Chat and Open in Claude on one row and the session tools
   assert.ok(!/data-term=|data-copy=|data-kill=/.test(full[0]));
   assert.ok(/data-term=/.test(full[1]) && /data-copy=/.test(full[1]) && /data-kill=/.test(full[1]));
   assert.equal(rows(card({ name: 'cdash-t', dir: '/p', provider: 'terminal' })).length, 1, 'a bare terminal has no empty row');
+});
+
+test('older history is asked for while the list cannot scroll, and Send again keeps its row offline', async () => {
+  globalThis.document = undefined;
+  await import('../public/chat/store.js');
+  await import('../public/chat/view.js');
+  const { needPage, resend, httpBase } = globalThis.cdashChat;
+  assert.equal(httpBase('wss://h.example:8443/api/chat?name=a'), 'https://h.example:8443', 'thumbnails come from the agent the socket reached');
+  assert.equal(httpBase('ws://127.0.0.1:41234/api/chat?name=a'), 'http://127.0.0.1:41234');
+  assert.equal(httpBase('wss://h/prefix/api/chat?name=a&after=3'), 'https://h/prefix', "a profile's path prefix stays");
+  assert.equal(needPage(true, false, 0, 500, 600), true, 'a first screen that does not scroll still pages');
+  assert.equal(needPage(true, false, 10, 3000, 600), true, 'scrolled to the top');
+  assert.equal(needPage(true, false, 900, 3000, 600), false);
+  assert.equal(needPage(false, false, 0, 500, 600), false, 'nothing older');
+  assert.equal(needPage(true, true, 0, 500, 600), false, 'one page at a time');
+  const s = { mine: [{ cid: 'c1', text: 'hi', status: 'unconfirmed', seq: null }] };
+  assert.equal(resend(s, 'c1', () => false), false);
+  assert.deepEqual(s.mine.map(m => m.cid), ['c1'], 'offline: the row and its text stay');
+  assert.equal(resend(s, 'c1', text => text === 'hi'), true);
+  assert.deepEqual(s.mine, []);
+  const files = [{ id: '0123456789abcdef', name: 'a.png', kind: 'image', size: 8, mime: 'image/png' }];
+  const t = { mine: [{ cid: 'c2', text: '', status: 'unconfirmed', seq: null, files }] };
+  assert.equal(resend(t, 'c2', (text, fs) => text === '' && fs === files), true, 'Send again carries the attachments');
+});
+
+test('focus counts only a visible, focused page with input in the last two minutes, and both sockets report it', async () => {
+  globalThis.document = undefined;
+  await import('../public/chat/store.js');
+  await import('../public/chat/view.js');
+  const at = o => globalThis.cdashChat.focusActive({ visible: true, focused: true, lastInput: 0, now: 0, ...o });
+  assert.equal(at({ now: 119_999 }), true);
+  assert.equal(at({ now: 120_000 }), false, 'a desk window left focused stops counting after two idle minutes');
+  assert.equal(at({ visible: false }), false);
+  assert.equal(at({ focused: false }), false);
+  const src = f => readFileSync(new URL(f, import.meta.url), 'utf8');
+  for (const f of ['../public/chat/view.js', '../public/app.js']) assert.match(src(f), /t: 'focus', on/, f);
+});
+
+test('an untouched page stops reporting focus after two idle minutes', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  globalThis.document = { hidden: false, hasFocus: () => true, addEventListener() {} };
+  globalThis.addEventListener = () => {};
+  t.after(() => { globalThis.document = undefined; delete globalThis.addEventListener; });
+  await import('../public/chat/store.js');
+  await import('../public/chat/view.js');
+  const seen = [];
+  globalThis.cdashChat.watchFocus(on => seen.push(on));
+  t.mock.timers.tick(119_000);
+  assert.deepEqual(seen, []);
+  t.mock.timers.tick(1_100);
+  assert.deepEqual(seen, [false]);
+});
+
+function notifyHelpers(extra = {}) {
+  const src = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const slice = src.slice(src.indexOf('function notifyBlocked('), src.indexOf('/* notify wiring */'));
+  const opened = [], toasts = [];
+  const ctx = { atob, URLSearchParams, listed: true, lastRunning: [], opened, toasts,
+    openChat: (s, p) => opened.push([s, p]), toast: m => toasts.push(m), ...extra };
+  runInNewContext(slice, ctx);
+  return ctx;
+}
+test('the switch says why it cannot work here', () => {
+  const { notifyBlocked } = notifyHelpers();
+  const env = o => ({ tauri: false, secure: true, push: true, permission: 'default', ...o });
+  assert.equal(notifyBlocked(env({ secure: false })), 'needs HTTPS or 127.0.0.1');
+  assert.equal(notifyBlocked(env({ push: false })), 'this browser cannot receive push notifications');
+  assert.equal(notifyBlocked(env({ permission: 'denied' })), 'notifications are blocked for this site');
+  assert.equal(notifyBlocked(env({})), '');
+  assert.equal(notifyBlocked(env({ tauri: true, secure: false, push: false })), '', 'the apps use their own channel');
+});
+const plain = o => JSON.parse(JSON.stringify(o)); // objects from the vm context have another prototype
+test('a tapped notification opens its chat, or says the session has ended', () => {
+  const c = notifyHelpers({ lastRunning: [{ name: 'cdash-a', chat: true }] });
+  assert.deepEqual(plain(c.chatFromQuery('?chat=cdash-a&title=proj')), { s: 'cdash-a', p: 'proj' });
+  assert.deepEqual(plain(c.chatFromQuery('?chat=cdash-a&title=a%26b%23c%20d')), { s: 'cdash-a', p: 'a&b#c d' });
+  assert.equal(c.chatFromQuery('?x=1'), null);
+  c.noteOpen('cdash-a', 'proj');
+  c.noteOpen('cdash-gone', 'old');
+  assert.deepEqual(c.opened, [['cdash-a', 'proj']]);
+  assert.deepEqual(c.toasts, ['That session has ended']);
+});
+test('a tap before the first session list waits for it', () => {
+  const c = notifyHelpers({ listed: false, lastRunning: [{ name: 'cdash-a', chat: true }] });
+  c.noteOpen('cdash-a', 'proj');
+  assert.deepEqual(c.opened, []);
+  assert.deepEqual(c.toasts, []);
+  c.listed = true;
+  c.flushOpen();
+  c.flushOpen();
+  assert.deepEqual(c.opened, [['cdash-a', 'proj']], 'opened once, after the list arrived');
+});
+test('a browser subscription follows the agent key and is registered again on each load', async () => {
+  const { syncPush } = notifyHelpers();
+  const posted = [];
+  const sub = k => ({ options: { applicationServerKey: Uint8Array.from([k]).buffer }, toJSON: () => ({ endpoint: 'https://p/' + k }),
+    unsubscribe: async () => { pm.current = null; return true; } });
+  const pm = { current: null, getSubscription: async () => pm.current,
+    subscribe: async o => (pm.current = sub(new Uint8Array(o.applicationServerKey)[0])) };
+  assert.equal(await syncPush(pm, 'AQ', s => posted.push(s)), false, 'not subscribed: nothing to sync');
+  pm.current = sub(1);
+  assert.equal(await syncPush(pm, 'AQ', s => posted.push(s)), true);
+  assert.equal(await syncPush(pm, 'Ag', s => posted.push(s)), true);
+  assert.deepEqual(posted.map(s => s.endpoint), ['https://p/1', 'https://p/2']);
+});
+
+test('view.js never assigns state.mine: only the store mutates what rows() reads', () => {
+  const src = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
+  assert.ok(!src.includes('state.mine ='));
+});
+
+test('one rewind or undo at a time, a caret not after the code wrapper, and keyboard-reachable messages', () => {
+  const view = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
+  const sends = view.split('\n').filter(l => /t: 'rewind(_undo)?'/.test(l));
+  assert.ok(sends.length >= 2 && sends.every(l => l.includes('rewinding')), sends.join('\n'));
+  assert.ok(view.includes('tabIndex = 0'), 'message bodies take focus');
+  assert.ok(!/MARK\[/.test(view) || /Object\.hasOwn\(MARK/.test(view), 'MARK is looked up as own keys only');
+  const css = readFileSync(new URL('../public/style.css', import.meta.url), 'utf8');
+  for (const rule of css.match(/[^{}]*streaming[^{}]*::after[^{}]*\{/g) || []) assert.ok(rule.includes(':not(.chat-code)') || rule.includes('.chat-code'), rule);
+});
+
+test('/btw opens the side sheet and is never sent; the menu offers it; aside frames reach the sheets', () => {
+  const view = readFileSync(new URL('../public/chat/view.js', import.meta.url), 'utf8');
+  const submit = view.slice(view.indexOf("$('#chat-form').addEventListener('submit'"), view.indexOf("input.addEventListener('keydown'"));
+  assert.ok(submit.indexOf('cdashSheets.btw(') > 0 && submit.indexOf('cdashSheets.btw(') < submit.indexOf('submitText('), submit);
+  assert.match(view, /cdashSheets\.onFrame\(/);
+  assert.match(readFileSync(new URL('../public/chat/menu.js', import.meta.url), 'utf8'), /name: 'btw'/);
 });

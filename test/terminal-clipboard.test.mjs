@@ -19,7 +19,7 @@ function terminalKeys() {
     getComputedStyle: () => ({ getPropertyValue: () => 'monospace' }),
     FitAddon: { FitAddon: class { fit() {} } },
     ResizeObserver: class { observe() {} },
-    history: { pushState() {} }, setCtrl() {}, termConnect() {},
+    history: { pushState() {} }, setCtrl() {}, termConnect() {}, cdashChat: { watchFocus: () => () => {} },
   });
   return (key, modifiers = {}, selection = false) => {
     selected = selection;

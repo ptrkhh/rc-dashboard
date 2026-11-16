@@ -1,0 +1,6 @@
+{"type":"system","subtype":"turn_duration","uuid":"1f2a686a-6106-4dc8-8612-3ab8910a20f8","parentUuid":"03a82745-6f94-4455-a312-d25ef099b24f","isSidechain":false}
+{"type":"system","subtype":"compact_boundary","uuid":"2fed1735-26ac-4cdf-9015-359a74d55d90","parentUuid":null,"logicalParentUuid":"1f2a686a-6106-4dc8-8612-3ab8910a20f8","isSidechain":false}
+{"type":"user","uuid":"fd277824-f7a9-494c-96f0-90723428e000","parentUuid":"2fed1735-26ac-4cdf-9015-359a74d55d90","isSidechain":false,"isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}
+{"type":"attachment","uuid":"63c28e42-9102-4443-9bff-2305a35cdeb9","parentUuid":"fd277824-f7a9-494c-96f0-90723428e000","isSidechain":false,"attachment":{"type":"file"}}
+{"type":"system","subtype":"informational","uuid":"75928b5b-9212-4e7e-a93b-ab9933e90693","parentUuid":"7645452b-6009-4deb-9800-422ca6b37e27","isSidechain":false}
+{"type":"user","uuid":"a7e885f8-2a43-43d9-afd3-e119d30842f2","parentUuid":"75928b5b-9212-4e7e-a93b-ab9933e90693","isSidechain":false,"promptSource":"typed","message":{"role":"user","content":"next step"}}

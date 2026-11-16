@@ -39,3 +39,52 @@ test('a new service worker takes over at once, so old browsers pick up the fix o
   handlers.install?.({ waitUntil() {} });
   assert.ok(skipped);
 });
+
+// Runs sw.js with a fake registration and clients; records notifications shown and windows opened.
+function worker() {
+  const w = { handlers: {}, shown: [], opened: [], clients: [] };
+  const self = {
+    addEventListener: (type, fn) => { w.handlers[type] = fn; },
+    registration: { showNotification: async (title, o) => { w.shown.push({ title, ...o }); } },
+    clients: { matchAll: async () => w.clients, openWindow: async u => { w.opened.push(u); } },
+  };
+  runInNewContext(readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8'), { self, URL, encodeURIComponent, caches: {}, fetch: async () => {} });
+  return w;
+}
+function pushed(w, text) {
+  let p;
+  const data = text === undefined ? null : { json: () => JSON.parse(text), text: () => text };
+  w.handlers.push({ data, waitUntil: x => { p = x; } });
+  return p;
+}
+
+test('a push shows one notification per session, titled with the project', async () => {
+  const w = worker();
+  for (const [k, t] of [['done', 1], ['ask', 2]]) await pushed(w, JSON.stringify({ s: 'cdash-a', p: 'proj', k, t }));
+  await pushed(w, JSON.stringify({ s: 'cdash-b', p: 'other', k: 'error', t: 3 }));
+  assert.deepEqual(w.shown.map(n => [n.title, n.body, n.tag]),
+    [['proj', 'Finished', 'cdash-a'], ['proj', 'Needs your answer', 'cdash-a'], ['other', 'Stopped with an error', 'cdash-b']]);
+});
+test('a push that cannot be read still shows a notification', async () => {
+  const w = worker();
+  await pushed(w, 'not json');
+  await pushed(w, undefined);
+  assert.deepEqual(w.shown.map(n => [n.title, n.body]), [['RC Dashboard', 'Open the dashboard'], ['RC Dashboard', 'Open the dashboard']]);
+});
+test('a tap asks an open dashboard to open the chat, or opens one that will', async () => {
+  const w = worker();
+  const note = { data: { s: 'cdash-a', p: 'proj' }, close() { this.closed = true; } };
+  // posted messages are copied: objects made inside the vm context fail strict deepEqual on prototype
+  const tap = () => { let p; w.handlers.notificationclick({ notification: note, waitUntil: x => { p = x; } }); return p; };
+  await tap();
+  assert.deepEqual(w.opened, ['/?chat=cdash-a&title=proj']);
+  const posted = [];
+  w.clients.push({ focus: async () => {}, postMessage: m => posted.push(JSON.parse(JSON.stringify(m))) });
+  await tap();
+  assert.deepEqual(posted, [{ t: 'open-chat', s: 'cdash-a', p: 'proj' }]);
+  assert.equal(note.closed, true);
+  note.data = { s: 'cdash-a', p: 'a&b #c' };
+  w.clients.length = 0;
+  await tap();
+  assert.equal(w.opened.at(-1), '/?chat=cdash-a&title=a%26b%20%23c');
+});

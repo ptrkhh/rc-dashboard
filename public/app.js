@@ -42,6 +42,8 @@ const ICONS = {
   clock: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
   pin: svg('<path d="M16 3l5 5-4 1-3 5v3l-7-7h3l5-3zM3 21l6-6"/>'),
   star: svg('<path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.7l5.9-.9z"/>'),
+  bell: svg('<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>'),
+  bellOff: svg('<path d="M13.7 21a2 2 0 0 1-3.4 0"/><path d="M18.6 13A17 17 0 0 1 18 8a6 6 0 0 0-9.3-5"/><path d="M6.3 6.3A6 6 0 0 0 6 8c0 7-3 9-3 9h14"/><path d="M2 2l20 20"/>'),
   starFilled: `<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.7l5.9-.9z"/></svg>`,
 };
 
@@ -228,14 +230,14 @@ async function refreshModels(g, dir = $('#dir').value.trim()) {
 
 // navigator.clipboard needs a secure context, which a phone on plain-HTTP LAN
 // lacks; execCommand still works there. Last resort: show it for a long-press.
-async function copyText(text) {
-  try { await navigator.clipboard.writeText(text); toast('Session ID copied'); return; } catch {}
+async function copyText(text, label = 'Session ID') {
+  try { await navigator.clipboard.writeText(text); toast(`${label} copied`); return; } catch {}
   const ta = document.createElement('textarea');
   ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
   document.body.append(ta); ta.select();
   const ok = document.execCommand('copy');
   ta.remove();
-  toast(ok ? 'Session ID copied' : `Session ID: ${text}`);
+  toast(ok ? `${label} copied` : `${label}: ${text}`);
 }
 
 function toast(msg) {
@@ -360,7 +362,9 @@ function runningCard(r) {
 }
 
 let lastRes = [];
+let listed = false; // a session list has arrived (render sets it; `polled` also counts failures)
 let lastRunning = []; // the last poll's running cards, for the chat header's Claude link
+let lastStats = null; // the last poll's stats, for the chat's usage sheet
 let lastPinned = [];
 // A session resumes only with its own provider's models: a Claude transcript and
 // a Codex thread cannot stand in for each other. Everything shown is concrete
@@ -452,6 +456,7 @@ function renderResumable() {
 }
 
 function render(d) {
+  lastStats = d.stats;
   $('#nrun').textContent = d.running.length;
   $('#npin').textContent = d.pinned?.length || 0;
   $('#nres').textContent = d.resumable.length;
@@ -492,6 +497,7 @@ function render(d) {
   }
   lastRes = d.resumable;
   lastRunning = d.running;
+  listed = true;
   lastPinned = d.pinned || [];
   // Same rule for the pickers: re-rendering would snap an open menu shut.
   if (!document.activeElement?.closest('.pick-dd') && !$('.pick-dd .cb-menu:not([hidden])')) renderResumable();
@@ -644,6 +650,7 @@ async function termConnect() {
     // onResize drops sizes while connecting, and the keyboard that focus()
     // opens usually lands then; send the size the screen has now.
     ws.send(JSON.stringify({ resize: [t.xterm.cols, t.xterm.rows] }));
+    ws.send(JSON.stringify({ t: 'focus', on: cdashChat.focusNow() }));
   };
   ws.onmessage = e => { if (typeof e.data !== 'string') t.xterm.write(new Uint8Array(e.data)); };
   ws.onclose = e => {
@@ -705,6 +712,9 @@ function openTerm(name, title) {
   term.ro = new ResizeObserver(() => fit.fit());
   term.ro.observe($('#term-screen'));
   history.pushState({ term: name }, ''); // Android back closes the overlay
+  term.unwatch = cdashChat.watchFocus(on => {
+    if (term?.ws?.readyState === WebSocket.OPEN) term.ws.send(JSON.stringify({ t: 'focus', on }));
+  });
   termConnect();
   xterm.focus();
 }
@@ -713,6 +723,7 @@ function closeTerm() {
   if (!term) return;
   const t = term;
   term = null;
+  t.unwatch?.();
   t.ro.disconnect();
   t.ws?.close();
   t.xterm.dispose();
@@ -754,11 +765,19 @@ function openChat(name, title) {
     name, title, wsUrl, toast,
     rcLink: lastRunning.find(r => r.name === name)?.rcLink || null,
     openTerm: (n, t) => openTerm(n, t),
+    store,
+    copy: text => copyText(text, 'Text'),
+    api,
+    limits: () => ({ claude: lastStats?.claudeUsage || [], codex: lastStats?.codexUsage || [] }),
   });
   document.body.classList.add('chat-open');
   chatFull = !wide.matches;
   // Switching cards replaces the entry, so back always leaves chat in one step.
   history[already ? 'replaceState' : 'pushState']({ chat: name }, '');
+  // Opening the chat answers the notification: clear it, ignoring failures.
+  if (isTauri) { try { invoke('notify_clear', { name }).catch(() => {}); } catch {} }
+  else if ('serviceWorker' in navigator) navigator.serviceWorker.ready
+    .then(r => r.getNotifications({ tag: name })).then(ns => ns.forEach(n => n.close())).catch(() => {});
 }
 
 function closeChat() {
@@ -777,6 +796,88 @@ wide.addEventListener('change', () => {
   chatFull = !wide.matches;
   if (!chatFull) poll();
 });
+
+/* ---------- Notifications: the switch, the subscription, taps ---------- */
+function notifyBlocked({ tauri, secure, push, permission }) {
+  if (tauri) return '';
+  if (!secure) return 'needs HTTPS or 127.0.0.1';
+  if (!push) return 'this browser cannot receive push notifications';
+  if (permission === 'denied') return 'notifications are blocked for this site';
+  return '';
+}
+function chatFromQuery(search) {
+  const q = new URLSearchParams(search), s = q.get('chat');
+  return s ? { s, p: q.get('title') || s } : null;
+}
+function b64urlBytes(s) {
+  return Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+}
+// Keeps the browser's subscription on the agent's key and registered; false when there is none.
+async function syncPush(pm, key, post) {
+  let sub = await pm.getSubscription();
+  if (!sub) return false;
+  const want = b64urlBytes(key), have = new Uint8Array(sub.options.applicationServerKey || 0);
+  if (have.length !== want.length || have.some((b, i) => b !== want[i])) {
+    await sub.unsubscribe();
+    sub = await pm.subscribe({ userVisibleOnly: true, applicationServerKey: want });
+  }
+  await post(sub.toJSON());
+  return true;
+}
+// A tap before the first session list is held; after it, the list says whether the session still runs.
+let pendingOpen = null;
+function noteOpen(s, p) {
+  if (!listed) { pendingOpen = [s, p]; return; }
+  if (lastRunning.some(r => r.name === s && r.chat)) openChat(s, p || s);
+  else toast('That session has ended');
+}
+function flushOpen() {
+  const o = pendingOpen;
+  if (o && listed) { pendingOpen = null; noteOpen(...o); }
+}
+/* notify wiring */
+window.cdashOpenChat = noteOpen;
+{
+  const btn = $('#notify-toggle'), KEY = 'cdash-notify';
+  const paint = on => {
+    btn.innerHTML = on ? ICONS.bell : ICONS.bellOff;
+    btn.setAttribute('aria-checked', String(on));
+  };
+  const blocked = () => notifyBlocked({ tauri: isTauri, secure: window.isSecureContext,
+    push: 'PushManager' in window && 'serviceWorker' in navigator, permission: globalThis.Notification?.permission });
+  const why = blocked();
+  paint(false);
+  if (why) { btn.disabled = true; btn.title = why; }
+  else {
+    btn.title = 'Notifications on this device';
+    const reg = () => navigator.serviceWorker.ready;
+    const post = sub => api('/api/push/subscribe', sub);
+    if (isTauri) {
+      const set = async on => { await invoke('notify_set', { on }); store.set(KEY, on ? '1' : '0'); paint(on); };
+      btn.addEventListener('click', () => set(btn.getAttribute('aria-checked') !== 'true').catch(e => toast(String(e?.message ?? e))));
+      if (store.get(KEY) === '1') { paint(true); set(true).catch(() => {}); }
+      try { invoke('notify_take_open').then(o => { if (o) noteOpen(o.s, o.p); }).catch(() => {}); } catch {}
+    } else {
+      const toggle = async () => {
+        const pm = (await reg()).pushManager, sub = await pm.getSubscription();
+        if (sub) {
+          await sub.unsubscribe();
+          await api('/api/push/unsubscribe', { endpoint: sub.endpoint });
+          return paint(false);
+        }
+        if (await Notification.requestPermission() !== 'granted') return toast('Notifications were not allowed');
+        const { key } = await api('/api/push/key');
+        await post((await pm.subscribe({ userVisibleOnly: true, applicationServerKey: b64urlBytes(key) })).toJSON());
+        paint(true);
+      };
+      btn.addEventListener('click', () => toggle().catch(e => toast(String(e?.message ?? e))));
+      reg().then(async r => paint(await syncPush(r.pushManager, (await api('/api/push/key')).key, post))).catch(() => {});
+      navigator.serviceWorker.addEventListener('message', e => { if (e.data?.t === 'open-chat') noteOpen(e.data.s, e.data.p); });
+    }
+  }
+  const tapped = chatFromQuery(location.search);
+  if (tapped) { history.replaceState(null, '', location.pathname); noteOpen(tapped.s, tapped.p); }
+}
 
 let modelDirTimer;
 $('#dir').addEventListener('input', () => {
@@ -949,6 +1050,7 @@ async function tick() {
     const data = await api(`/api/sessions?resumable=${resLimit}`);
     if (g !== gen) return; // superseded mid-flight: never paint the old snapshot
     render(data);
+    flushOpen();
     $('#health').className = 'dot ok';
     $('#health-label').textContent = 'Connected';
     markConnected();

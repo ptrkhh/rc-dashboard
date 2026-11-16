@@ -194,6 +194,103 @@ pub async fn post_pin(
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
+fn push_failed(e: std::io::Error) -> ApiError {
+    ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("Could not read cdash-push.json: {e}") }
+}
+
+/// Resolves when `serve`'s stop signal fires; never without one (a router
+/// served on its own, as tests do).
+pub(crate) async fn stopped(stop: Option<axum::Extension<tokio::sync::watch::Receiver<bool>>>) {
+    match stop {
+        Some(axum::Extension(mut rx)) => {
+            let _ = rx.wait_for(|s| *s).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// One `data:` line per note. Ends when the server stops, so `Bound::stop`
+/// never waits on an open stream. A lagged receiver skips ahead.
+pub async fn get_notify(
+    State(ctx): State<Arc<Ctx>>,
+    stop: Option<axum::Extension<tokio::sync::watch::Receiver<bool>>>,
+) -> axum::response::sse::Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
+    use axum::response::sse::{Event, KeepAlive};
+    use tokio::sync::broadcast::error::RecvError;
+    let stream = futures_util::stream::unfold((ctx.notes.subscribe(), Box::pin(stopped(stop))), |(mut rx, mut stopped)| async move {
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return None,
+                r = rx.recv() => match r {
+                    Ok(n) => return Some((Ok(Event::default().data(n.payload())), (rx, stopped))),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return None,
+                },
+            }
+        }
+    });
+    axum::response::sse::Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(25)))
+}
+
+pub async fn get_push_key(State(ctx): State<Arc<Ctx>>) -> Result<Response, ApiError> {
+    let key = crate::chat::push::key(&ctx).await.map_err(push_failed)?;
+    Ok(Json(serde_json::json!({ "key": key })).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct PushKeys {
+    #[serde(default)]
+    pub p256dh: String,
+    #[serde(default)]
+    pub auth: String,
+}
+
+#[derive(Deserialize)]
+pub struct SubscribeBody {
+    #[serde(default)]
+    pub endpoint: String,
+    pub keys: Option<PushKeys>,
+}
+
+pub async fn post_push_subscribe(
+    State(ctx): State<Arc<Ctx>>,
+    Json(body): Json<SubscribeBody>,
+) -> Result<Response, ApiError> {
+    use crate::chat::ece::unb64;
+    let bad = |m: &str| ApiError { status: StatusCode::BAD_REQUEST, message: m.to_string() };
+    let keys = body.keys.ok_or_else(|| bad("missing keys"))?;
+    if !body.endpoint.starts_with("https://") || body.endpoint.len() > 2048 {
+        return Err(bad("bad endpoint"));
+    }
+    if !unb64(&keys.p256dh).is_some_and(|k| k.len() == 65 && k[0] == 4) {
+        return Err(bad("bad p256dh"));
+    }
+    if unb64(&keys.auth).is_none_or(|k| k.len() != 16) {
+        return Err(bad("bad auth"));
+    }
+    let added = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let sub = crate::chat::push::Sub { endpoint: body.endpoint, p256dh: keys.p256dh, auth: keys.auth, added };
+    crate::chat::push::add(&ctx, sub).await.map_err(push_failed)?;
+    Ok(Json(serde_json::json!({ "ok": true })).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct UnsubscribeBody {
+    #[serde(default)]
+    pub endpoint: String,
+}
+
+pub async fn post_push_unsubscribe(
+    State(ctx): State<Arc<Ctx>>,
+    Json(body): Json<UnsubscribeBody>,
+) -> Result<Response, ApiError> {
+    crate::chat::push::remove(&ctx, &body.endpoint).await.map_err(push_failed)?;
+    Ok(Json(serde_json::json!({ "ok": true })).into_response())
+}
+
 pub async fn post_launch(
     State(ctx): State<Arc<Ctx>>,
     Json(body): Json<LaunchBody>,
@@ -309,7 +406,28 @@ pub async fn get_chat(
     };
     let after = q.get("after").and_then(|a| a.parse::<u64>().ok());
     let epoch = q.get("epoch").cloned();
-    Ok(ws.on_upgrade(move |socket| crate::chat::ws::serve(ctx, hub, name, after, epoch, socket)))
+    // Text is at most 32 KiB and upload slices 1 MiB; 2 MiB leaves room for JSON escapes.
+    Ok(ws.max_message_size(2 << 20).on_upgrade(move |socket| crate::chat::ws::serve(ctx, hub, name, after, epoch, socket)))
+}
+
+/// The session folder's changes against HEAD. Only the session name comes from
+/// the client; the folder is the transcript's own `cwd`.
+pub async fn get_chat_diff(
+    State(ctx): State<Arc<Ctx>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let name = q.get("session").cloned().unwrap_or_default();
+    assert_kill_name(&name)?;
+    let conflict = |message: String| ApiError { status: StatusCode::CONFLICT, message };
+    let hub = match crate::chat::hub_for(&ctx, &name).await {
+        Ok(hub) => hub,
+        Err(Refused::BadRequest(m) | Refused::Failed(m)) => return Err(conflict(m)),
+    };
+    let Some(folder) = hub.folder().await else {
+        return Err(conflict("this session's folder is not known yet".into()));
+    };
+    ctx.host.log.push(format!("chat diff {name}"));
+    Ok(Json(crate::chat::diff::diff(&ctx.runner, &folder).await).into_response())
 }
 
 pub async fn post_purge(
@@ -338,6 +456,39 @@ pub async fn post_logout(
     }
 }
 
+/// A cached chat image by its hash. Only `^[0-9a-f]{64}$` reaches the file
+/// system, and the file is opened with O_NOFOLLOW, so nothing outside
+/// `media_dir` is read even through a planted symlink.
+// ponytail: reads the whole file per request; stream it if large originals are viewed often.
+pub async fn get_chat_media(axum::extract::Path(reference): axum::extract::Path<String>) -> Response {
+    use std::os::unix::fs::OpenOptionsExt;
+    use tokio::io::AsyncReadExt;
+    if reference.len() != 64 || !reference.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    for (mime, ext) in crate::chat::media::IMAGES {
+        let path = crate::chat::media::media_dir().join(format!("{reference}.{ext}"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let Ok(file) = tokio::fs::OpenOptions::from(opts).open(path).await else { continue };
+        let mut body = Vec::new();
+        if !file.metadata().await.is_ok_and(|m| m.is_file()) || tokio::io::BufReader::new(file).read_to_end(&mut body).await.is_err() {
+            continue;
+        }
+        return (
+            [
+                ("content-type", mime),
+                ("x-content-type-options", "nosniff"),
+                ("content-security-policy", "default-src 'none'"),
+                ("cache-control", "private, max-age=31536000, immutable"),
+            ],
+            body,
+        )
+            .into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::http::serve::serve;
@@ -349,6 +500,52 @@ mod tests {
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
         std::fs::write(dir.join("history.jsonl"), "").unwrap();
         dir
+    }
+
+    async fn raw_status(addr: std::net::SocketAddr, path: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out.split(' ').nth(1).unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_diff_refuses_bad_names_and_sessions_without_chat() {
+        let b = serve(cfg_for(tempdir("chat-diff"))).await.unwrap();
+        assert_eq!(http_get(&format!("http://{}/api/chat/diff?session=other", b.addr)).await.0, 400);
+        assert_eq!(http_get(&format!("http://{}/api/chat/diff?session=cdash-gone", b.addr)).await.0, 409);
+    }
+
+    #[tokio::test]
+    async fn chat_media_is_served_only_by_hash_and_only_as_an_image() {
+        let b = serve(cfg_for(tempdir("media"))).await.unwrap();
+        let png = [crate::chat::media::tests::PNG, b"route"].concat();
+        let r = crate::chat::media::stash(&png, "image/png").unwrap();
+        let res = reqwest::get(format!("http://{}/api/chat/media/{r}", b.addr)).await.unwrap();
+        assert_eq!(res.status(), 200);
+        for (h, v) in [("content-type", "image/png"), ("x-content-type-options", "nosniff"),
+            ("content-security-policy", "default-src 'none'"), ("cache-control", "private, max-age=31536000, immutable")] {
+            assert_eq!(res.headers()[h], v, "{h}");
+        }
+        assert_eq!(res.bytes().await.unwrap().as_ref(), png.as_slice());
+        for bad in ["..".to_string(), "%2e%2e".into(), r.to_uppercase(), r[..63].into(), format!("{r}0"), "..%2f..%2fetc%2fpasswd".into()] {
+            assert_eq!(raw_status(b.addr, &format!("/api/chat/media/{bad}")).await, 400, "{bad}");
+        }
+        assert_eq!(raw_status(b.addr, &format!("/api/chat/media/{}", "0".repeat(64))).await, 404);
+    }
+
+    #[tokio::test]
+    async fn chat_media_never_follows_a_symlink_out_of_the_cache() {
+        let b = serve(cfg_for(tempdir("media-link"))).await.unwrap();
+        let secret = tempdir("media-secret").join("secret.png");
+        std::fs::write(&secret, b"secret").unwrap();
+        let r = "1".repeat(64);
+        let dir = crate::chat::media::media_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join(format!("{r}.png"))).unwrap();
+        assert_eq!(raw_status(b.addr, &format!("/api/chat/media/{r}")).await, 404);
     }
 
     #[tokio::test]
@@ -404,6 +601,49 @@ mod tests {
         assert_eq!(saved.len(), 2);
         assert!(saved.contains(&"01234567-1234-1234-1234-0123456789ab".into()));
         assert!(saved.contains(&"01234567-1234-1234-1234-0123456789ac".into()));
+    }
+
+    async fn post(b: &crate::http::serve::Bound, path: &str, body: &str) -> u16 {
+        http_post(&format!("http://{}{path}", b.addr), body).await.0
+    }
+
+    #[tokio::test]
+    async fn the_push_key_is_made_once_kept_private_and_names_no_one() {
+        let dir = tempdir("push-key");
+        let b = serve(cfg_for(dir.clone())).await.unwrap();
+        let url = format!("http://{}/api/push/key", b.addr);
+        let (k1, k2) = (reqwest_get(&url).await, reqwest_get(&url).await);
+        assert_eq!(k1, k2);
+        let key: serde_json::Value = serde_json::from_str(&k1).unwrap();
+        assert_eq!(crate::chat::ece::unb64(key["key"].as_str().unwrap()).unwrap().len(), 65);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(dir.join("cdash-push.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!std::fs::read_to_string(dir.join("cdash-push.json")).unwrap().contains('@'));
+    }
+
+    #[tokio::test]
+    async fn subscriptions_are_checked_kept_once_per_device_and_removed() {
+        let b = serve(cfg_for(tempdir("push-subs"))).await.unwrap();
+        let (p, a) = (crate::chat::ece::b64(&[4u8; 65]), crate::chat::ece::b64(&[1u8; 16]));
+        let sub = |ep: &str, key: &str| format!(r#"{{"endpoint":"{ep}","keys":{{"p256dh":"{key}","auth":"{a}"}}}}"#);
+        assert_eq!(post(&b, "/api/push/subscribe", &sub("http://push.example/x", &p)).await, 400, "push services are https");
+        assert_eq!(post(&b, "/api/push/subscribe", &sub("https://push.example/x", "AAAA")).await, 400, "not a P-256 point");
+        assert_eq!(post(&b, "/api/push/subscribe", &sub("https://push.example/x", &p)).await, 200);
+        assert_eq!(post(&b, "/api/push/subscribe", &sub("https://push.example/x", &p)).await, 200);
+        assert_eq!(crate::chat::push::subscriptions(&b.ctx).await.len(), 1);
+        assert_eq!(post(&b, "/api/push/unsubscribe", r#"{"endpoint":"https://push.example/x"}"#).await, 200);
+        assert!(crate::chat::push::subscriptions(&b.ctx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_push_file_is_reported_and_left_alone() {
+        let dir = tempdir("push-corrupt");
+        std::fs::write(dir.join("cdash-push.json"), "{not json").unwrap();
+        let b = serve(cfg_for(dir.clone())).await.unwrap();
+        let (status, body) = http_get(&format!("http://{}/api/push/key", b.addr)).await;
+        assert_eq!(status, 500);
+        assert!(body.contains("cdash-push.json"));
+        assert_eq!(std::fs::read_to_string(dir.join("cdash-push.json")).unwrap(), "{not json", "a new key would orphan every device");
     }
 
     #[tokio::test]
@@ -667,7 +907,7 @@ mod tests {
     #[tokio::test]
     async fn chat_assets_are_embedded() {
         let b = serve(cfg_for(tempdir("chat-assets"))).await.unwrap();
-        for (path, marker) in [("/chat/md.js", "cdashMd"), ("/chat/store.js", "cdashChatStore"), ("/chat/view.js", "cdashChat")] {
+        for (path, marker) in [("/chat/highlight.js", "cdashHighlight"), ("/chat/md.js", "cdashMd"), ("/chat/store.js", "cdashChatStore"), ("/chat/cards.js", "cdashCards"), ("/chat/menu.js", "cdashMenu"), ("/chat/sheets.js", "cdashSheets"), ("/chat/attach.js", "cdashAttach"), ("/chat/view.js", "cdashChat")] {
             assert!(reqwest_get(&format!("http://{}{path}", b.addr)).await.contains(marker), "{path}");
         }
     }

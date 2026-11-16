@@ -8,6 +8,13 @@ use std::time::Duration;
 /// without measuring; do not remove it.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What `run_capped` read.
+pub struct Capped {
+    pub out: String,
+    pub truncated: bool,
+    pub code: Option<i32>,
+}
+
 /// The only sanctioned way to run a subprocess. `clippy.toml` forbids
 /// `std::process::Command` and `tokio::process::Command` everywhere else, and
 /// `-D clippy::disallowed_types` is a required CI gate, because this helper is
@@ -79,6 +86,67 @@ impl Runner {
         Err(format!("{key}: {reason}"))
     }
 
+    /// One-shot with a byte cap: reads at most `cap` bytes of stdout, kills
+    /// the child when more arrive, and errs only on spawn failure or timeout.
+    /// The cap counts raw bytes, before lossy UTF-8 decoding.
+    /// `code` is `None` when the child was killed for the cap.
+    pub async fn run_capped(
+        &self,
+        program: &str,
+        args: &[&str],
+        key: &str,
+        timeout: Duration,
+        cap: usize,
+    ) -> Result<Capped, String> {
+        use tokio::io::AsyncReadExt;
+        #[allow(clippy::disallowed_types)]
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .env("PATH", &self.path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let run = async {
+            let mut child = cmd.spawn()?;
+            let mut buf = Vec::new();
+            let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
+            stdout.take(cap as u64 + 1).read_to_end(&mut buf).await?;
+            let truncated = buf.len() > cap;
+            buf.truncate(cap);
+            let code = if truncated {
+                child.kill().await?;
+                None
+            } else {
+                child.wait().await?.code()
+            };
+            Ok::<_, std::io::Error>(Capped { out: String::from_utf8_lossy(&buf).into_owned(), truncated, code })
+        };
+        let reason = match tokio::time::timeout(timeout, run).await {
+            Err(_) => format!("timed out after {}ms", timeout.as_millis()),
+            Ok(Err(e)) => e.to_string(),
+            Ok(Ok(c)) => return Ok(c),
+        };
+        self.log_once(key, &reason);
+        Err(format!("{key}: {reason}"))
+    }
+
+    /// A long-lived child with stdin and stdout piped, for a protocol rather
+    /// than one answer. Dropping it kills it; the caller bounds every await on
+    /// it with `tokio::time::timeout`.
+    pub fn spawn_piped(&self, program: &str, args: &[&str], cwd: &std::path::Path) -> std::io::Result<tokio::process::Child> {
+        #[allow(clippy::disallowed_types)]
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .current_dir(cwd)
+            .env("PATH", &self.path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        cmd.spawn()
+    }
+
     /// Log a given failing key once per process lifetime. The KEY IS EXPLICIT:
     /// deriving it from `program + args[0]` is what made every `git status`
     /// failure across every repository collapse into one silenced entry.
@@ -98,6 +166,16 @@ mod tests {
         let log = Arc::new(LogBuffer::new());
         let path = std::env::var("PATH").unwrap_or_default();
         (Runner::new(path, log.clone()), log)
+    }
+
+    #[tokio::test]
+    async fn run_capped_stops_at_the_cap_and_reports_the_exit_code() {
+        let (r, _) = runner();
+        let c = r.run_capped("sh", &["-c", "yes x | head -c 100000"], "cap", Duration::from_secs(5), 10).await.unwrap();
+        assert_eq!((c.out.as_str(), c.truncated), ("x\nx\nx\nx\nx\n", true));
+        let c = r.run_capped("sh", &["-c", "printf ab; exit 1"], "code", Duration::from_secs(5), 10).await.unwrap();
+        assert_eq!((c.out.as_str(), c.truncated, c.code), ("ab", false, Some(1)));
+        assert!(r.run_capped("sleep", &["5"], "slow", Duration::from_millis(100), 10).await.is_err());
     }
 
     #[tokio::test]

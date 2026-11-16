@@ -208,3 +208,39 @@ test('event frames parse CRLF boundaries split across network chunks', { timeout
     assert.deepEqual(events, ['split']);
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
+
+test('an event bigger than the limit is skipped and the stream stays up', async () => {
+  let connections = 0;
+  const server = createServer((req, res) => {
+    connections++;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"one"}\n\n'); res.write(`data: {"type":"big","x":"${'y'.repeat(2 * 1024 * 1024)}"}\n\n`); res.write('data: {"type":"two"}\n\n');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new OpenCode({ url: `http://127.0.0.1:${server.address().port}`, password: 'fixture' });
+    const controller = new AbortController(), events = [];
+    await client.subscribe(event => { events.push(event.type); if (events.length === 2) controller.abort(); }, () => {}, controller.signal);
+    assert.deepEqual([events, connections], [['one', 'two'], 1]);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+test('message rows may exceed the body limit, and a page too large is read one row at a time', async () => {
+  const rows = ['r1', 'r2'].map(id => ({ id, type: 'user', text: 'x'.repeat(40 * 1024) })), limits = [];
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname.endsWith('/message/r1')) return res.end(JSON.stringify({ data: rows[0] }));
+    if (url.pathname === '/api/model') return res.end('x'.repeat(2048));
+    limits.push(url.searchParams.get('limit'));
+    const start = Number(url.searchParams.get('cursor') ?? 0), limit = Number(url.searchParams.get('limit'));
+    res.end(JSON.stringify({ data: rows.slice(start, start + limit), cursor: { next: start + limit < rows.length ? String(start + limit) : null } }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new OpenCode({ url: `http://127.0.0.1:${server.address().port}`, password: 'fixture' });
+    Object.assign(client, { bodyMax: 1024, rowMax: 64 * 1024 });
+    assert.deepEqual((await client.messages('ses_x')).map(r => r.id), ['r1', 'r2']);
+    assert.deepEqual(limits, ['100', '1', '100']);
+    assert.equal((await client.request('/api/session/ses_x/message/r1')).data.id, 'r1');
+    await assert.rejects(client.request('/api/model'), /too large/i);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});

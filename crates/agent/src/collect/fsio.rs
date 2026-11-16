@@ -42,6 +42,25 @@ pub async fn write_atomic(file: &Path, contents: &str, tmp_suffix: &str) -> std:
     tokio::fs::rename(&tmp, file).await
 }
 
+/// `write_atomic` for secrets: the temp file is born 0600 (a stale one is
+/// removed first, so an old mode cannot survive), then renamed over `file`.
+pub async fn write_atomic_private(file: &Path, contents: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut tmp = file.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = tokio::fs::remove_file(&tmp).await;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut fh = opts.open(&tmp).await?;
+    fh.write_all(contents.as_bytes()).await?;
+    fh.flush().await?;
+    drop(fh);
+    tokio::fs::rename(&tmp, file).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +70,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_atomic_private_leaves_a_0600_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = tempdir("private").join("k.json");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic_private(&f, "one").await.unwrap();
+        write_atomic_private(&f, "two").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "two");
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[tokio::test]

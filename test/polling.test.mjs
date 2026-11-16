@@ -22,7 +22,7 @@ function dashboard(session = {}) {
       return { running: running.map(s => ({ ...s })) };
     },
     render: data => rendered.push(data),
-    markConnected() {}, refreshModels() {}, checkAgent() {},
+    markConnected() {}, refreshModels() {}, checkAgent() {}, flushOpen() {},
     clearTimeout: key => timers.delete(key),
     setTimeout: (fn, ms) => { timers.set(++id, { fn, at: now + ms }); return id; },
   };

@@ -92,7 +92,8 @@ pub async fn external_sessions(
         else {
             continue;
         };
-        if pane_pids.contains(&pid) || !alive.contains(&pid) {
+        // Headless claude processes of our own: `sdk-cli` is filtered below as well.
+        if pane_pids.contains(&pid) || !alive.contains(&pid) || ctx.own_pids.lock().unwrap_or_else(|e| e.into_inner()).contains(&pid) {
             continue;
         }
         let Some(sess) = session_file_for(&ctx.claude_dir, pid).await else { continue };
@@ -251,6 +252,16 @@ mod tests {
         write_session(&d, 502, r#"{"sessionId":"s","cwd":"/p","entrypoint":"sdk-cli"}"#);
         let out = external_sessions(&ctx_for(d), &rows(&[502]), &HashSet::new(), 0.0).await;
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_headless_claude_the_agent_started_is_not_reported() {
+        let d = tempdir("own");
+        write_session(&d, 505, CLI);
+        let ctx = ctx_for(d);
+        assert_eq!(external_sessions(&ctx, &rows(&[505]), &HashSet::new(), 0.0).await.len(), 1);
+        ctx.own_pids.lock().unwrap().insert(505);
+        assert!(external_sessions(&ctx, &rows(&[505]), &HashSet::new(), 0.0).await.is_empty());
     }
 
     #[tokio::test]

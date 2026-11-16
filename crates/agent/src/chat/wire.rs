@@ -1,16 +1,32 @@
 //! Client frames and the text sanitizer.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// What a browser may send on `/api/chat`. Anything else fails to parse and is
 /// ignored by the socket loop.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum ClientFrame {
-    Send { cid: String, text: String },
+    Send { cid: String, text: String, #[serde(default)] files: Vec<String> },
+    /// Announces a binary upload; `ws.rs` handles it, the hub ignores it.
+    Upload { #[serde(rename = "ref")] reference: String, name: String, size: u64 },
     Stop,
     Held { op: HeldOp, id: String },
     Page { before: u64, limit: Option<usize> },
+    /// This socket's device is (or is no longer) looking at the session.
+    Focus { on: bool },
+    Answer { id: String, choice: Option<String>, text: Option<String>, answers: Option<Value> },
+    Set { what: String, value: Value },
+    Menu,
+    /// Rewind to the prompt `uuid`; `files` also restores the code.
+    Rewind { uuid: String, #[serde(default)] files: bool },
+    #[serde(rename = "rewind_undo")]
+    RewindUndo,
+    /// A side question; `ws.rs` routes it and its cancel, the hub ignores both.
+    Aside { id: String, text: String },
+    #[serde(rename = "aside_cancel")]
+    AsideCancel { id: String },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -61,10 +77,29 @@ mod tests {
     #[test]
     fn client_frames_parse_and_unknown_ones_do_not() {
         let f = |s| serde_json::from_str::<ClientFrame>(s);
-        assert!(matches!(f(r#"{"t":"send","cid":"c1","text":"hi"}"#), Ok(ClientFrame::Send { .. })));
+        assert!(matches!(f(r#"{"t":"send","cid":"c1","text":"hi"}"#), Ok(ClientFrame::Send { files, .. }) if files.is_empty()));
+        assert!(matches!(f(r#"{"t":"send","cid":"c1","text":"","files":["0123456789abcdef"]}"#), Ok(ClientFrame::Send { files, .. }) if files == ["0123456789abcdef"]));
+        assert!(matches!(f(r#"{"t":"upload","ref":"r1","name":"a.png","size":5}"#), Ok(ClientFrame::Upload { size: 5, .. })));
+        assert!(f(r#"{"t":"upload","ref":"r1","name":"a.png","size":-1}"#).is_err());
         assert!(matches!(f(r#"{"t":"stop"}"#), Ok(ClientFrame::Stop)));
         assert!(matches!(f(r#"{"t":"held","op":"now","id":"h1"}"#), Ok(ClientFrame::Held { op: HeldOp::Now, .. })));
         assert!(matches!(f(r#"{"t":"page","before":40}"#), Ok(ClientFrame::Page { before: 40, limit: None })));
+        assert!(matches!(f(r#"{"t":"focus","on":true}"#), Ok(ClientFrame::Focus { on: true })));
+        assert!(matches!(f(r#"{"t":"answer","id":"a1","choice":"yes"}"#), Ok(ClientFrame::Answer { answers: None, .. })));
+        assert!(matches!(f(r#"{"t":"answer","id":"a1","answers":{"q0":{"choices":["Red"]}}}"#), Ok(ClientFrame::Answer { answers: Some(_), .. })));
+        assert!(matches!(f(r#"{"t":"set","what":"plan","value":true}"#), Ok(ClientFrame::Set { .. })));
+        assert!(matches!(f(r#"{"t":"menu"}"#), Ok(ClientFrame::Menu)));
+        assert!(f(r#"{"t":"set","what":"plan"}"#).is_err(), "value is required");
         assert!(f(r#"{"t":"keys","data":"x"}"#).is_err());
+    }
+    #[test]
+    fn part_five_frames_parse() {
+        let f = |s| serde_json::from_str::<ClientFrame>(s);
+        assert!(matches!(f(r#"{"t":"rewind","uuid":"u"}"#), Ok(ClientFrame::Rewind { uuid, files: false }) if uuid == "u"));
+        assert!(matches!(f(r#"{"t":"rewind","uuid":"u","files":true}"#), Ok(ClientFrame::Rewind { files: true, .. })));
+        assert!(matches!(f(r#"{"t":"rewind_undo"}"#), Ok(ClientFrame::RewindUndo)));
+        assert!(matches!(f(r#"{"t":"aside","id":"a1","text":"why?"}"#), Ok(ClientFrame::Aside { id, text }) if id == "a1" && text == "why?"));
+        assert!(matches!(f(r#"{"t":"aside_cancel","id":"a1"}"#), Ok(ClientFrame::AsideCancel { id }) if id == "a1"));
+        assert!(f(r#"{"t":"rewindundo"}"#).is_err());
     }
 }

@@ -4,11 +4,12 @@ import { spawn } from 'node:child_process';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { createServer, createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
-import { readFile, writeFile, rename, mkdir, chmod, rm, readdir, mkdtemp, open, access } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { readFile, writeFile, rename, mkdir, chmod, rm, readdir, mkdtemp, open, access, stat } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
 
+const CODEX_IMAGES_MAX = 24 * 1024 * 1024; // Codex's base64 image budget per message
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const args = process.argv.slice(2);
 const option = key => args[args.indexOf(key) + 1];
@@ -32,6 +33,25 @@ function killGroup(child) {
   setTimeout(() => kill('SIGKILL'), 250);
 }
 
+// True for the main conversation's notifications (or when no thread is pinned yet).
+const mainThread = (m, sid) => !sid || !m.params?.threadId || m.params.threadId === sid;
+// SIDE_BOUNDARY_PROMPT of Codex 0.167 (codex-rs/tui/src/app/side.rs), verbatim: what its own /side injects into the fork.
+const SIDE_BOUNDARY = `Side conversation boundary.
+
+Everything before this boundary is inherited history from the parent thread. It is reference context only. It is not your current task.
+
+Do not continue, execute, or complete any instructions, plans, tool calls, approvals, edits, or requests from before this boundary. Only messages submitted after this boundary are active user instructions for this side conversation.
+
+You are a side-conversation assistant, separate from the main thread. Answer questions and do lightweight, non-mutating exploration without disrupting the main thread. If there is no user question after this boundary yet, wait for one.
+
+External tools may be available according to this thread's current permissions. Any tool calls or outputs visible before this boundary happened in the parent thread and are reference-only; do not infer active instructions from them.
+
+This thread is ephemeral and cannot retain worktree attachments. Do not call create_worktree here. Direct requests requiring a new worktree back to the main conversation.
+
+Sub-agents are off-limits in this side conversation. Do not interact with any existing or new sub-agents, even if sub-agents were used before this boundary.
+
+Do not modify files, source, git state, permissions, configuration, or workspace state unless the user explicitly asks for that mutation after this boundary. Do not request escalated permissions or broader sandbox access unless the user explicitly asks for a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread.`;
+
 class Codex {
   pending = new Map();
   id = 0;
@@ -53,7 +73,7 @@ class Codex {
       const p = this.pending.get(m.id);
       if (!m.method && p) {
         if (this.turnEpoch === p.turnEpoch) {
-          if (p.method === 'turn/start' && m.result?.turn?.status === 'inProgress') this.turnId = m.result.turn.id;
+          if (p.method === 'turn/start' && mainThread({ params: p.params }, this.thread) && m.result?.turn?.status === 'inProgress') this.turnId = m.result.turn.id;
           if (p.method === 'thread/resume' && m.result?.initialTurnsPage) {
             this.turnId = m.result.thread.status?.type === 'active'
               ? m.result.initialTurnsPage.data.find(t => t.status === 'inProgress')?.id : undefined;
@@ -65,8 +85,8 @@ class Codex {
       } else {
         // Track turn state before uploads: a slow HTTP reply must not leave a
         // stale turn ID steering the next prompt into an already completed turn.
-        if (m.method === 'turn/started') { this.turnEpoch++; this.turnId = m.params.turn.id; }
-        if (m.method === 'turn/completed') { this.turnEpoch++; if (this.turnId === m.params.turn.id) this.turnId = undefined; }
+        if (m.method === 'turn/started' && mainThread(m, this.thread)) { this.turnEpoch++; this.turnId = m.params.turn.id; }
+        if (m.method === 'turn/completed' && mainThread(m, this.thread)) { this.turnEpoch++; if (this.turnId === m.params.turn.id) this.turnId = undefined; }
         notifications = notifications.then(() => onEvent(m));
         notifications.catch(onError);
       }
@@ -84,7 +104,7 @@ class Codex {
     const id = ++this.id;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(id); reject(Object.assign(Error(`Codex ${method} timed out`), { rpc: true })); }, timeout);
-      this.pending.set(id, { resolve, reject, timer, method, turnEpoch: this.turnEpoch });
+      this.pending.set(id, { resolve, reject, timer, method, params, turnEpoch: this.turnEpoch });
       this.send({ id, method, params });
     });
   }
@@ -160,7 +180,12 @@ function toolMessages(item, completed = true) {
   return messages;
 }
 
-async function replayHistory(codex, threadId, remoteSid, emit, submitted = new Set()) {
+// A reasoning item as a thinking message body; null when it has no summary.
+const thinkingOf = item => { const thinking = (item.summary || []).join('\n\n'); return thinking ? [{ type: 'thinking', thinking }] : null; };
+
+const textOnly = async item => ({ content: item.content.filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text })) });
+
+async function replayHistory(codex, threadId, remoteSid, emit, submitted = new Set(), { shapeUser = textOnly, reasoning = false } = {}) {
   let cursor;
   const seen = new Set();
   do {
@@ -169,17 +194,20 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
     });
     for (const turn of page.data) for (const item of turn.items) {
       for (const payload of toolMessages(item, item.status !== 'inProgress')) {
-        await emit({ ...payload, uuid: messageUuid(remoteSid, threadId, turn.id, payload.message.id) });
+        await emit({ ...payload, uuid: messageUuid(remoteSid, threadId, turn.id, payload.message.id) }, turn);
+      }
+      const thinking = reasoning && item.type === 'reasoning' && thinkingOf(item);
+      if (thinking) {
+        await emit({ uuid: messageUuid(remoteSid, threadId, turn.id, item.id), type: 'assistant', message: { id: item.id, role: 'assistant', content: thinking } }, turn);
+        continue;
       }
       const role = item.type === 'userMessage' ? 'user' : item.type === 'agentMessage' ? 'assistant' : null;
       if (!role || (role === 'user' && submitted.has(item.clientId))) continue;
-      const content = role === 'user'
-        ? item.content.filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text }))
-        : [{ type: 'text', text: item.text }];
-      if (!content.length) continue;
+      const { content, files } = role === 'user' ? await shapeUser(item) : { content: [{ type: 'text', text: item.text }] };
+      if (!content.length && !files?.length) continue;
       // Stable UUIDs let the remote deduplicate a replay interrupted by a crash.
       const uuid = messageUuid(remoteSid, threadId, turn.id, item.id);
-      await emit({ uuid, type: role, message: { id: item.id, role, content, ...(role === 'assistant' ? { stop_reason: item.phase === 'commentary' ? null : 'end_turn' } : {}) } });
+      await emit({ uuid, type: role, message: { id: item.id, role, content, ...(role === 'assistant' ? { stop_reason: item.phase === 'commentary' ? null : 'end_turn' } : {}) }, ...(files?.length ? { files } : {}) }, turn);
     }
     cursor = page.nextCursor;
     if (cursor && seen.has(cursor)) throw Error('Repeated Codex history cursor');
@@ -190,24 +218,92 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
 // Chat's view of one app-server notification, in the shapes the worker sends
 // Remote Control. Prompts typed in the native TUI arrive here too.
 // ponytail: mirrors the worker's inline shaping; fold the two together when the worker is next reworked.
-function chatMessages(m, sid) {
+// A userMessage item as chat shows it: its text without the `Attached:` lines, and files
+// as cache refs. Image bytes (a data URL, or a file Codex names) never leave this function.
+async function chatPrompt(item) {
+  const { MAX_MEDIA, splitAttached, stashMedia } = await import(new URL('./chat-feed.mjs', import.meta.url)); // lazy: the worker is also copied alone
+  const blocks = item.content || [];
+  const { text, files: attached } = splitAttached(blocks.filter(b => b.type === 'text').map(b => b.text).join(''));
+  const images = [];
+  for (const b of blocks) {
+    let bytes = null, name = 'image';
+    if (b.type === 'image' && typeof b.url === 'string' && b.url.startsWith('data:')) {
+      const b64 = b.url.slice(b.url.indexOf(',') + 1);
+      if (b64.length / 4 * 3 <= MAX_MEDIA) bytes = Buffer.from(b64, 'base64'); // history is untrusted: never decode a huge one
+    } else if (b.type === 'localImage' && typeof b.path === 'string') {
+      name = basename(b.path);
+      try { if ((await stat(b.path)).size <= MAX_MEDIA) bytes = await readFile(b.path); } catch { /* gone */ }
+    } else continue;
+    // a failed stash (EACCES, ENOSPC) must not reach the notification chain: fatal() would end the session
+    const m = bytes && await stashMedia(process.env.CDASH_MEDIA_DIR, bytes).catch(() => null);
+    images.push(m ? { kind: 'image', ref: m.ref, mime: m.mime } : { kind: 'file', name });
+  }
+  return { text, files: [...images, ...attached] };
+}
+
+async function chatMessages(m, sid) {
   const p = m.params || {};
   let out = [];
   if (m.method === 'item/started' && p.item) out = toolMessages(p.item, false);
   else if (m.method === 'item/completed' && p.item) {
     const item = p.item;
     if (item.type === 'userMessage') {
-      const content = (item.content || []).filter(b => b.type === 'text').map(b => ({ type: 'text', text: b.text }));
-      if (content.length) out = [{ type: 'user', message: { id: item.id, role: 'user', content } }];
+      const { text, files } = await chatPrompt(item);
+      if (text || files.length) out = [{ type: 'user', message: { id: item.id, role: 'user', content: text ? [{ type: 'text', text }] : [] }, ...(files.length ? { files } : {}) }];
     } else if (item.type === 'agentMessage') {
       out = [{ type: 'assistant', message: { id: item.id, role: 'assistant', content: [{ type: 'text', text: item.text }] } }];
+    } else if (item.type === 'reasoning') {
+      const content = thinkingOf(item);
+      if (content) out = [{ type: 'assistant', message: { id: item.id, role: 'assistant', content } }];
     } else out = toolMessages(item);
+  } else if (m.method === 'turn/plan/updated') { // live only: a reread or restart clears the checklist until the next plan update
+    out = [{ type: 'cdash', subtype: 'todo', items: (p.plan || []).map(s => ({ text: s.step, status: s.status === 'inProgress' ? 'in_progress' : s.status })) }];
   } else if (m.method === 'turn/completed') {
     const status = p.turn?.status;
     out = [{ type: 'result', subtype: status === 'interrupted' ? 'interrupted' : status === 'completed' ? 'success' : 'error_during_execution' }];
   }
-  return out.map(msg => ({ ...msg, uuid: messageUuid('cdash-chat', sid, p.turnId ?? p.turn?.id, msg.message?.id ?? 'result') }));
+  return out.map(msg => msg.type === 'cdash' ? msg : ({ ...msg, uuid: messageUuid('cdash-chat', sid, p.turnId ?? p.turn?.id, msg.message?.id ?? 'result') }));
 }
+
+// A prompt's input blocks: text with the other files as `Attached:` lines, then each image as a data URL.
+async function codexInput(text, files) {
+  const { withAttached } = await import(new URL('./chat-feed.mjs', import.meta.url));
+  const images = files.filter(f => f.kind === 'image');
+  const sizes = await Promise.all(images.map(async f => Math.max(f.size || 0, (await stat(f.path)).size)));
+  if (sizes.reduce((a, b) => a + b, 0) > CODEX_IMAGES_MAX) throw Error('too many images for one Codex message');
+  const body = withAttached(text, files.filter(f => f.kind !== 'image').map(f => f.path));
+  let total = 0;
+  const urls = [];
+  for (const f of images) { // the file may have grown since stat
+    const buf = await readFile(f.path);
+    if ((total += buf.length) > CODEX_IMAGES_MAX) throw Error('too many images for one Codex message');
+    urls.push({ type: 'image', url: `data:${f.mime};base64,${buf.toString('base64')}` });
+  }
+  return [...(body ? [{ type: 'text', text: body, text_elements: [] }] : []), ...urls];
+}
+
+const CODEX_COMMANDS = [
+  { name: 'compact', description: 'Summarize the conversation to free context' },
+  { name: 'review', description: 'Review uncommitted changes' },
+  { name: 'plan', description: 'Turn plan mode on' },
+  { name: 'model', description: 'Choose the model' },
+  { name: 'effort', description: 'Choose the reasoning effort' },
+];
+
+// A requestUserInput server request as a chat question card.
+const questionAsk = request => ({
+  id: String(request.id), kind: 'question', tool: 'codex',
+  questions: (request.params?.questions || []).map(q => ({
+    id: q.id, header: q.header, question: q.question, multi: false,
+    other: Boolean(q.isOther) || !q.options?.length, secret: Boolean(q.isSecret), options: q.options ?? [],
+  })),
+});
+
+// The card's answers as the server-request response: choices, then the typed note.
+const codexAnswers = (questions, answers) => Object.fromEntries(questions.map(q => {
+  const a = answers?.[q.id];
+  return [q.id, { answers: [...(a?.choices ?? []), ...(a?.text ? [`user_note: ${a.text}`] : [])] }];
+}));
 
 let stop = () => {};
 function fatal(e) { console.error(`Codex bridge: ${e.message}${e.cause ? ` (${e.cause.code || e.cause.message})` : ''}`); stop(); setTimeout(() => process.exit(1), 5000).unref(); process.exitCode = 1; }
@@ -446,14 +542,158 @@ async function nativeLauncher(statePath, state, script) {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-codex-native-'));
   const resuming = Boolean(state.sid);
   const { ChatFeed } = await import(new URL('./chat-feed.mjs', import.meta.url));
+  const asks = new Map(); // ask id -> { rpcId, questions } for a question, { implement: true } for the plan card
+  let lastPlan = null, plan = null, models = null;
+  let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
+  const openRequests = new Set(); // ids of server requests not yet resolved
+  const running = new Map(), children = new Map(); // id -> task; thread id -> { agent, title }
+  // A side question: { id, child, turnId, item, cancelled, closed }. `asking` holds it by question id from the
+  // moment it is asked; `sides` by its thread, kept once closed so the thread's late notifications are still dropped.
+  // ponytail: `sides` keeps one small entry per side question for the session's life.
+  const asking = new Map(), sides = new Map();
+  const closeSide = (side, interrupt = true) => {
+    side.closed = true;
+    const { child, turnId } = side;
+    (interrupt && turnId ? control.call('turn/interrupt', { threadId: child, turnId }).catch(() => {}) : Promise.resolve())
+      .then(() => control.call('thread/unsubscribe', { threadId: child })).catch(() => {});
+  };
+  const startSide = async (side, text) => {
+    try {
+      side.child = (await control.call('thread/fork', { threadId: state.sid, ephemeral: true, excludeTurns: true, model: state.model,
+        config: { model_reasoning_effort: state.effort }, sandbox: 'read-only', approvalPolicy: 'never' })).thread.id;
+      sides.set(side.child, side);
+      if (side.cancelled) return closeSide(side);
+      await control.call('thread/inject_items', { threadId: side.child, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: SIDE_BOUNDARY }] }] });
+      if (side.cancelled) return closeSide(side);
+      side.turnId = (await control.call('turn/start', { threadId: side.child, input: [{ type: 'text', text, text_elements: [] }] })).turn.id;
+      if (side.cancelled) closeSide(side); // cancelled while the turn started: interrupt it too
+    } catch (e) {
+      if (side.child) closeSide(side);
+      if (asking.get(side.id) === side) asking.delete(side.id);
+      if (!side.cancelled) feed.pushAside(side.id, '', true, e.message);
+    }
+  };
+  const publishTasks = () => feed.setTasks([...running.values()]);
+  const publishSettings = () => feed.setSettings({ model: state.model, effort: state.effort, plan, agent: null, variant: null });
+  const modelList = async () => models ??= await control.models();
+  let skillCache = null, skillsAt = 0;
+  const skills = async () => {
+    if (!skillCache || Date.now() - skillsAt > 60_000) {
+      skillCache = ((await control.call('skills/list', { cwds: [state.dir] }, 10_000)).data || [])
+        .flatMap(d => d.skills || []).filter(s => s.enabled);
+      skillsAt = Date.now();
+    }
+    return skillCache;
+  };
+  const mode = on => control.call('thread/settings/update', { threadId: state.sid, collaborationMode: {
+    mode: on ? 'plan' : 'default', settings: { model: state.model, reasoning_effort: state.effort, developer_instructions: null } } });
+  const submit = async (input, steer) => {
+    const clientUserMessageId = randomUUID();
+    if (steer && control.turnId) await control.call('turn/steer', { threadId: state.sid, expectedTurnId: control.turnId, input, clientUserMessageId });
+    else await control.call('turn/start', { threadId: state.sid, input, effort: state.effort, clientUserMessageId });
+  };
+  // Every chat message reaches the feed here, live or replayed: it tracks each turn's first prompt, the only one that can be rewound.
+  const firstOf = new Map(), prompts = new Map();
+  const stamp = (msg, turn) => msg.ts ? msg : { ...msg, ts: new Date(turn?.startedAt ? turn.startedAt * 1000 : Date.now()).toISOString() };
+  const accept = (msg, turn) => {
+    const turnId = turn?.id;
+    if (msg.type === 'user' && !msg.message.content.some(b => b.type === 'tool_result')) {
+      if (!firstOf.has(turnId)) firstOf.set(turnId, msg.uuid);
+      prompts.set(msg.uuid, { turnId, text: msg.message.content.find(b => b.type === 'text')?.text ?? '' });
+      if (firstOf.get(turnId) !== msg.uuid) msg = { ...msg, src: 'steer' };
+    }
+    feed.accept(stamp(msg, turn));
+  };
+  const ops = {
+    rewind: async ({ uuid }) => {
+      if (control.turnId) throw Error('Stop the turn or wait for it to finish');
+      const p = prompts.get(uuid);
+      if (!p || firstOf.get(p.turnId) !== uuid) throw Error('this prompt cannot be rewound');
+      await control.call('thread/revert', { threadId: state.sid, beforeTurnId: p.turnId });
+      restartTui();
+      return { text: p.text }; // Codex never restores files
+    },
+    answer: async ({ id, answer }) => {
+      const ask = asks.get(id);
+      if (!ask) throw Error('already answered');
+      if (ask.implement) {
+        if (ask.busy) throw Error('already answered');
+        if (answer?.choice === 'yes') {
+          ask.busy = true;
+          try {
+            await mode(false);
+            plan = false; publishSettings();
+            await submit([{ type: 'text', text: 'Implement the plan.', text_elements: [] }], false);
+          } finally { ask.busy = false; } // on failure the card stays, so the user can retry
+        }
+      } else control.send({ id: ask.rpcId, result: { answers: codexAnswers(ask.questions, answer?.answers) } });
+      asks.delete(id);
+      feed.dropAsk(id);
+    },
+    set: async ({ what, value }) => {
+      if (what === 'plan') {
+        if (typeof value !== 'boolean') throw Error('plan takes true or false');
+        await mode(value);
+        plan = value;
+      } else if (what === 'model') {
+        const m = (await modelList()).find(x => x.model === value);
+        if (!m) throw Error('unknown model');
+        const effort = m.efforts.includes(state.effort) ? state.effort : m.defaultEffort;
+        await control.call('thread/settings/update', { threadId: state.sid, model: m.model, effort });
+        state.model = m.model; state.effort = effort;
+      } else if (what === 'effort') {
+        if (!(await modelList()).find(x => x.model === state.model)?.efforts.includes(value)) throw Error('unknown effort');
+        await control.call('thread/settings/update', { threadId: state.sid, effort: value });
+        state.effort = value;
+      } else throw Error('not supported');
+      publishSettings();
+    },
+    // A side question, as Codex's own /side: an ephemeral read-only fork that never touches the conversation.
+    // It answers at once; the fork, the boundary and the turn run behind, so a slow fork stays cancellable.
+    aside: ({ id, text }) => {
+      const side = { id };
+      asking.set(id, side);
+      void startSide(side, text);
+    },
+    aside_cancel: ({ id }) => {
+      const side = asking.get(id);
+      if (!side) return;
+      asking.delete(id);
+      side.cancelled = true;
+      if (side.child) closeSide(side);
+    },
+    menu: async () => {
+      const list = await modelList();
+      const extra = (await skills().catch(() => [])).map(s => ({ name: s.name, description: (s.shortDescription || s.description || '').slice(0, 100) }));
+      return {
+        commands: [...CODEX_COMMANDS, ...extra].slice(0, 150),
+        models: list.map(m => ({ value: m.model, label: m.label, efforts: m.efforts })),
+        efforts: list.find(m => m.model === state.model)?.efforts ?? [], agents: [],
+      };
+    },
+  };
   // Dashboard chat: the agent connects to this feed's socket. It lives as
   // long as the pane, independent of Remote Control.
   const feed = new ChatFeed({
-    send: async (text, { steer }) => {
-      const input = [{ type: 'text', text, text_elements: [] }];
-      const clientUserMessageId = randomUUID();
-      if (steer && control.turnId) await control.call('turn/steer', { threadId: state.sid, expectedTurnId: control.turnId, input, clientUserMessageId });
-      else await control.call('turn/start', { threadId: state.sid, input, effort: state.effort, clientUserMessageId });
+    ops,
+    send: async (text, { steer, files = [] }) => {
+      const [, name, rest = ''] = /^\/([A-Za-z0-9_:-]+)(?:\s+([\s\S]*))?$/.exec(text) || []; // `/usr/bin/x ...` is a prompt
+      // ponytail: attachments on a command are ignored; refuse them if owners hit it.
+      if (!name) return submit(await codexInput(text, files), steer);
+      const arg = rest.trim();
+      if (name === 'compact') await control.call('thread/compact/start', { threadId: state.sid });
+      else if (name === 'review') await control.call('review/start', { threadId: state.sid, target: { type: 'uncommittedChanges' } });
+      else if (name === 'plan' && !arg) await ops.set({ what: 'plan', value: true });
+      else if (name === 'model' || name === 'effort') {
+        if (!arg) throw Error('Use the model chip at the top of the chat');
+        await ops.set({ what: name, value: arg });
+      } else {
+        const skill = (await skills().catch(() => [])).find(s => s.name === name);
+        if (!skill) throw Error('Use Terminal for this command');
+        // A skill starts a real model turn, so it is not `done`.
+        return submit([{ type: 'skill', name, path: skill.path }, ...(arg ? [{ type: 'text', text: arg, text_elements: [] }] : [])], steer);
+      }
+      return { done: true };
     },
     stop: async () => { if (control?.turnId) await control.call('turn/interrupt', { threadId: state.sid, turnId: control.turnId }); },
   });
@@ -463,7 +703,7 @@ async function nativeLauncher(statePath, state, script) {
   const loopback = process.platform === 'android';
   const socket = join(dir, 'backend.sock'), tokenFile = join(dir, 'token');
   let endpoint = loopback ? undefined : socket;
-  let backend, runner, tui, control, log, cleanup, remoteRetry;
+  let backend, runner, tui, control, log, cleanup, remoteRetry, restartTui;
   let closing = false;
   stop = () => {
     if (cleanup) return cleanup;
@@ -531,19 +771,86 @@ async function nativeLauncher(statePath, state, script) {
   };
   control = new Codex(async m => {
     const p = m.params || {};
+    const side = sides.get(p.threadId); // first: a side thread is never the conversation, a running agent or a card
+    if (side) {
+      if (m.id != null && m.method) control.send({ id: m.id, error: { code: -32000, message: 'a side question cannot ask' } });
+      if (side.closed) return;
+      if (m.method === 'item/agentMessage/delta') {
+        const gap = side.item && side.item !== p.itemId ? '\n\n' : ''; // a new message is a new paragraph, as Claude joins text blocks
+        side.item = p.itemId;
+        feed.pushAside(side.id, gap + p.delta, false);
+      }
+      if (m.method === 'turn/completed') {
+        if (asking.get(side.id) === side) asking.delete(side.id);
+        feed.pushAside(side.id, '', true, p.turn.status === 'completed' ? undefined : p.turn.error?.message || 'side question failed');
+        closeSide(side, false);
+      }
+      return;
+    }
+    if (m.id != null && m.method) { openRequests.add(String(m.id)); feed.setState({ waiting: true }); } // a server request: an approval or a question
+    if (m.method === 'serverRequest/resolved') {
+      openRequests.delete(String(p.requestId));
+      feed.setState({ waiting: openRequests.size > 0 }); // another subagent's question may still be open
+      asks.delete(String(p.requestId));
+      feed.dropAsk(String(p.requestId));
+    }
+    if (m.method === 'item/tool/requestUserInput') {
+      asks.set(String(m.id), { rpcId: m.id, questions: p.questions || [] });
+      feed.putAsk(questionAsk(m));
+    }
+    if (m.method === 'thread/status/changed' && !mainThread(m, state.sid)) {
+      let kid = children.get(p.threadId);
+      if (!kid) {
+        const t = (await control.call('thread/read', { threadId: p.threadId, includeTurns: false }, 10_000).catch(() => null))?.thread;
+        if (t) children.set(p.threadId, kid = { agent: t.parentThreadId === state.sid, title: t.agentNickname || t.agentRole || t.name || t.preview || 'agent' }); // a failed read is not cached: the next status change retries
+      }
+      if (kid?.agent) {
+        if (p.status?.type === 'active') { if (!running.has(p.threadId)) running.set(p.threadId, { id: p.threadId, kind: 'agent', title: kid.title, started: new Date().toISOString() }); }
+        else running.delete(p.threadId);
+        publishTasks();
+      }
+    }
+    if (!mainThread(m, state.sid)) return; // a subagent's turns and items are not this conversation; its questions (above) still are
     if (state.sid) {
-      const chat = chatMessages(m, state.sid);
-      if (replayed) replayed.push(...chat); else for (const msg of chat) feed.accept(msg);
+      const chat = await chatMessages(m, state.sid);
+      const turn = p.turn ?? { id: p.turnId };
+      for (const msg of chat) if (replayed) replayed.push([stamp(msg, turn), turn]); // stamped on arrival, not on flush
+      else accept(msg, turn);
+    }
+    const shell = p.item?.type === 'commandExecution' && p.item.source === 'unifiedExecStartup';
+    if (shell && m.method === 'item/started') { running.set(p.item.id, { id: p.item.id, kind: 'shell', title: p.item.command, started: new Date().toISOString() }); publishTasks(); }
+    if (shell && m.method === 'item/completed' && running.delete(p.item.id)) publishTasks();
+    if (m.method === 'thread/tokenUsage/updated' && p.tokenUsage?.total && p.tokenUsage.last) {
+      const { total, last, modelContextWindow } = p.tokenUsage;
+      usage = { ...usage, context: { used: last.totalTokens, window: modelContextWindow ?? null },
+        tokens: { input: total.inputTokens, output: total.outputTokens, cache_read: total.cachedInputTokens, cache_write: total.cacheWriteInputTokens ?? 0 } };
+      feed.setUsage(usage);
     }
     if (m.method === 'item/agentMessage/delta') feed.delta(p.itemId, p.delta);
-    if (m.method === 'turn/started') feed.setState({ working: true });
-    if (m.method === 'turn/completed') feed.setState({ working: false, waiting: false });
-    if (m.id != null && m.method) feed.setState({ waiting: true }); // a server request: an approval or a question
-    if (m.method === 'serverRequest/resolved') feed.setState({ waiting: false });
+    if (m.method === 'thread/reverted' && p.threadId === state.sid) reread(); // chat's own revert too: it reaches every connection
+    if (m.method === 'turn/started') {
+      feed.setState({ working: true });
+      for (const id of asks.keys()) if (id.startsWith('implement:')) { asks.delete(id); feed.dropAsk(id); }
+      lastPlan = null;
+    }
+    if (m.method === 'item/completed' && p.item.type === 'plan') lastPlan = { turnId: p.turnId, text: p.item.text };
+    if (m.method === 'turn/completed') {
+      openRequests.clear();
+      feed.setState({ working: false, waiting: false });
+      if (p.turn.status === 'completed' && lastPlan?.turnId === p.turn.id) {
+        const id = `implement:${p.turn.id}`;
+        asks.set(id, { implement: true });
+        feed.putAsk({ id, kind: 'plan', tool: 'codex', plan: lastPlan.text });
+      }
+    }
     if (m.method === 'thread/settings/updated') {
       state.model = p.threadSettings.model;
       state.effort = p.threadSettings.effort;
       state.model_label = state.model;
+      usage = { ...usage, cwd: p.threadSettings.cwd ?? usage.cwd, model: state.model };
+      feed.setUsage(usage);
+      if (p.threadSettings.collaborationMode) plan = p.threadSettings.collaborationMode.mode === 'plan';
+      publishSettings();
     } else if (m.method === 'turn/started') state.working = true;
     else if (m.method === 'turn/completed') { state.working = false; state.ts = Date.now(); }
     else if (m.method === 'item/completed' && p.item.type === 'agentMessage') state.last_message = p.item.text;
@@ -561,32 +868,68 @@ async function nativeLauncher(statePath, state, script) {
     ...(state.model ? { model: state.model } : {}), config: { model_reasoning_effort: state.effort },
   });
   state.sid = result.thread.id;
+  control.thread = state.sid;
   state.model = result.model;
   state.effort = result.reasoningEffort;
   state.working = Boolean(control.turnId);
+  publishSettings();
+  usage = { ...usage, cwd: result.thread.cwd ?? state.dir, model: state.model };
+  feed.setUsage(usage);
   // Naming persists an empty thread, so both clients can immediately resume it.
   await control.call('thread/name/set', { threadId: state.sid, name: state.display_name });
   state.chat_sock = await feed.listen(dir);
   await atomic(statePath, JSON.stringify(state));
   await saveNative();
   feed.setState({ working: state.working });
-  if (resuming) {
-    // Not awaited: the TUI must not wait for history.
+  // Not awaited: the TUI must not wait for history.
+  let gen = 0;
+  const replay = () => {
+    const mine = ++gen;
     replayed = [];
-    replayHistory(control, state.sid, 'cdash-chat', async msg => feed.accept(msg))
+    replayHistory(control, state.sid, 'cdash-chat', (msg, turn) => { if (gen === mine) accept(msg, turn); }, new Set(), { reasoning: true, shapeUser: async item => {
+      const p = await chatPrompt(item);
+      return { content: p.text ? [{ type: 'text', text: p.text }] : [], ...(p.files.length ? { files: p.files } : {}) };
+    } })
       .catch(e => log.write(`${new Date().toISOString()} chat history replay failed: ${e.message}\n`).catch(() => {}))
       .finally(() => {
+        if (gen !== mine) return; // a newer replay owns `replayed`
         const live = replayed;
         replayed = null;
-        for (const msg of live) feed.accept(msg);
+        for (const [msg, turn] of live) accept(msg, turn);
         feed.ready();
       });
-  } else feed.ready();
-  tui = spawn('codex', ['resume', '--remote', loopback ? endpoint : `unix://${socket}`, ...(loopback ? ['--remote-auth-token-env', 'CDASH_CODEX_TOKEN'] : []), '-c', 'tui.fullscreen_transcript=true', '-c', 'tui.alternate_screen="always"', state.sid], {
-    cwd: state.dir, env: { ...codexEnv(), CDASH_CODEX_TOKEN: process.env.CDASH_CODEX_TOKEN }, stdio: 'inherit',
-  });
-  tui.on('error', fatal);
-  tui.on('exit', code => { if (!closing) { process.exitCode = code ?? 1; stop(); } });
+  };
+  // A revert changed the conversation: start chat over from the thread's turns.
+  const reread = () => {
+    for (const id of asks.keys()) if (id.startsWith('implement:')) { asks.delete(id); feed.dropAsk(id); } // the plan may be gone
+    lastPlan = null;
+    if (usage.context) { usage = { ...usage, context: null }; feed.setUsage(usage); } // Codex resends no usage on a revert; the next turn refills it
+    feed.reset();
+    firstOf.clear(); prompts.clear();
+    for (const [id, t] of running) if (t.kind === 'shell') running.delete(id); // a revert kills background terminals
+    publishTasks();
+    replay();
+  };
+  if (resuming) replay(); else feed.ready();
+  let restarting = false, killTimer;
+  const startTui = () => {
+    tui = spawn('codex', ['resume', '--remote', loopback ? endpoint : `unix://${socket}`, ...(loopback ? ['--remote-auth-token-env', 'CDASH_CODEX_TOKEN'] : []), '-c', 'tui.fullscreen_transcript=true', '-c', 'tui.alternate_screen="always"', state.sid], {
+      cwd: state.dir, env: { ...codexEnv(), CDASH_CODEX_TOKEN: process.env.CDASH_CODEX_TOKEN }, stdio: 'inherit',
+    });
+    tui.on('error', fatal);
+    tui.on('exit', code => {
+      clearTimeout(killTimer);
+      if (restarting) { restarting = false; if (!closing) return startTui(); }
+      if (!closing) { process.exitCode = code ?? 1; stop(); }
+    });
+  };
+  restartTui = () => {
+    restarting = true;
+    tui.kill('SIGTERM');
+    const old = tui;
+    killTimer = setTimeout(() => old.kill('SIGKILL'), 5000); // a TUI that ignores SIGTERM must not leave `restarting` set; its exit clears the timer
+  };
+  startTui();
   const debugPath = join(controlDir, 'remote-debug.log');
   await writeFile(debugPath, '', { flag: 'a', mode: 0o600 });
   await chmod(debugPath, 0o600);

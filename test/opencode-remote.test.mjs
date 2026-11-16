@@ -476,3 +476,35 @@ test('a transient permission reply failure can be retried', async () => {
     assert.equal(pending.length, 0);
   } finally { await server.close(); }
 });
+
+test('historyMessages without chat is unchanged; with chat it adds thinking, ts and edit diffs', async () => {
+  const { historyMessages } = await import('../crates/agent/src/collect/opencode-remote.mjs');
+  const files = [{ file: 'a.ts', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-x\n+y\n' }, { file: 'big.ts', additions: 9, deletions: 0, patch: 'p'.repeat(20000) }];
+  const row = { id: 'msg_a', type: 'assistant', time: { created: 1789000000000 }, content: [
+    { type: 'reasoning', text: 'pondering' }, { type: 'text', text: 'done' },
+    { type: 'tool', id: 'call_1', name: 'edit', state: { status: 'completed', input: { path: 'a.ts' }, content: [{ type: 'text', text: 'ok' }], metadata: { files } } }] };
+  const plain = historyMessages(row, 'ses_t', 'rs');
+  assert.deepEqual(plain.map(m => [m.type, m.message.content[0].type]), [['assistant', 'text'], ['assistant', 'tool_use'], ['user', 'tool_result']]);
+  assert.ok(plain.every(m => !('ts' in m) && !('diff' in m)));
+  assert.deepEqual(historyMessages(row, 'ses_t', 'rs', new Set(), { chat: false }), plain);
+  const chat = historyMessages(row, 'ses_t', 'rs', new Set(), { chat: true });
+  assert.deepEqual(chat.map(m => m.message.content[0].type), ['thinking', 'text', 'tool_use', 'tool_result']);
+  assert.deepEqual([chat[0].message.id, chat[0].message.content[0].thinking], ['msg_a-reasoning-0', 'pondering']);
+  assert.ok(chat.every(m => m.ts === new Date(1789000000000).toISOString()));
+  const diff = chat[3].message.content[0].diff;
+  assert.ok(!('diff' in chat[3]), 'the diff sits in the tool_result block');
+  assert.deepEqual(diff[0], files[0]);
+  assert.deepEqual([diff[1].file, diff[1].additions, diff[1].deletions, 'patch' in diff[1]], ['big.ts', 9, 0, false], 'a patch past the 16 KiB budget keeps counts only');
+  assert.ok(chat.slice(1).every((m, i) => m.uuid === plain[i].uuid), 'uuids of existing messages are unchanged');
+});
+
+test('historyMessages hardening: odd times and file entries, byte-counted patch cap, patch under diff', async () => {
+  const { historyMessages } = await import('../crates/agent/src/collect/opencode-remote.mjs');
+  const row = created => ({ id: 'msg_b', type: 'assistant', time: { created }, content: [{ type: 'tool', id: 'c1', name: 'edit', state: { status: 'completed', input: {}, content: [],
+    metadata: { files: [{ relativePath: 7, additions: '2', deletions: 'x', diff: 'é'.repeat(9000) }, { file: 'b', patch: 'ok' }] } } }] });
+  const out = historyMessages(row('soon'), 's', 'r', new Set(), { chat: true });
+  assert.ok(out.every(m => !('ts' in m)));
+  const [a, b] = out.at(-1).message.content[0].diff;
+  assert.deepEqual([a.file, a.additions, a.deletions, 'patch' in a, b.patch], ['7', 2, 0, false, 'ok'], '18000 bytes (9000 chars) pass a character count but not the byte cap');
+  assert.equal(typeof historyMessages(row(1789000000000), 's', 'r', new Set(), { chat: true })[0].ts, 'string');
+});
