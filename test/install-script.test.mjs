@@ -188,12 +188,17 @@ test('pasting again replaces an agent that is running, and stops the old one', a
   // ("Text file busy"), which a shell-script stub would never show.
   copyFileSync('/bin/sleep', agent);
   chmodSync(agent, 0o755);
-  const running = spawn(agent, ['30'], { stdio: 'ignore' });
+  const running = spawn(agent, ['30'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  let runStderr = '';
+  running.stderr.on('data', d => { runStderr += d; });
+  let runExit = 'alive';
+  running.once('exit', (code, signal) => { runExit = `code=${code} signal=${signal}`; });
   // Mentions the agent's path but is not the agent — an editor on its log, say.
   // The stop is anchored on the full command line, so this must survive.
   const decoy = spawn('/bin/sh', ['-c', 'sleep 30', 'tail', `${agent}.log`], { stdio: 'ignore' });
   try {
     await Promise.all([once(running, 'spawn'), once(decoy, 'spawn')]);
+    const before = procsNamed('cdash-agent');
     const file = join(mkdtempSync(join(tmpdir(), 'cdash-paste-')), 'setup.sh');
     writeFileSync(file, setupScript('curl', url));
     // -x traces every step to stderr, so a failure below shows which kill ran.
@@ -203,9 +208,10 @@ test('pasting again replaces an agent that is running, and stops the old one', a
     // Left running, the old agent keeps answering the health check and the
     // startup guard never starts the new one — the stale-agent bug.
     const stopped = await stopSignal(running, 10_000);
-    const trace = stderr.split('\n').filter(l => l.includes('cdash-agent')).slice(0, 12).join(' | ');
+    const trace = stderr.split('\n').filter(l => l.includes('cdash-agent') || l.includes('kill ')).slice(0, 20).join(' | ');
     assert.equal(stopped, 'SIGTERM',
-      `the old agent was stopped. HOME=${HOME} pid=${running.pid} exitCode=${running.exitCode} ` +
+      `the old agent was stopped. HOME=${HOME} pid=${running.pid} exit=${runExit} ` +
+      `stub stderr=${runStderr.trim() || 'none'} before=${before} ` +
       `processes now: ${procsNamed('cdash-agent')}. Script trace: ${trace || 'none'}`);
     assert.equal(decoy.exitCode ?? decoy.signalCode, null, 'a process that only names the path was left alone');
   } finally {
