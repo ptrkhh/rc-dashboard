@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "cdash-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "cdash-tauri"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cdash-agent",
  "reqwest",
