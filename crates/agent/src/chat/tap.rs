@@ -111,7 +111,7 @@ const MAX_TODOS: usize = 100;
 const STATUSES: [&str; 3] = ["pending", "in_progress", "completed"];
 
 // ponytail: one entry per model family, each read from a status-line sample; unknown models show tokens only.
-const WINDOWS: &[(&str, u64)] = &[("claude-opus-5-5", 1_000_000), ("claude-sonnet-5-5", 1_000_000), ("claude-fable-5-2", 1_000_000)];
+const WINDOWS: &[(&str, u64)] = &[("claude-opus-5-5", 1_000_000), ("claude-sonnet-5-5", 1_000_000), ("claude-fable-5-2", 1_000_000), ("claude-haiku-5-5", 1_000_000)];
 
 pub fn context_window(model: &str) -> Option<u64> {
     WINDOWS.iter().find(|(p, _)| model.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))).map(|&(_, w)| w)

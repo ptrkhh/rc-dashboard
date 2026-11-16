@@ -542,6 +542,13 @@ pub fn stash_images(mut ev: Value, session: &str, log: &LogBuffer) -> Value {
     ev
 }
 
+/// The context limit the owner set for `model` in settings.json
+/// (`modelSettings.<model>.autoCompactWindow`): the size Claude compacts at,
+/// so the one the Usage sheet measures against.
+fn compact_window(settings: &[u8], model: &str) -> Option<u64> {
+    serde_json::from_slice::<Value>(settings).ok()?["modelSettings"][model]["autoCompactWindow"].as_u64().filter(|&w| w > 0)
+}
+
 /// The conversation currently followed.
 struct Conv {
     sid: String,
@@ -563,6 +570,8 @@ async fn run(
     let mut last: Option<(bool, bool, Option<String>)> = None;
     let (mut last_asks, mut last_settings) = (None, None);
     let (mut last_usage, mut last_tasks): (Option<Value>, Option<Vec<Value>>) = (None, None);
+    // The owner's per-model `autoCompactWindow`, read again only when the model changes.
+    let mut compact: (Option<String>, Option<u64>) = (None, None);
     // Set only when it changes, so a rewind's shortened branch outlives lines that are no prompt.
     let mut last_branch: Vec<Listed> = Vec::new();
     let mut blind_sent = false;
@@ -709,6 +718,14 @@ async fn run(
             }
             if c.ready {
                 let mut usage = c.tap.usage();
+                let model = usage["model"].as_str().map(String::from);
+                if model != compact.0 {
+                    let settings = tokio::fs::read(ctx.claude_dir.join("settings.json")).await.unwrap_or_default();
+                    compact = (model.clone(), model.as_deref().and_then(|m| compact_window(&settings, m)));
+                }
+                if let (Some(w), Some(ctx_use)) = (compact.1, usage.get_mut("context").filter(|v| v.is_object())) {
+                    ctx_use["window"] = json!(w);
+                }
                 if usage["cwd"].is_null() {
                     usage["cwd"] = json!(file.as_ref().and_then(|f| f.cwd.clone()));
                 }
@@ -1374,6 +1391,13 @@ pub(crate) mod aside_tests {
         (engine, rx)
     }
 
+    #[test]
+    fn the_owners_compact_window_is_the_context_limit() {
+        let s = br#"{"modelSettings":{"claude-haiku-5-5":{"effortLevel":"low","autoCompactWindow":135000},"claude-opus-5-5":{"effortLevel":"high"}}}"#;
+        assert_eq!(compact_window(s, "claude-haiku-5-5"), Some(135_000));
+        assert_eq!(compact_window(s, "claude-opus-5-5"), None, "no limit set: the model's own window");
+        assert_eq!(compact_window(b"not json", "claude-haiku-5-5"), None);
+    }
     #[test]
     fn side_question_arguments_follow_the_spec_and_put_the_question_last() {
         let a = aside_args("sid-1", Some("claude-opus-5-5"), "--what did I ask?");
