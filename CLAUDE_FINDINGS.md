@@ -402,3 +402,27 @@ Observed 2026-11-16; not a supported contract.
 - An edit tool's `metadata.files[]` has `file`, `patch`, `status`,
   `additions`, `deletions`. A patch starts `Index: a.txt`, a `====` rule, then
   `--- a.txt` / `+++ a.txt` with no `a/` `b/` prefixes.
+
+### Thinking, the checklist and day rows (Claude Code 2.1.325)
+
+Observed 2026-11-16; not a supported contract.
+
+- **Thinking text is redacted by default.** Thinking blocks carry
+  `"thinking":""` and a signature (5212 characters in one sample). With
+  `{"showThinkingSummaries":true}` in settings, haiku at medium effort wrote
+  readable thinking (423 characters), and chat showed it as a Thinking row.
+- **The task tools load only with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`.**
+  Without it, neither TaskCreate, TaskUpdate nor TodoWrite was available, on
+  haiku or sonnet, and they were not among the ToolSearch-deferred tools. With
+  it, haiku ran `ToolSearch` (`select:TaskCreate,TaskUpdate`), then:
+  - TaskCreate input `{"subject":"alpha","description":"alpha"}`, result
+    `toolUseResult: {"task":{"id":"1","subject":"alpha","description":"alpha"}}`,
+    content "Task #1 created successfully: alpha";
+  - TaskUpdate input `{"taskId":"1","status":"completed"}`, result
+    `{"success":true,"taskId":"1","updatedFields":["status"],"statusChange":{"from":"pending","to":"completed"}}`,
+    content "Updated task #1 status".
+
+  Chat's pinned checklist showed "1 of 3 done" and the struck-through item.
+- **Day rows.** A transcript whose first half was dated a day earlier, resumed
+  with `claude --resume`, showed one day separator between the two days and
+  none before the first.
