@@ -3,8 +3,16 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Ceiling for a hang. Without it, a stuck test run holds the job for
+    # GitHub's six-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # The test flags in package.json need Node 22, the version the suite was
+      # verified on. Pin it instead of taking the runner's default.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
@@ -15,7 +23,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev tmux
-      - run: node --test
+      - run: npm test
       - run: cargo test --all --locked
       - run: cargo clippy --all-targets --locked -- -D warnings -D clippy::disallowed_types
 

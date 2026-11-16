@@ -8,6 +8,15 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 
+// Bounded: a supervisor that ignores SIGTERM gets SIGKILL, so teardown cannot hang.
+function stopped(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  const exit = new Promise(resolve => child.once('exit', resolve));
+  child.kill('SIGTERM');
+  const force = setTimeout(() => child.kill('SIGKILL'), 5000);
+  return exit.finally(() => clearTimeout(force));
+}
+
 async function fixture(t, failure = '', platform = 'linux', resuming = false, { history } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-native-test-'));
   const state = join(dir, 'state.json'), wire = join(dir, 'wire.jsonl');
@@ -89,7 +98,7 @@ setInterval(()=>{const marker=process.env.CDASH_CHECK_ROOT+'/stop-remote';if(fs.
   const alive = pid => { try { process.kill(pid,0); return true; } catch { return false; } };
   t.after(async () => {
     // The supervisor writes into `dir` while it shuts down: rm only once it has exited.
-    if (child.exitCode === null && child.signalCode === null) { const exit = new Promise(r => child.once('exit', r)); child.kill(); child.stdin.end(); await exit; }
+    if (child.exitCode === null && child.signalCode === null) { child.stdin.end(); await stopped(child); }
     for (const m of await messages()) if (m.pid && alive(m.pid)) process.kill(m.pid,'SIGKILL');
     await rm(dir,{recursive:true,force:true});
   });

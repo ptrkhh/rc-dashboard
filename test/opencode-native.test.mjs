@@ -7,6 +7,15 @@ import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 
+// Bounded: a supervisor that ignores SIGTERM gets SIGKILL, so teardown cannot hang.
+function stopped(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  const exit = new Promise(resolve => child.once('exit', resolve));
+  child.kill('SIGTERM');
+  const force = setTimeout(() => child.kill('SIGKILL'), 5000);
+  return exit.finally(() => clearTimeout(force));
+}
+
 test('project model query uses a private metadata lease and strips Claude credentials', { timeout: 30000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-oc-native-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -135,8 +144,7 @@ else {
     const orphan = rows.find(row => row.kind === 'claude').descendant;
     try { assert.throws(() => process.kill(orphan, 0), { code: 'ESRCH' }, 'a failed runner must not leave children'); }
     finally { try { process.kill(orphan, 'SIGKILL'); } catch {} }
-    const firstExit = new Promise(resolve => child.once('exit', resolve));
-    child.kill('SIGTERM'); await firstExit;
+    await stopped(child);
     child = spawn(process.execPath, [resolve('crates/agent/src/collect/opencode-remote.mjs'), '--state', state, '--name', 'cdash-fixture'], {
       cwd: dir, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CDASH_TEST_LOG: log, CLAUDE_CODE_SESSION_ACCESS_TOKEN: 'do-not-leak' }, stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -154,7 +162,7 @@ else {
     assert.equal(rows.filter(row => row.kind === 'api' && row.path === '/api/session' && row.method === 'POST').length, 1, 'resume must not create another session');
     assert.equal(rows.filter(row => row.kind === 'api' && row.path === '/api/session/ses_fixture/model').length, 0, 'unchanged model must not be reselected');
   } finally {
-    if (child.exitCode === null) { const exit = new Promise(resolve => child.once('exit', resolve)); child.kill('SIGTERM'); await exit; }
+    await stopped(child);
     for (const row of rows.filter(item => item.descendant)) { try { process.kill(row.descendant, 'SIGKILL'); } catch {} }
     for (const row of rows.filter(item => item.pid)) {
       let alive = true;

@@ -15,7 +15,10 @@ import { promisify } from 'node:util';
 
 // Async, not execFileSync: the handoff server below runs in this process, and a
 // synchronous child would block the event loop that has to answer its curl.
-const run = promisify(execFile);
+// Every shell step has a ceiling, so a stuck child fails its test instead of
+// holding the file open until the CI job times out.
+const execFileAsync = promisify(execFile);
+const run = (file, args, opts = {}) => execFileAsync(file, args, { timeout: 30_000, ...opts });
 
 const AGENT = '#!/bin/sh\ntouch "$HOME/agent-started"\nprintf "%s" "${SSL_CERT_FILE-}" > "$HOME/agent-cert-file"\nsleep 2\n';
 // A port nothing else here is using: "down" must be decided from the agent's
@@ -44,6 +47,15 @@ async function handoff() {
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   return { url: `http://127.0.0.1:${server.address().port}/cdash-agent`, server };
+}
+
+/** A loopback port with no listener on it: curl is refused at once, not left to time out. */
+async function closedPort() {
+  const probe = createServer();
+  await new Promise(r => probe.listen(0, '127.0.0.1', r));
+  const { port } = probe.address();
+  await new Promise(r => probe.close(r));
+  return port;
 }
 
 /** Everything after the fetch is identical on both platforms, so assert it once. */
@@ -165,7 +177,8 @@ test('pasting again replaces an agent that is running, and stops the old one', a
     assert.ok(!existsSync(`${agent}.new`), 'no staging file left behind');
     // Left running, the old agent keeps answering the health check and the
     // startup guard never starts the new one — the stale-agent bug.
-    assert.equal(running.signalCode ?? (await once(running, 'exit'))[1], 'SIGTERM', 'the old agent was stopped');
+    const exit = running.signalCode ?? (await once(running, 'exit', { signal: AbortSignal.timeout(10_000) }))[1];
+    assert.equal(exit, 'SIGTERM', 'the old agent was stopped');
     assert.equal(decoy.exitCode ?? decoy.signalCode, null, 'a process that only names the path was left alone');
   } finally {
     running.kill();
@@ -182,8 +195,8 @@ test('a failed download leaves the agent that was already there', async () => {
   chmodSync(agent, 0o755);
   const before = readFileSync(agent, 'utf8');
   const file = join(mkdtempSync(join(tmpdir(), 'cdash-paste-')), 'setup.sh');
-  // Nothing listens on port 1: curl fails, and the rename must not happen.
-  writeFileSync(file, setupScript('curl', 'http://127.0.0.1:1/cdash-agent'));
+  // Nothing listens on that port: curl fails, and the rename must not happen.
+  writeFileSync(file, setupScript('curl', `http://127.0.0.1:${await closedPort()}/cdash-agent`));
   await run('bash', [file], { env: { ...process.env, HOME } }).catch(() => {});
   assert.equal(readFileSync(agent, 'utf8'), before, 'the old agent is untouched');
   assert.ok(!existsSync(`${agent}.new`), 'no partial download left behind');
