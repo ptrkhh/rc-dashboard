@@ -18,7 +18,7 @@ This plan runs last, after Parts 4, 2 and 3 exactly as their plans describe them
 
 ## Global Constraints
 
-- Work in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` on `feat/chat-parts-2-5`. Export `CARGO_TARGET_DIR=/home/p/.cache/chat-parts-2-5-target` in every shell that runs cargo.
+- Work in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` on `feat/chat-parts-2-5`. Export `CARGO_TARGET_DIR=/mnt/d/git/claude-dashboard/target` in every shell that runs cargo.
 - CI commands: `node --test`, `cargo test --all --locked`, `cargo clippy --all-targets --locked -- -D warnings -D clippy::disallowed_types`.
 - Never `git add -A` or `git add .`: each commit adds its task's listed files by name. `claude-1-261102-19.xapk` stays untracked.
 - No new npm packages and no new Rust crates.

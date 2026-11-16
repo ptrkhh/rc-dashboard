@@ -31,8 +31,7 @@ as written here.
   `feat/chat-parts-2-5`, off `master` at `e3385c4` or later. The first commit
   adds the four specs, the evidence folder, this document and the four plans.
 - Rust builds and tests use
-  `CARGO_TARGET_DIR=/home/p/.cache/chat-parts-2-5-target` (the D: drive is
-  nearly full).
+  `CARGO_TARGET_DIR=/mnt/d/git/claude-dashboard/target` (the repo-wide shared target dir).
 - CI commands: `node --test`, `cargo test --all --locked`,
   `cargo clippy --all-targets --locked -- -D warnings -D clippy::disallowed_types`.
 

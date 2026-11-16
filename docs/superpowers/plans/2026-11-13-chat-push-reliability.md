@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` on branch `feat/chat-parts-2-5` (Task 1 creates it). Every cargo command runs with `CARGO_TARGET_DIR=/home/p/.cache/chat-parts-2-5-target` exported (the D: drive is nearly full).
+- Work in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` on branch `feat/chat-parts-2-5` (Task 1 creates it). Every cargo command runs with `CARGO_TARGET_DIR=/mnt/d/git/claude-dashboard/target` exported (the repo-wide shared target dir).
 - CI commands: `node --test`, `cargo test --all --locked`, `cargo clippy --all-targets --locked -- -D warnings -D clippy::disallowed_types`.
 - Never `git add -A` or `git add .`. `claude-1-261102-19.xapk` in the repo root stays untracked.
 - No new npm packages. New Rust crates only where a spec names them: `ring` as a direct dependency of `cdash-agent` at the locked 0.17.14, and `tauri-plugin-notification` in `crates/tauri-app`.
@@ -128,7 +128,7 @@ git status --short   # only the documents above
 git commit -m "docs: chat parts 2 to 5 specs, evidence, shared contract and plans"
 ```
 
-From here on every task runs in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` with `export CARGO_TARGET_DIR=/home/p/.cache/chat-parts-2-5-target`.
+From here on every task runs in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` with `export CARGO_TARGET_DIR=/mnt/d/git/claude-dashboard/target`.
 
 ### Task 2: Chat client fixes (findings 1, 2 and 6)
 

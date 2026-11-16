@@ -14,7 +14,7 @@
 
 Workspace and order:
 - Part 4 (`2026-11-13-chat-push-reliability.md`) is done exactly as the shared contract describes: `EngineMsg::Status { working, waiting, waiting_for }`, the hub state key `waiting_for`, `shell` counted as idle, `Ctx.focus`, `Tail` end-of-file reporting, and the Codex main-thread filter in `codex-remote.mjs`. This plan edits that code, not `master`.
-- Work in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` on branch `feat/chat-parts-2-5` (it exists). Rust builds and tests use `CARGO_TARGET_DIR=/home/p/.cache/chat-parts-2-5-target`.
+- Work in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` on branch `feat/chat-parts-2-5` (it exists). Rust builds and tests use `CARGO_TARGET_DIR=/mnt/d/git/claude-dashboard/target`.
 - CI commands: `node --test`, `cargo test --all --locked`, `cargo clippy --all-targets --locked -- -D warnings -D clippy::disallowed_types`.
 
 From the shared contract:
@@ -1148,16 +1148,16 @@ In `frontend-guards.test.mjs`: add `chat/menu.js` before `chat/view.js` and the 
 
 This task needs the owner's machine and accounts; run it with them. Every command runs from `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5`. Record each result for the pull request description. Plan mode switches Claude to Sonnet (E1c), so the plan steps cost a little more than haiku.
 
-- [ ] **Step 1: Run the gates.** `node --test`, `CARGO_TARGET_DIR=/home/p/.cache/chat-parts-2-5-target cargo test --all --locked`, the clippy command. Expected: all pass.
+- [ ] **Step 1: Run the gates.** `node --test`, `CARGO_TARGET_DIR=/mnt/d/git/claude-dashboard/target cargo test --all --locked`, the clippy command. Expected: all pass.
 - [ ] **Step 2: Start a private server and a test agent.** The agent's plain `tmux` calls follow `$TMUX`, so they all reach `cdash-test`. Both start from a minimal environment so no `CLAUDE*` variable leaks into the sessions (E1 setup).
 
 ```bash
-CARGO_TARGET_DIR=/home/p/.cache/chat-parts-2-5-target cargo build -p cdash-agent
+CARGO_TARGET_DIR=/mnt/d/git/claude-dashboard/target cargo build -p cdash-agent
 CLEAN=(env -i "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" "PATH=$PATH" "SHELL=$SHELL" LANG=C.UTF-8 TERM=xterm-256color "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
 "${CLEAN[@]}" tmux -L cdash-test -f /dev/null new-session -d -s cdash-hold
 SOCK=$(tmux -L cdash-test display-message -p '#{socket_path}')
 mkdir -p /tmp/cdash-p2 && cp -p ~/.claude/settings.json /tmp/cdash-p2/settings.json.bak
-"${CLEAN[@]}" "TMUX=$SOCK,0,0" PORT=23290 CDASH_HOOK_PORT=23291 /home/p/.cache/chat-parts-2-5-target/debug/cdash-agent > /tmp/cdash-p2/agent.log 2>&1 &
+"${CLEAN[@]}" "TMUX=$SOCK,0,0" PORT=23290 CDASH_HOOK_PORT=23291 /mnt/d/git/claude-dashboard/target/debug/cdash-agent > /tmp/cdash-p2/agent.log 2>&1 &
 ```
 
 Open `http://127.0.0.1:23290` in the Windows browser. Expected: the dashboard loads and `agent.log` has no `hook listener off`.

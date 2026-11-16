@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Work in `/mnt/d/git/claude-dashboard/.worktrees/chat-parts-2-5` on `feat/chat-parts-2-5`. Parts 4 and 2 are already done there exactly as the shared contract says; use their names (`EngineMsg::Status { working, waiting, waiting_for }`, the `req`/`res` envelope, `Engine::answer`, `set`, `menu`). No branch setup.
-- `export CARGO_TARGET_DIR=/home/p/.cache/chat-parts-2-5-target` before every cargo command. CI gates: `node --test`, `cargo test --all --locked`, `cargo clippy --all-targets --locked -- -D warnings -D clippy::disallowed_types`.
+- `export CARGO_TARGET_DIR=/mnt/d/git/claude-dashboard/target` before every cargo command. CI gates: `node --test`, `cargo test --all --locked`, `cargo clippy --all-targets --locked -- -D warnings -D clippy::disallowed_types`.
 - Never `git add -A` or `git add .`; `claude-1-261102-19.xapk` stays untracked. Each task ends with one commit of exactly the files in its Files block, with the task's Conventional Commits subject and a body of exactly two lines: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_0121cbef6XAzH3a3m9iNVdAr`.
 - No new npm packages and no new Rust crates.
 - Agent subprocesses go through `Runner` (`crates/agent/src/host/cmd.rs`). Supervisors never write to stdout: it is the native TUI's terminal.
