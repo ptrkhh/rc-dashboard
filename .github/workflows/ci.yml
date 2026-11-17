@@ -63,6 +63,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build release image
         run: docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+      - name: Smoke-test the image about to be pushed
+        run: bash scripts/test-docker.sh "$IMAGE:$VERSION"
       - name: Push to GHCR
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
