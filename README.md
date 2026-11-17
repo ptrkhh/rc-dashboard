@@ -101,15 +101,18 @@ The image bundles the agent, Claude Code and tmux. A second container runs cloud
 2. In Cloudflare Zero Trust, create a tunnel and a public hostname that points at `http://tools:23274`. Create an Access application for that hostname with a policy that allows you. Put the tunnel token, team domain, and application audience tag in `.env`. **`CF_TEAM_DOMAIN` must be the full HTTPS issuer URL**, such as `https://example.cloudflareaccess.com`, with no trailing slash. A bare hostname causes the agent to exit with a JWKS fetch error and the container to restart.
 3. Create the directory named by `PROJECTS_DIR` and put your projects in it, then start the stack:
 
-       docker compose up -d --build
+       docker compose pull
+       docker compose up -d
+
+   The published image is `linux/amd64` only. On arm64 hosts, build from source instead (see Docker maintenance below).
 
    Projects appear at `/home/node/projects` in the container. On Linux, the directory and project files must be writable by the container's `node` user (UID/GID 1000); creating a directory as another host user does not automatically grant that access.
 
 4. Sign in once. In the launcher, choose **Terminal** in the Model menu, open the `projects` folder and pick a directory in it, and tap **Launch**. Open the new card's **Terminal** button and run `claude`. Claude Code must be signed in with an account that supports Remote Control.
 
-The container starts with fresh CLI configuration. Host logins, plugins, trust lists, and permission settings are not imported. Configure each CLI inside the container, and set Git's `user.name` and `user.email` before committing. Dashboard-launched coding sessions set permissions on launch and resume: Claude Code uses `--dangerously-skip-permissions`. No saved permission configuration is needed for these defaults. The `home` volume preserves container logins, settings, and session history across rebuilds and `docker compose down`. `docker compose down -v` deletes that volume and its contents.
+The container starts with fresh CLI configuration. Host logins, plugins, trust lists, and permission settings are not imported. Configure each CLI inside the container, and set Git's `user.name` and `user.email` before committing. Dashboard-launched coding sessions set permissions on launch and resume: Claude Code uses `--dangerously-skip-permissions`. No saved permission configuration is needed for these defaults. The `home` volume preserves container logins, settings, and session history across image updates and `docker compose down`. `docker compose down -v` deletes that volume and its contents.
 
-The agent runs as `node` with passwordless `sudo`, so project dependencies can be installed from the remote terminal. Elevated commands can modify mounted host files. System packages installed interactively survive a container restart, but disappear when the container is removed or recreated; add lasting dependencies to the Dockerfile. The image also disables Git's ownership check for repositories, so mount repositories you trust. This does not grant filesystem write permission.
+The agent runs as `node` with passwordless `sudo`, so project dependencies can be installed from the remote terminal. Elevated commands can modify mounted host files. System packages installed interactively survive a container restart, but disappear when the container is removed or recreated; add lasting dependencies to the Dockerfile and build from source (see Docker maintenance below). The image also disables Git's ownership check for repositories, so mount repositories you trust. This does not grant filesystem write permission.
 
 Sessions run in tmux inside the container, so `docker restart`, `docker compose down`, and container replacement end them. Project files stay on the host. Cloudflare Access is the only guard: do not publish port 23274.
 
@@ -127,9 +130,20 @@ volumes:
     name: old-project_home
 ```
 
-Replace `old-project_home` with the existing home volume's name, then start the new project with `docker compose -p new-project -f docker-compose.yml -f compose.home.yml up -d --build`. Include the override in subsequent Compose commands. Never run independent dashboard stacks against the same home volume.
+Replace `old-project_home` with the existing home volume's name, then start the new project with `docker compose -p new-project -f docker-compose.yml -f compose.home.yml up -d`. Include the override in subsequent Compose commands. Never run independent dashboard stacks against the same home volume.
 
-To check a built image without CLI credentials or published ports, run `bash scripts/test-docker.sh rc-dashboard:local`.
+To build from source instead of pulling, for arm64 hosts, an edited Dockerfile, or other CLI versions (the `CLAUDE_CODE_VERSION`, `CODEX_VERSION`, and `OPENCODE_VERSION` build args, set under `build.args`), save an override such as `compose.build.yml`:
+
+```yaml
+services:
+  tools:
+    build: .
+    image: rc-dashboard:local
+```
+
+Then run `docker compose -f docker-compose.yml -f compose.build.yml up -d --build`. Include the override in subsequent Compose commands.
+
+To check a locally built image without CLI credentials or published ports, run `docker build -t rc-dashboard:local .` and then `bash scripts/test-docker.sh rc-dashboard:local`.
 
 </details>
 

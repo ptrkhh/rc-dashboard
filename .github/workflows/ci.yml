@@ -54,6 +54,34 @@ jobs:
           docker build -t rc-dashboard:ci .
           bash scripts/test-docker.sh rc-dashboard:ci
 
+  publish:
+    # ponytail: rebuilds the image; cache mounts do not persist, so reusing the
+    # docker job's image needs an artifact. Add it if release time matters.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release image
+        run: docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+      - name: Smoke-test the image about to be pushed
+        run: bash scripts/test-docker.sh "$IMAGE:$VERSION"
+      - name: Push to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+
   release-matrix:
     runs-on: ubuntu-latest
     strategy:
