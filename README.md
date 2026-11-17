@@ -101,7 +101,8 @@ The image bundles the agent, Claude Code and tmux. A second container runs cloud
 2. In Cloudflare Zero Trust, create a tunnel and a public hostname that points at `http://tools:23274`. Create an Access application for that hostname with a policy that allows you. Put the tunnel token, team domain, and application audience tag in `.env`. **`CF_TEAM_DOMAIN` must be the full HTTPS issuer URL**, such as `https://example.cloudflareaccess.com`, with no trailing slash. A bare hostname causes the agent to exit with a JWKS fetch error and the container to restart.
 3. Create the directory named by `PROJECTS_DIR` and put your projects in it, then start the stack:
 
-       docker compose up -d --build
+       docker compose pull
+       docker compose up -d
 
    Projects appear at `/home/node/projects` in the container. On Linux, the directory and project files must be writable by the container's `node` user (UID/GID 1000); creating a directory as another host user does not automatically grant that access.
 
@@ -127,7 +128,7 @@ volumes:
     name: old-project_home
 ```
 
-Replace `old-project_home` with the existing home volume's name, then start the new project with `docker compose -p new-project -f docker-compose.yml -f compose.home.yml up -d --build`. Include the override in subsequent Compose commands. Never run independent dashboard stacks against the same home volume.
+Replace `old-project_home` with the existing home volume's name, then start the new project with `docker compose -p new-project -f docker-compose.yml -f compose.home.yml up -d`. Include the override in subsequent Compose commands. Never run independent dashboard stacks against the same home volume.
 
 To check a built image without CLI credentials or published ports, run `bash scripts/test-docker.sh rc-dashboard:local`.
 

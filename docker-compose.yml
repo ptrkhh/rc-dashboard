@@ -2,8 +2,7 @@ name: cdash
 
 services:
   tools:
-    build: .
-    image: rc-dashboard:local
+    image: ghcr.io/ptrkhh/rc-dashboard:latest
     init: true
     restart: unless-stopped
     environment:
