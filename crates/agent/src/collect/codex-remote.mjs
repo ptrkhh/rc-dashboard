@@ -215,12 +215,31 @@ async function replayHistory(codex, threadId, remoteSid, emit, submitted = new S
   } while (cursor);
 }
 
-// Chat's view of one app-server notification, in the shapes the worker sends
-// Remote Control. Prompts typed in the native TUI arrive here too.
-// ponytail: mirrors the worker's inline shaping; fold the two together when the worker is next reworked.
+const ASYNC_REPLY = 'send_user_message_question_reply';
+const asyncQuestionId = (itemId, index) => JSON.stringify(['request_user_input_async', itemId, index]);
+
+function asyncReplies(item) {
+  const blocks = (item.content ?? []).filter(b => b.type !== 'skill' && b.type !== 'mention');
+  if (blocks.length !== 1 || blocks[0].type !== 'text' || typeof blocks[0].text !== 'string') return null;
+  let text = blocks[0].text.trim();
+  if (text.startsWith('# Context from my IDE setup:\n')) {
+    text = text.split('\n## My request for Codex:\n').at(-1).trim();
+  }
+  const start = `<${ASYNC_REPLY}>`, end = `</${ASYNC_REPLY}>`;
+  if (!text.startsWith(start) || !text.endsWith(end)) return null;
+  try {
+    const value = JSON.parse(text.slice(start.length, -end.length));
+    const replies = Array.isArray(value) ? value : [value];
+    if (replies.length && replies.every(r => typeof r?.questionItemId === 'string' && typeof r.question === 'string' && typeof r.answer === 'string')) return replies;
+  } catch { /* malformed markup is ordinary chat text */ }
+  return null;
+}
+
 // A userMessage item as chat shows it: its text without the `Attached:` lines, and files
 // as cache refs. Image bytes (a data URL, or a file Codex names) never leave this function.
 async function chatPrompt(item) {
+  const replies = asyncReplies(item);
+  if (replies) return { text: replies.map(r => `${r.question}\n\n${r.answer}`).join('\n\n'), files: [] };
   const { MAX_MEDIA, splitAttached, stashMedia } = await import(new URL('./chat-feed.mjs', import.meta.url)); // lazy: the worker is also copied alone
   const blocks = item.content || [];
   const { text, files: attached } = splitAttached(blocks.filter(b => b.type === 'text').map(b => b.text).join(''));
@@ -241,6 +260,9 @@ async function chatPrompt(item) {
   return { text, files: [...images, ...attached] };
 }
 
+// Chat's view of one app-server notification, in the shapes the worker sends
+// Remote Control. Prompts typed in the native TUI arrive here too.
+// ponytail: mirrors the worker's inline shaping; fold the two together when the worker is next reworked.
 async function chatMessages(m, sid) {
   const p = m.params || {};
   let out = [];
@@ -542,7 +564,14 @@ async function nativeLauncher(statePath, state, script) {
   const dir = await mkdtemp(join(tmpdir(), 'cdash-codex-native-'));
   const resuming = Boolean(state.sid);
   const { ChatFeed } = await import(new URL('./chat-feed.mjs', import.meta.url));
-  const asks = new Map(); // ask id -> { rpcId, questions } for a question, { implement: true } for the plan card
+  const asks = new Map();
+  const dropAsk = id => { asks.delete(id); feed.dropAsk(id); };
+  const settleAsyncAsks = replies => {
+    const ids = replies && new Set(replies.map(r => r.questionItemId));
+    for (const [id, ask] of asks) {
+      if (ask.asyncQuestion && (!ids || ids.has(id) || ids.has(ask.itemId))) dropAsk(id);
+    }
+  };
   let lastPlan = null, plan = null, models = null;
   let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
   const openRequests = new Set(); // ids of server requests not yet resolved
@@ -615,9 +644,8 @@ async function nativeLauncher(statePath, state, script) {
     },
     answer: async ({ id, answer }) => {
       const ask = asks.get(id);
-      if (!ask) throw Error('already answered');
+      if (!ask || ask.busy) throw Error('already answered');
       if (ask.implement) {
-        if (ask.busy) throw Error('already answered');
         if (answer?.choice === 'yes') {
           ask.busy = true;
           try {
@@ -626,9 +654,20 @@ async function nativeLauncher(statePath, state, script) {
             await submit([{ type: 'text', text: 'Implement the plan.', text_elements: [] }], false);
           } finally { ask.busy = false; } // on failure the card stays, so the user can retry
         }
+      } else if (ask.asyncQuestion) {
+        const picked = answer?.answers?.answer;
+        const text = picked?.text?.trim() || picked?.choices?.[0]?.trim();
+        if (!text) throw Error('answer the question');
+        // Codex's TUI includes at most 512 UTF-8 bytes of the question in its reply.
+        const title = new TextDecoder('utf-8', { ignoreBOM: true })
+          .decode(Buffer.from(ask.asyncQuestion).subarray(0, 512), { stream: true }).replace(/[\r\n]/g, ' ');
+        const reply = JSON.stringify([{ answer: text, question: title, questionItemId: id }]);
+        ask.busy = true;
+        try {
+          await submit([{ type: 'text', text: `<${ASYNC_REPLY}>\n${reply}\n</${ASYNC_REPLY}>`, text_elements: [] }], true);
+        } finally { ask.busy = false; }
       } else control.send({ id: ask.rpcId, result: { answers: codexAnswers(ask.questions, answer?.answers) } });
-      asks.delete(id);
-      feed.dropAsk(id);
+      dropAsk(id);
     },
     set: async ({ what, value }) => {
       if (what === 'plan') {
@@ -791,8 +830,7 @@ async function nativeLauncher(statePath, state, script) {
     if (m.method === 'serverRequest/resolved') {
       openRequests.delete(String(p.requestId));
       feed.setState({ waiting: openRequests.size > 0 }); // another subagent's question may still be open
-      asks.delete(String(p.requestId));
-      feed.dropAsk(String(p.requestId));
+      dropAsk(String(p.requestId));
     }
     if (m.method === 'item/tool/requestUserInput') {
       asks.set(String(m.id), { rpcId: m.id, questions: p.questions || [] });
@@ -811,6 +849,19 @@ async function nativeLauncher(statePath, state, script) {
       }
     }
     if (!mainThread(m, state.sid)) return; // a subagent's turns and items are not this conversation; its questions (above) still are
+    const item = p.item;
+    if (m.method === 'item/completed' && item?.type === 'agentMessage' && item.delivery === 'async') {
+      for (const [index, q] of (item.questions ?? []).entries()) {
+        const id = asyncQuestionId(item.id, index);
+        asks.set(id, { asyncQuestion: q.title, itemId: item.id });
+        feed.putAsk({ id, kind: 'question', tool: 'codex', questions: [{
+          id: 'answer', question: q.title, other: true, options: (q.options ?? []).map(label => ({ label })),
+        }] });
+      }
+    }
+    if (m.method === 'item/completed' && item?.type === 'userMessage') settleAsyncAsks(asyncReplies(item));
+    // A successful turn can leave a question open for a follow-up.
+    if (m.method === 'turn/completed' && p.turn.status !== 'completed') settleAsyncAsks();
     if (state.sid) {
       const chat = await chatMessages(m, state.sid);
       const turn = p.turn ?? { id: p.turnId };
@@ -830,7 +881,7 @@ async function nativeLauncher(statePath, state, script) {
     if (m.method === 'thread/reverted' && p.threadId === state.sid) reread(); // chat's own revert too: it reaches every connection
     if (m.method === 'turn/started') {
       feed.setState({ working: true });
-      for (const id of asks.keys()) if (id.startsWith('implement:')) { asks.delete(id); feed.dropAsk(id); }
+      for (const id of asks.keys()) if (id.startsWith('implement:')) dropAsk(id);
       lastPlan = null;
     }
     if (m.method === 'item/completed' && p.item.type === 'plan') lastPlan = { turnId: p.turnId, text: p.item.text };
@@ -901,7 +952,8 @@ async function nativeLauncher(statePath, state, script) {
   };
   // A revert changed the conversation: start chat over from the thread's turns.
   const reread = () => {
-    for (const id of asks.keys()) if (id.startsWith('implement:')) { asks.delete(id); feed.dropAsk(id); } // the plan may be gone
+    settleAsyncAsks();
+    for (const id of asks.keys()) if (id.startsWith('implement:')) dropAsk(id); // the plan may be gone
     lastPlan = null;
     if (usage.context) { usage = { ...usage, context: null }; feed.setUsage(usage); } // Codex resends no usage on a revert; the next turn refills it
     feed.reset();

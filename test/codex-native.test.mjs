@@ -380,6 +380,72 @@ test('questions from any thread become cards; an answer is the server-request re
   assert.deepEqual(await res(c, 2), { t: 'res', rid: 2, ok: false, error: 'already answered' });
   c.close();
 });
+
+const asyncQuestionId = index => JSON.stringify(['request_user_input_async', 'call_question', index]);
+const asyncReply = (index, question, answer) => ({
+  type: 'text',
+  text: '<send_user_message_question_reply>\n' + JSON.stringify([{ answer, question, questionItemId: asyncQuestionId(index) }]) + '\n</send_user_message_question_reply>',
+});
+
+test('Codex async question cards steer an active turn and accept a follow-up after it finishes', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  t.after(c.close);
+  const event = (method, params) => f.inject({ method, params: { threadId: SID, turnId: 't2', ...params } });
+  const title = 'Which environment?';
+  await event('turn/started', { turn: { id: 't2' } });
+  await event('item/completed', { item: { type: 'agentMessage', id: 'call_question', delivery: 'async', phase: 'final', text: title, questions: [
+    { title, options: ['Staging', 'Production'] }, { title: 'Which audience?', options: null }, { title: 'Which date?', options: null },
+  ] } });
+  await until(() => asksNow(c).length === 3, 2000);
+  assert.deepEqual(asksNow(c)[0], { id: asyncQuestionId(0), kind: 'question', tool: 'codex', questions: [{
+    id: 'answer', question: title, other: true, options: [{ label: 'Staging' }, { label: 'Production' }],
+  }] });
+  assert.equal(c.lines.findLast(l => l.t === 'state').waiting, false);
+
+  const answer = async (index, picks) => {
+    c.write({ t: 'req', rid: index + 1, op: 'answer', id: asyncQuestionId(index), answer: { answers: { answer: picks } } });
+    return res(c, index + 1);
+  };
+  assert.equal((await answer(0, { choices: ['Staging'] })).ok, true);
+  assert.equal(f.rpc('turn/steer').params.expectedTurnId, 't2');
+  assert.equal(f.rpc('turn/steer').params.input[0].text, asyncReply(0, title, 'Staging').text);
+
+  await event('item/completed', { item: { type: 'userMessage', id: 'terminal-answer', content: [asyncReply(1, 'Which audience?', 'Customers')] } });
+  await until(() => asksNow(c).length === 1);
+  assert.equal(asksNow(c)[0].id, asyncQuestionId(2));
+  assert.deepEqual(await answer(1, { text: 'Someone else' }), { t: 'res', rid: 2, ok: false, error: 'already answered' });
+  const message = () => c.lines.find(l => l.t === 'ev' && l.ev.message?.id === 'terminal-answer');
+  await until(message);
+  assert.equal(message().ev.message.content[0].text, 'Which audience?\n\nCustomers');
+
+  await event('turn/completed', { turn: { id: 't2', status: 'completed' } });
+  await until(() => c.lines.findLast(l => l.t === 'state').working === false);
+  const reopened = await client(f.native().chat_sock, { after: 0, epoch: null });
+  t.after(reopened.close);
+  await until(() => asksNow(reopened).length === 1);
+  assert.equal((await answer(2, { choices: [], text: 'Tomorrow' })).ok, true);
+  assert.equal(f.rpc('turn/start').params.input[0].text, asyncReply(2, 'Which date?', 'Tomorrow').text);
+  await until(() => asksNow(reopened).length === 0);
+});
+
+test('Codex history displays the answer from a reply envelope and preserves a prompt quoting it', { timeout: 20000 }, async t => {
+  const reply = asyncReply(0, 'Which environment?', 'Staging');
+  const quoted = 'Please inspect this reply:\n' + reply.text;
+  const history = { data: [{ id: 't1', items: [
+    { id: 'u1', type: 'userMessage', content: [reply] },
+    { id: 'u2', type: 'userMessage', content: [{ type: 'text', text: quoted }] },
+  ] }], nextCursor: null };
+  const f = await fixture(t, '', 'linux', true, { history });
+  await f.wait(() => f.native()?.chat_sock);
+  const c = await client(f.native().chat_sock, { after: 0, epoch: null });
+  t.after(c.close);
+  await until(() => c.lines.some(l => l.t === 'ready'));
+  const prompts = c.lines.filter(l => l.t === 'ev' && l.ev.type === 'user');
+  assert.deepEqual(prompts.map(l => l.ev.message.content[0].text), ['Which environment?\n\nStaging', quoted]);
+});
+
 test('the plan switch, pickers, menu, slash commands and Implement this plan? drive the app server', { timeout: 20000 }, async t => {
   const f = await fixture(t);
   await f.wait(() => f.native()?.chat_sock);
