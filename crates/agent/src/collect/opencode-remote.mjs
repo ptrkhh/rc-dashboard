@@ -1,6 +1,7 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { stat, readFile, writeFile, rename, readdir, mkdir, open, rm } from 'node:fs/promises';
+import { stat, readFile, writeFile, rename, readdir, mkdir, open, rm, mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { isAbsolute, resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { OpenCode, startServer, normalizeModels } from './opencode-api.mjs';
@@ -11,7 +12,7 @@ function inputID() {
   return `msg_${time}${Array.from(randomBytes(14), byte => chars[byte % chars.length]).join('')}`;
 }
 
-export async function submitPrompt(client, state, remoteId, text, save) {
+export async function submitPrompt(client, state, remoteId, text, save, files = []) {
   if (typeof remoteId !== 'string' || !remoteId || typeof text !== 'string' || !state.sid) throw new Error('Invalid OpenCode prompt association');
   state.remote_inputs ||= {};
   let entry = Object.hasOwn(state.remote_inputs, remoteId) ? state.remote_inputs[remoteId] : undefined;
@@ -23,7 +24,7 @@ export async function submitPrompt(client, state, remoteId, text, save) {
   if (entry.sessionID !== state.sid || entry.text !== text) throw new Error('OpenCode prompt association conflict');
   const path = `/api/session/${encodeURIComponent(state.sid)}`;
   try {
-    const result = await client.request(`${path}/prompt`, { method: 'POST', body: { id: entry.id, text, delivery: 'steer' } });
+    const result = await client.request(`${path}/prompt`, { method: 'POST', body: { id: entry.id, text, delivery: 'steer', ...(files.length ? { files } : {}) } });
     if (result?.data?.id !== entry.id || result.data.sessionID !== state.sid || result.data.type !== 'user') throw new Error('OpenCode returned an unmatched prompt');
   } catch (error) {
     if (error.status !== 409) throw error;
@@ -38,9 +39,21 @@ function messageUuid(remoteSid, nativeSid, messageId, part) {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-8${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 
-export function historyMessages(row, nativeSid, remoteSid, submitted = new Set()) {
+// The edit tool's file list as chat diffs. ponytail: patches are cut so one event's patch text stays under 16 KiB (the socket's line limit is 64 KiB); the rest keep counts only.
+function editFiles(files) {
+  let room = 16 * 1024;
+  return files.filter(f => f && typeof f === 'object').map(f => {
+    const out = { file: String(f.file ?? f.relativePath ?? f.filePath ?? ''), additions: Number(f.additions) || 0, deletions: Number(f.deletions) || 0 };
+    const patch = f.patch ?? f.diff, size = typeof patch === 'string' ? Buffer.byteLength(patch) : Infinity;
+    if (size <= room) { out.patch = patch; room -= size; }
+    return out;
+  });
+}
+
+export function historyMessages(row, nativeSid, remoteSid, submitted = new Set(), { chat = false } = {}) {
   const messages = [];
-  const emit = (part, payload) => messages.push({ ...payload, uuid: messageUuid(remoteSid, nativeSid, row.id, part) });
+  const ts = chat && row.time?.created != null && Number.isFinite(Number(row.time.created)) ? { ts: new Date(Number(row.time.created)).toISOString() } : {};
+  const emit = (part, payload) => messages.push({ ...payload, ...ts, uuid: messageUuid(remoteSid, nativeSid, row.id, part) });
   if (row.type === 'user' && typeof row.text === 'string' && !submitted.has(row.id)) {
     emit('user', { type: 'user', message: { id: row.id, role: 'user', content: [{ type: 'text', text: row.text }] } });
   }
@@ -49,6 +62,9 @@ export function historyMessages(row, nativeSid, remoteSid, submitted = new Set()
     if (part.type === 'text' && typeof part.text === 'string' && part.text) {
       emit(`text:${index}`, { type: 'assistant', message: { id: `${row.id}-text-${index}`, role: 'assistant', content: [{ type: 'text', text: part.text }], stop_reason: null } });
     }
+    if (chat && part.type === 'reasoning' && typeof part.text === 'string' && part.text) {
+      emit(`reasoning:${index}`, { type: 'assistant', message: { id: `${row.id}-reasoning-${index}`, role: 'assistant', content: [{ type: 'thinking', thinking: part.text }], stop_reason: null } });
+    }
     if (part.type !== 'tool' || !part.state || !part.id) continue;
     const tool = part.state, name = ['shell', 'bash'].includes(part.name) ? 'Bash' : part.name;
     const input = tool.input && typeof tool.input === 'object' && !Array.isArray(tool.input) ? tool.input : {};
@@ -56,7 +72,8 @@ export function historyMessages(row, nativeSid, remoteSid, submitted = new Set()
     if (!['completed', 'error'].includes(tool.status)) continue;
     // shortcut: tool results are capped at 65,536 characters; use Terminal for larger output.
     const output = (tool.content || []).filter(item => item.type === 'text' && typeof item.text === 'string').map(item => item.text).join('\n').slice(0, 65536);
-    emit(`tool:${part.id}:result`, { type: 'user', parent_tool_use_id: null, message: { id: `${part.id}-tool-result`, role: 'user', content: [{ type: 'tool_result', tool_use_id: part.id, content: output || (tool.status === 'error' ? 'Tool failed' : ''), is_error: tool.status === 'error' }] } });
+    const files = chat && Array.isArray(tool.metadata?.files) ? editFiles(tool.metadata.files) : null;
+    emit(`tool:${part.id}:result`, { type: 'user', parent_tool_use_id: null, message: { id: `${part.id}-tool-result`, role: 'user', content: [{ type: 'tool_result', tool_use_id: part.id, content: output || (tool.status === 'error' ? 'Tool failed' : ''), is_error: tool.status === 'error', ...(files?.length && { diff: files }) }] } });
   }
   return messages;
 }
@@ -68,10 +85,30 @@ function updateModel(state, selected) {
   state.variant = selected.variant || null;
 }
 
+// A user row as chat shows it: text without its `Attached:` lines, and files as cache refs
+// (images) or chips. Base64 never leaves this function.
+async function chatPrompt(m, rowFiles) {
+  const { MAX_MEDIA, splitAttached, stashMedia } = await import(new URL('./chat-feed.mjs', import.meta.url)); // lazy: the worker is also copied alone
+  const { text, files: attached } = splitAttached(m.message.content.map(b => b.text).join(''));
+  const files = [];
+  for (const f of Array.isArray(rowFiles) ? rowFiles : []) {
+    const data = typeof f?.data === 'string' ? f.data : '';
+    const name = typeof f?.name === 'string' && f.name ? f.name : 'file';
+    let entry = { kind: 'file', name, size: Math.floor(data.length / 4 * 3) - (data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0) };
+    if (typeof f?.mime === 'string' && f.mime.startsWith('image/') && data.length / 4 * 3 <= MAX_MEDIA) { // history is untrusted: never decode a huge one
+      // a failed stash must not reach the event chain: it would end the session
+      const s = await stashMedia(process.env.CDASH_MEDIA_DIR, Buffer.from(data, 'base64')).catch(() => null);
+      if (s) entry = { kind: 'image', ref: s.ref, mime: s.mime };
+    }
+    files.push(entry);
+  }
+  return { ...m, message: { ...m.message, content: text ? [{ type: 'text', text }] : [] }, ...(files.length || attached.length ? { files: [...files, ...attached] } : {}) };
+}
+
 export class RemoteBridge {
   constructor(client, remote, state, save) {
     this.client = client; this.remote = remote; this.state = state; this.save = save;
-    this.approvals = new Map(); this.forms = new Set(); this.sent = new Set(); this.activity = false; this.completedSinceStart = false;
+    this.approvals = new Map(); this.forms = new Set(); this.sent = new Set(); this.activity = false; this.completedSinceStart = false; this.chat = false;
     this.path = `/api/session/${encodeURIComponent(state.sid)}`;
   }
   connect(signal, onError = () => {}, beforeReplay = Promise.resolve()) {
@@ -95,7 +132,7 @@ export class RemoteBridge {
   async emitHistory(row, onlyTools = false) {
     const prefix = `${this.remote.sid || ''}:`;
     const submitted = new Set(Object.entries(this.state.remote_inputs || {}).filter(([key]) => key.startsWith(prefix)).map(([, value]) => value.id));
-    for (const payload of historyMessages(row, this.state.sid, this.remote.sid || '', submitted)) {
+    for (const payload of historyMessages(row, this.state.sid, this.remote.sid || '', submitted, { chat: this.chat })) {
       if (onlyTools && !['tool_use', 'tool_result'].includes(payload.message?.content?.[0]?.type)) continue;
       if (this.sent.has(payload.uuid)) continue;
       await this.remote.event(payload);
@@ -328,10 +365,32 @@ async function worker(args) {
   } finally { stop(); await saved.catch(() => {}); await client.close(); }
 }
 
+const BTW = 'The user is asking a quick side question about the conversation so far. Answer directly and concisely in markdown from what you already know. Do not call any tools and do not take any actions.';
+
 function modelRef(model, variant) {
   const split = typeof model === 'string' ? model.indexOf('/') : -1;
   if (split < 1 || split === model.length - 1) throw new Error('Invalid OpenCode model');
   return { providerID: model.slice(0, split), id: model.slice(split + 1), ...(variant ? { variant } : {}) };
+}
+
+// A question form becomes a card only when every field is a plain string or
+// multiselect; any other form keeps the Terminal banner.
+export function formAsk(form) {
+  const fields = form?.fields;
+  if (!Array.isArray(fields) || !fields.length || !fields.every(f => ['string', 'multiselect'].includes(f.type) && f.when === undefined)) return null;
+  return { id: form.id, kind: 'question', tool: 'opencode', questions: fields.map(f => ({
+    id: f.key, header: f.title ?? '', question: f.description ?? f.title ?? '', multi: f.type === 'multiselect',
+    other: f.custom === true || !f.options?.length, secret: false,
+    options: (f.options ?? []).map(o => ({ label: o.label ?? o.value, description: o.description ?? '' })) })) };
+}
+
+// answers: { <key>: { choices, text } } -> { <key>: "text" | ["a", "b"] }
+export function formAnswer(form, answers) {
+  return Object.fromEntries(form.fields.map(f => {
+    const a = answers?.[f.key], text = typeof a?.text === 'string' ? a.text.trim() : '';
+    const choices = Array.isArray(a?.choices) ? a.choices : [];
+    return [f.key, f.type === 'multiselect' ? [...choices, ...(text ? [text] : [])] : text || choices[0] || ''];
+  }));
 }
 
 function stopGroup(child) {
@@ -349,7 +408,7 @@ async function supervise(statePath, name) {
   const controlDir = join(root, 'controls', name);
   await mkdir(controlDir, { recursive: true, mode: 0o700 });
   const log = await open(join(controlDir, 'native.log'), 'a', 0o600);
-  let client, tui, runner, retry, closing = false, cleanup;
+  let client, tui, runner, retry, closing = false, cleanup, feed, chatDir;
   let saved = Promise.resolve();
   const saveNative = () => { const data = JSON.stringify(state); saved = saved.then(() => atomic(nativePath, data)); return saved; };
   const events = new AbortController();
@@ -358,9 +417,11 @@ async function supervise(statePath, name) {
     closing = true; clearTimeout(retry); events.abort();
     cleanup = (async () => {
       if (client && state.sid) await client.request(`/api/session/${encodeURIComponent(state.sid)}/interrupt`, { method: 'POST', body: {} }).catch(() => {});
+      feed?.close();
       tui?.kill('SIGTERM');
       stopGroup(runner);
       await client?.close();
+      if (chatDir) await rm(chatDir, { recursive: true, force: true });
       await saved.catch(() => {});
       await rm(statePath.replace(/\.json$/, '.link'), { force: true });
       await log.close();
@@ -386,25 +447,279 @@ async function supervise(statePath, name) {
     }
     state.pid = process.pid; state.native_terminal = true; state.working = false; state.rc_unavailable = false;
     await atomic(statePath, JSON.stringify(state)); await saveNative();
+    // Dashboard chat. Its own state object, so the worker's file is never
+    // touched; the `dash:` prefix differs from the sink's sid on purpose, so
+    // emitHistory still echoes chat's own prompts. OpenCode takes one delivery
+    // mode (steer) whether or not a turn is running, so `steer` is not consulted.
+    const { ChatFeed } = await import(new URL('./chat-feed.mjs', import.meta.url));
+    chatDir = await mkdtemp(join(tmpdir(), 'cdash-opencode-'));
+    const chatState = { sid: state.sid, model: state.model, variant: state.variant, remote_inputs: {} };
+    const sessionPath = '/api/session/' + encodeURIComponent(state.sid);
+    let bridge; // the running ChatBridge
+    const forms = new Map(); // form id -> form shown as a card, shared by every ChatBridge
+    const publishSettings = () => feed.setSettings({ model: chatState.model, effort: null, plan: null, agent: chatState.agent ?? null, variant: chatState.variant ?? null });
+    const dropForm = id => { forms.delete(id); feed.dropAsk(id); };
+    const list = async path => { const data = (await client.request(path)).data; if (!Array.isArray(data)) throw new Error('Invalid OpenCode list'); return data; };
+    // The agents the TUI's Tab cycle keeps.
+    const agents = async () => (await list('/api/agent')).filter(a => a.mode !== 'subagent' && !a.hidden);
+    const models = async () => normalizeModels(await client.request('/api/model'));
+    const promptRows = new Map(); // chat row uuid -> {id, text}, the prompts a rewind can stage
+    const sides = new Map(); // side question id -> AbortController of its generate call
+    const ops = {
+      rewind: async ({ uuid, files }) => {
+        const row = promptRows.get(uuid);
+        if (!row) throw new Error('this prompt cannot be rewound');
+        try { await client.request(`${sessionPath}/revert/stage`, { method: 'POST', body: { messageID: row.id, files: !!files } }); }
+        catch (error) { throw error.status === 409 ? new Error('the session is busy') : error; }
+        return { text: row.text };
+      },
+      rewind_undo: async () => { await client.request(`${sessionPath}/revert`, { method: 'DELETE' }); },
+      answer: async ({ id, answer }) => {
+        const form = forms.get(id);
+        if (!form) throw new Error('already answered');
+        try { await client.request(`${sessionPath}/form/${encodeURIComponent(id)}/reply`, { method: 'POST', body: { answer: formAnswer(form, answer?.answers) } }); }
+        catch (error) { if (error.status === 409 || error.status === 404) { dropForm(id); bridge?.forms.delete(id); bridge?.syncPermissions().catch(() => {}); throw new Error('already answered'); } throw error; }
+        dropForm(id);
+      },
+      set: async ({ what, value }) => {
+        if (what === 'agent') {
+          if (!(await agents()).some(a => a.id === value)) throw new Error('unknown agent');
+          await client.request(`${sessionPath}/agent`, { method: 'POST', body: { agent: value } });
+          chatState.agent = value;
+        } else if (what === 'model' || what === 'variant') {
+          const all = await models();
+          const m = all.find(x => x.model === (what === 'model' ? value : chatState.model));
+          if (!m) throw new Error('unknown model');
+          let variant = chatState.variant;
+          if (what === 'variant') {
+            if (value && !m.variants.includes(value)) throw new Error('unknown variant');
+            variant = value || null;
+          } else if (!m.variants.includes(variant)) variant = null;
+          await client.request(`${sessionPath}/model`, { method: 'POST', body: { model: modelRef(m.model, variant) } });
+          chatState.model = m.model; chatState.variant = variant;
+        } else throw new Error('not supported');
+        publishSettings();
+      },
+      // A side question: OpenCode's own /btw, one tool-less call that leaves the session's history and cost alone.
+      aside: ({ id, text }) => {
+        const ac = new AbortController();
+        sides.get(id)?.abort();
+        sides.set(id, ac);
+        client.request(`${sessionPath}/generate`, { method: 'POST', body: { prompt: BTW + '\n\n' + text }, signal: ac.signal, timeout: 300000 })
+          .then(r => feed.pushAside(id, r?.data?.text || '', true), e => { if (!ac.signal.aborted) feed.pushAside(id, '', true, e.message); })
+          .finally(() => { if (sides.get(id) === ac) sides.delete(id); });
+      },
+      aside_cancel: ({ id }) => { sides.get(id)?.abort(); sides.delete(id); },
+      menu: async () => ({
+        commands: (await commands()).slice(0, 150).map(c => ({ name: c.name, description: (c.description ?? '').slice(0, 100) })),
+        models: (await models()).map(m => ({ value: m.model, label: m.label.replace(/^OpenCode: /, ''), variants: m.variants })),
+        efforts: [], agents: (await agents()).map(a => ({ value: a.id, label: a.name ?? a.id })),
+      }),
+    };
+    const commands = () => list('/api/command');
+    feed = new ChatFeed({
+      ops,
+      send: async (text, { cid, files = [] }) => {
+        const [, name, rest = ''] = /^\/([A-Za-z0-9_:-]+)(?:\s+([\s\S]*))?$/.exec(text) || []; // `/usr/bin/x ...` is a prompt
+        // ponytail: attachments on a command are ignored; refuse them if owners hit it
+        if (name && (await commands().catch(() => [])).some(c => c.name === name)) {
+          await client.request(`${sessionPath}/command`, { method: 'POST', body: { name, text: rest.trim() } });
+          return { done: true }; // the server expands the template, so no prompt row matches this cid
+        }
+        const { withAttached } = await import(new URL('./chat-feed.mjs', import.meta.url));
+        const asPart = f => f.kind === 'image' || f.mime === 'application/pdf';
+        const parts = files.filter(asPart).map(f => ({ uri: pathToFileURL(f.path).href, name: f.name }));
+        return submitPrompt(client, chatState, 'dash:' + cid, withAttached(text, files.filter(f => !asPart(f)).map(f => f.path)), async () => {}, parts);
+      },
+      stop: () => client.request(sessionPath + '/interrupt', { method: 'POST', body: {} }),
+    });
+    publishSettings();
+    // The bridge reports a stopped turn as a failed one; chat must tell them
+    // apart so a stop from any door holds the queue.
+    let lastExecution = '';
+    let held = null; // events that arrive while rebuild() replays are kept and follow it
+    const emit = async m => {
+      if (m.type === 'user' && m.message?.content?.[0]?.type !== 'tool_result') {
+        m = await chatPrompt(m, rowFiles.get(m.message?.id));
+        if (m.uuid) promptRows.set(m.uuid, { id: m.message.id, text: m.message.content[0]?.text ?? '' });
+      }
+      return feed.accept(m.type === 'result' && lastExecution === 'session.execution.interrupted' ? { ...m, subtype: 'interrupted' } : m);
+    };
+    const sink = {
+      sid: 'cdash-chat',
+      event: async m => held ? void held.push(m) : emit(m),
+      state: async status => feed.setState({ working: status === 'running', waiting: status === 'requires_action' }),
+    };
+    const rowFiles = new Map(); // user row id -> its files, only while a row is replayed
+    const withRowFiles = async (row, fn) => {
+      if (row.type === 'user' && row.files) rowFiles.set(row.id, row.files);
+      try { return await fn(); } finally { rowFiles.delete(row.id); }
+    };
+    // The chat as the session shows it now: rows from a staged revert on are
+    // hidden and one `staged` row stands for them. RemoteBridge.emitHistory is
+    // not used: its `sent` set would skip rows already shown once.
+    let stagedAt = null; // revert.messageID while a revert is staged: every replay hides rows from it on
+    const rebuild = async () => {
+      held = [];
+      try {
+        // read first: a failed read must leave the chat as it is
+        const at = (await client.request(sessionPath)).data?.revert?.messageID ?? null;
+        const rows = await client.messages(state.sid);
+        const shown = at ? rows.filter(r => r.id < at) : rows; // ids ascend
+        stagedAt = at; promptRows.clear(); lastTokens = null; feed.reset();
+        for (const row of shown) {
+          if (row.type === 'assistant' && row.tokens) lastTokens = row.tokens;
+          const onlyTools = row.type === 'assistant' && !row.time?.completed;
+          await withRowFiles(row, async () => {
+            for (const p of historyMessages(row, state.sid, sink.sid, new Set(), { chat: true })) {
+              if (!onlyTools || ['tool_use', 'tool_result'].includes(p.message?.content?.[0]?.type) || bridge?.sent.has(p.uuid)) await emit(p);
+            }
+          });
+        }
+        if (at) feed.accept({ type: 'cdash', subtype: 'staged', messages: rows.length - shown.length });
+      } catch (error) {
+        log.write('chat rebuild: ' + error.message + '\n').catch(() => {});
+      } finally {
+        while (held.length) await emit(held.shift());
+        held = null;
+        await readUsage().catch(error => log.write('chat usage: ' + error.message + '\n').catch(() => {}));
+        feed.ready();
+      }
+    };
+    // Usage, as OpenCode's TUI counts it: the context is every token of the last call.
+    const num = x => Number(x) || 0;
+    const usedOf = t => num(t.input) + num(t.output) + num(t.reasoning) + num(t.cache?.read) + num(t.cache?.write);
+    const tokensOf = t => ({ input: num(t.input), output: num(t.output) + num(t.reasoning), cache_read: num(t.cache?.read), cache_write: num(t.cache?.write) });
+    let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
+    let lastTokens = null; // tokens of the last visible assistant row, seen as rows replay
+    let modelList = null; // GET /api/model, read once
+    const windowOf = model => modelList?.find(m => `${m.providerID}/${m.id}` === model)?.limit?.context ?? null;
+    const publishUsage = patch => { usage = { ...usage, ...patch }; feed.setUsage(usage); };
+    const readUsage = async () => {
+      const session = (await client.request(sessionPath)).data;
+      modelList ??= await list('/api/model').catch(() => null); // a failing model list must not block tokens and cost
+      publishUsage({ cwd: session?.location?.directory ?? usage.cwd, ...(session?.tokens && { tokens: tokensOf(session.tokens) }), ...(session?.cost != null && { cost: session.cost }),
+        context: lastTokens ? { used: usedOf(lastTokens), window: windowOf(usage.model) } : usage.context });
+    };
+    // The running list: shells of the session or its subagents, and the subagents themselves.
+    const children = new Map(); // child session id -> title
+    const shells = new Map(), subagents = new Map();
+    const publishTasks = () => feed.setTasks([...shells.values(), ...subagents.values()]);
+    const addShell = info => {
+      if (info?.id && info.status === 'running' && (info.metadata?.sessionID === state.sid || children.has(info.metadata?.sessionID)))
+        shells.set(info.id, { id: info.id, kind: 'shell', title: info.command, started: new Date(Number.isFinite(Number(info.time?.started)) ? Number(info.time.started) : Date.now()).toISOString() });
+    };
+    const addAgent = id => subagents.set(id, { id, kind: 'agent', title: children.get(id) ?? id, started: new Date().toISOString() });
+    const loadTasks = async () => {
+      const kids = await list('/api/session?' + new URLSearchParams({ parentID: state.sid }));
+      const found = await list('/api/shell');
+      const active = Object.keys((await client.request('/api/session/active')).data ?? {}); // all reads first: a failure keeps the list as it was
+      for (const c of kids) children.set(c.id, c.title ?? c.id);
+      shells.clear(); subagents.clear();
+      for (const sh of found) addShell(sh);
+      for (const id of active) if (children.has(id)) addAgent(id);
+      publishTasks();
+    };
+    const taskEvent = (type, data) => {
+      if (type === 'session.created' && data.parentID === state.sid) children.set(data.sessionID ?? data.id, data.title ?? data.sessionID ?? data.id);
+      else if (type === 'shell.created') addShell(data.info ?? data);
+      else if (type === 'shell.exited' || type === 'shell.deleted') { if (!shells.delete(data.id)) return; }
+      else if (children.has(data.sessionID) && type === 'session.execution.started') addAgent(data.sessionID);
+      else if (children.has(data.sessionID) && ['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(type)) { if (!subagents.delete(data.sessionID)) return; }
+      else return;
+      publishTasks();
+    };
+    class ChatBridge extends RemoteBridge {
+      chat = true;
+      emitHistory(row, onlyTools) {
+        if (stagedAt && row.id >= stagedAt) return;
+        if (row.type === 'assistant' && row.tokens) lastTokens = row.tokens;
+        return withRowFiles(row, () => super.emitHistory(row, onlyTools));
+      }
+      async nativeEvent(event) {
+        const data = event.data || {};
+        if (event.type?.startsWith('session.execution.')) lastExecution = event.type;
+        if (event.type === 'form.created' && data.form?.sessionID === this.state.sid) return this.addForm(data.form);
+        if (data.sessionID === this.state.sid) {
+          if (event.type === 'form.replied' || event.type === 'form.cancelled') dropForm(data.id);
+          else if (event.type === 'session.model.selected') { updateModel(this.state, data.model); publishSettings(); }
+          else if (event.type === 'session.agent.selected') { this.state.agent = data.agent; publishSettings(); }
+        }
+        return super.nativeEvent(event);
+      }
+      async reconcile() {
+        await super.reconcile();
+        await readUsage().catch(error => log.write('chat usage: ' + error.message + '\n').catch(() => {}));
+        this.state.agent = (await this.client.request(this.path)).data?.agent ?? null;
+        publishSettings();
+      }
+      // A form with a card never gets RemoteBridge's "Use Terminal" message.
+      async addForm(form) {
+        if (!form?.id || this.forms.has(form.id)) return;
+        this.forms.add(form.id); forms.set(form.id, form);
+        const ask = formAsk(form);
+        if (ask) feed.putAsk(ask);
+        await this.remote.state('requires_action', { tool_name: 'Terminal', action_description: 'Answer the pending form.' });
+      }
+      async syncForms() {
+        const mine = (await list(`${this.path}/form`)).filter(form => form.sessionID === this.state.sid);
+        const ids = new Set(mine.map(form => form.id));
+        for (const id of new Set([...this.forms, ...forms.keys()])) if (!ids.has(id)) { this.forms.delete(id); dropForm(id); } // the shared Map outlives a replaced bridge
+        for (const form of mine) await this.addForm(form);
+      }
+    }
+    state.chat_sock = await feed.listen(chatDir);
+    await saveNative();
+    // A bridge stops for good after one failed operation, so chat replaces it
+    // after a pause; the feed drops what the new one replays. connect()
+    // resolves after the first reconcile (the history replay). A failing feed
+    // must not stop the pane, nor leave chat connecting forever.
+    const startChat = () => {
+      if (closing) return;
+      const own = new AbortController();
+      events.signal.addEventListener('abort', () => own.abort(), { once: true });
+      let failed = false;
+      const restart = error => {
+        if (failed) return;
+        failed = true;
+        own.abort();
+        log.write('chat feed: ' + error.message + '\n').catch(() => {});
+        feed.ready();
+        if (!closing) setTimeout(startChat, 2000).unref();
+      };
+      (bridge = new ChatBridge(client, sink, chatState, async () => {})).connect(own.signal, restart)
+        .then(() => first && stagedAt ? rebuild() : feed.ready(), error => restart(error)).finally(() => { first = false; });
+    };
+    let first = true;
+    stagedAt = (await client.request(sessionPath).catch(() => ({}))).data?.revert?.messageID ?? null; // a revert staged before this start; a failed read only loses the hiding
+    startChat();
     let updates = Promise.resolve();
     const enqueue = operation => { updates = updates.then(operation).catch(() => {}); };
     void client.subscribe(event => enqueue(async () => {
       const data = event.data || {};
+      taskEvent(event.type, data);
       if (data.sessionID !== state.sid) return;
+      if (event.type === 'session.usage.updated' && data.tokens) publishUsage({ tokens: tokensOf(data.tokens), cost: data.cost ?? usage.cost });
+      else if (event.type === 'session.step.ended' && data.tokens) publishUsage({ context: { used: usedOf(data.tokens), window: usage.context?.window ?? windowOf(usage.model) } });
+      else if (event.type === 'session.model.selected' && data.model) { const model = `${data.model.providerID}/${data.model.id}`; publishUsage({ model, ...(usage.context && { context: { ...usage.context, window: windowOf(model) } }) }); }
+      if (['session.revert.staged', 'session.revert.cleared', 'session.revert.committed'].includes(event.type)) return rebuild();
       if (event.type === 'session.execution.started') state.working = true;
       else if (['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type)) { state.working = false; state.ts = Date.now(); }
       else if (event.type === 'session.text.ended') state.last_message = data.text;
       else if (event.type === 'session.model.selected') updateModel(state, data.model);
       else return;
       await saveNative();
-    }), () => enqueue(async () => {
+    }), () => {
+      enqueue(async () => {
       const active = (await client.request('/api/session/active')).data;
       const session = (await client.request(`/api/session/${encodeURIComponent(state.sid)}`)).data;
       state.working = Boolean(active?.[state.sid]);
       if (session?.model) updateModel(state, session.model);
       await saveNative();
-    }), events.signal);
-    tui = spawn('opencode', ['--server', client.url, '--session', state.sid], { cwd: state.dir, env: { ...nativeEnv(), OPENCODE_PASSWORD: client.password }, stdio: 'inherit' });
+      });
+      enqueue(() => loadTasks().catch(error => log.write('chat tasks: ' + error.message + '\n').catch(() => {}))); // its own step: a failed read above cannot skip it
+    }, events.signal);
+    tui = spawn('opencode', ['--server', client.url, '--session', state.sid, '--auto'], { cwd: state.dir, env: { ...nativeEnv(), OPENCODE_PASSWORD: client.password }, stdio: 'inherit' });
     tui.once('error', () => stop().then(() => process.exit(1)));
     tui.once('exit', code => { if (!closing) stop().then(() => process.exit(code || 0)); });
     let failures = 0, reuseRemote = false;

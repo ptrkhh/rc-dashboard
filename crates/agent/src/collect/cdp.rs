@@ -318,7 +318,7 @@ pub(crate) mod fake {
 mod tests {
     use super::*;
     use crate::collect::browser::browser_ws_url;
-    use crate::collect::term::tests::eventually;
+    use crate::chat::tmux_io::tests::eventually;
     use serde_json::json;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};

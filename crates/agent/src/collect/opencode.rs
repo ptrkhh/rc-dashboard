@@ -43,6 +43,9 @@ pub struct OpenCodeSession {
     pub last_message: Option<String>,
     #[serde(default)]
     pub ts: f64,
+    /// The supervisor's chat socket; absent for panes started before chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_sock: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +99,7 @@ async fn install(ctx: &Ctx) -> Result<PathBuf, Refused> {
         ("opencode-api.mjs", include_str!("opencode-api.mjs")),
         ("claude-remote.mjs", include_str!("claude-remote.mjs")),
         ("opencode-remote.mjs", include_str!("opencode-remote.mjs")),
+        ("chat-feed.mjs", include_str!("chat-feed.mjs")),
     ] {
         let file = base.join(name);
         if read_if(&file).await.as_deref() != Some(contents) {
@@ -364,12 +368,15 @@ pub async fn launch(
     )
     .await
     .map_err(|e| Refused::Failed(format!("OpenCode runner trust write: {e}")))?;
+    let media_env = format!("CDASH_MEDIA_DIR={}", crate::chat::media::media_dir().display());
     ctx.runner
         .run_checked(
             "tmux",
             &[
                 "new-session",
                 "-d",
+                "-e",
+                &media_env,
                 "-s",
                 &name,
                 "-c",
@@ -453,6 +460,7 @@ pub async fn resume(
 mod tests {
     use super::*;
     use crate::host::{cmd::Runner, init::Host, log::LogBuffer, sample::Sampler};
+    use crate::chat::tmux_io::tests::install_stub;
     use std::os::unix::fs::PermissionsExt;
 
     fn fixture(tag: &str, installed: bool) -> (std::path::PathBuf, Arc<Ctx>) {
@@ -470,9 +478,7 @@ mod tests {
             programs.push(("opencode", "#!/bin/sh\necho opencode v2.1.4\n".to_string()));
         }
         for (name, body) in programs {
-            let file = dir.join("bin").join(name);
-            std::fs::write(&file, body).unwrap();
-            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install_stub(&dir, name, &body);
         }
         let log = Arc::new(LogBuffer::new());
         let path = dir.join("bin").to_string_lossy().into_owned();
@@ -519,6 +525,7 @@ mod tests {
             .await
             .unwrap();
         let args = std::fs::read_to_string(dir.join("tmux-args")).unwrap();
+        assert!(args.contains(&format!("-e CDASH_MEDIA_DIR={}", crate::chat::media::media_dir().display())));
         let state_path = args
             .split("--state ")
             .nth(1)
@@ -565,11 +572,7 @@ mod tests {
     async fn unsupported_opencode_version_is_rejected_before_tmux() {
         let (dir, ctx) = fixture("version", true);
         for version in ["opencode v1.9.0", "opencode v2.1.3", "opencode v3.0.0"] {
-            std::fs::write(
-                dir.join("bin/opencode"),
-                format!("#!/bin/sh\necho {version}\n"),
-            )
-            .unwrap();
+            install_stub(&dir, "opencode", &format!("#!/bin/sh\necho {version}\n"));
             assert!(
                 launch(&ctx, dir.to_str().unwrap(), "nvidia/model", None, None)
                     .await
@@ -604,6 +607,18 @@ mod tests {
             std::fs::read_to_string(root(&first).join("opencode-remote.mjs")).unwrap(),
             include_str!("opencode-remote.mjs")
         );
+        assert_eq!(
+            std::fs::read_to_string(root(&first).join("chat-feed.mjs")).unwrap(),
+            include_str!("chat-feed.mjs")
+        );
+    }
+
+    #[test]
+    fn a_native_state_names_its_chat_socket_when_the_supervisor_serves_one() {
+        let with: OpenCodeSession = serde_json::from_str(r#"{"dir":"/p","pid":1,"sid":"s","chat_sock":"/tmp/x/chat.sock"}"#).unwrap();
+        assert_eq!(with.chat_sock.as_deref(), Some("/tmp/x/chat.sock"));
+        let without: OpenCodeSession = serde_json::from_str(r#"{"dir":"/p","pid":1,"sid":"s"}"#).unwrap();
+        assert_eq!(without.chat_sock, None);
     }
 
     #[tokio::test]

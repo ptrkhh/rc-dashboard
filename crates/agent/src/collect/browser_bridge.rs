@@ -117,6 +117,23 @@ async fn start_view(cdp: &Cdp, target: &str) -> Result<View, &'static str> {
     Ok(View { target: target.to_string(), session, viewport: None })
 }
 
+async fn list_tabs(cdp: &Cdp) -> Result<Vec<Tab>, &'static str> {
+    let listed = cdp.call("Target.getTargets", json!({}), None).await?;
+    let infos = listed["targetInfos"].as_array().ok_or("protocol")?;
+    Ok(infos.iter().filter_map(tab_of).collect())
+}
+
+async fn select_view(cdp: &Cdp, tabs: &mut Vec<Tab>, id: &str) -> Result<Option<View>, &'static str> {
+    match start_view(cdp, id).await {
+        // A popup can close between the tab list and the attach request.
+        Err("protocol") if !list_tabs(cdp).await?.iter().any(|tab| tab.id == id) => {
+            tabs.retain(|tab| tab.id != id);
+            Ok(None)
+        }
+        result => result.map(Some),
+    }
+}
+
 /// Best effort and bounded: the browser, its tab and Playwright stay untouched.
 async fn stop_view(cdp: &Cdp, view: &View) {
     let _ = tokio::time::timeout(CLEANUP, async {
@@ -183,15 +200,17 @@ async fn on_event(cdp: &Cdp, ws: &mut WebSocket, tabs: &mut Vec<Tab>, view: &mut
 
 /// Leave the old tab (if any) and stream `id`. Input stays off until the new
 /// tab's first frame, because the viewport went with the old view.
-async fn switch_tab(cdp: &Cdp, ws: &mut WebSocket, tabs: &[Tab], view: &mut Option<View>, id: &str) -> Option<Exit> {
+async fn switch_tab(cdp: &Cdp, ws: &mut WebSocket, tabs: &mut Vec<Tab>, view: &mut Option<View>, id: &str) -> Option<Exit> {
     if !tabs.iter().any(|t| t.id == id) || view.as_ref().is_some_and(|v| v.target == id) {
         return None;
     }
-    if let Some(old) = view.take() {
-        stop_view(cdp, &old).await;
-    }
-    match start_view(cdp, id).await {
-        Ok(v) => *view = Some(v),
+    match select_view(cdp, tabs, id).await {
+        Ok(Some(v)) => {
+            if let Some(old) = view.replace(v) {
+                stop_view(cdp, &old).await;
+            }
+        }
+        Ok(None) => {}
         Err(e) => return Some(failed(e)),
     }
     (!send_or_drop(ws, tabs_msg(tabs, view.as_ref())).await).then_some(Exit::Failed("send"))
@@ -241,7 +260,7 @@ async fn send_input(cdp: &Cdp, session: Option<&str>, vp: &Viewport, msg: PhoneM
     Ok(())
 }
 
-async fn on_phone(cdp: &Cdp, ws: &mut WebSocket, tabs: &[Tab], view: &mut Option<View>, msg: PhoneMsg) -> Option<Exit> {
+async fn on_phone(cdp: &Cdp, ws: &mut WebSocket, tabs: &mut Vec<Tab>, view: &mut Option<View>, msg: PhoneMsg) -> Option<Exit> {
     if let PhoneMsg::Tab(id) = &msg {
         return switch_tab(cdp, ws, tabs, view, id).await;
     }
@@ -314,15 +333,14 @@ async fn run(port: u16, ws: &mut WebSocket) -> Exit {
     if let Err(e) = cdp.call("Target.setDiscoverTargets", json!({"discover": true}), None).await {
         return failed(e);
     }
-    let listed = match cdp.call("Target.getTargets", json!({}), None).await {
-        Ok(v) => v,
+    let mut tabs = match list_tabs(&cdp).await {
+        Ok(tabs) => tabs,
         Err(e) => return failed(e),
     };
-    let mut tabs: Vec<Tab> = listed["targetInfos"].as_array().map(|a| a.iter().filter_map(tab_of).collect()).unwrap_or_default();
     let mut view = None;
-    if let Some(t) = initial_tab(&tabs, &page_order(port).await) {
-        match start_view(&cdp, &t.id).await {
-            Ok(v) => view = Some(v),
+    if let Some(id) = initial_tab(&tabs, &page_order(port).await).map(|tab| tab.id.clone()) {
+        match select_view(&cdp, &mut tabs, &id).await {
+            Ok(selected) => view = selected,
             Err(e) => return failed(e),
         }
     }
@@ -363,7 +381,8 @@ mod tests {
     use super::*;
     use crate::collect::browser::MAP_FILE;
     use crate::collect::cdp::fake::{fake_browser, Call, FakeBrowser};
-    use crate::collect::term::tests::{eventually, have_tmux, status_of, tempdir, Session, Ws};
+    use crate::chat::tmux_io::tests::eventually;
+    use crate::collect::term::tests::{ have_tmux, status_of, tempdir, Session, Ws};
     use crate::http::serve::{serve, tests::cfg_for, Bound};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{json, Value};
@@ -804,6 +823,22 @@ mod tests {
         send(&mut ws, json!({"text": "x"})).await;
         let after = drain_calls(&mut r.fake, SETTLE).await;
         assert!(after.is_empty(), "no input once the viewed tab is gone: {after:?}");
+    }
+
+    #[tokio::test]
+    async fn picking_a_disappearing_popup_keeps_the_current_view() {
+        let Some((r, mut ws)) = viewing("popup-gone", &[("P1", "https://a.example/", "A"), ("P2", "https://b.example/", "B")]).await else { return };
+        {
+            let mut replies = r.fake.replies.lock().unwrap();
+            replies.insert("Target.attachToTarget".into(), Some(json!({"error": {"code": -32602}})));
+            replies.insert("Target.getTargets".into(), Some(json!({"result": {"targetInfos": [
+                {"targetId": "P1", "type": "page", "url": "https://a.example/", "title": "A"}
+            ]}})));
+        }
+        send(&mut ws, json!({"tab": "P2"})).await;
+        let tabs = text(&mut ws).await;
+        assert_eq!(tabs["active"], "P1");
+        assert_eq!(tabs["tabs"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

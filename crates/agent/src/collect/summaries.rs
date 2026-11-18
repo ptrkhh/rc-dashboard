@@ -164,16 +164,14 @@ async fn worker(ctx: Arc<Ctx>) {
 mod tests {
     use super::*;
     use crate::host::{init::Host, log::LogBuffer, sample::Sampler};
-    use std::os::unix::fs::PermissionsExt;
+    use crate::chat::tmux_io::tests::install_stub;
 
     #[tokio::test]
     async fn polling_deduplicates_work_preserves_preview_on_failure_and_reloads_disk_cache() {
         let dir = std::env::temp_dir().join(format!("cdash-summary-queue-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        let node = dir.join("bin/node");
-        std::fs::write(&node, format!("#!/bin/sh\necho run >> '{}/calls'\nsleep 0.2\necho '{{\"error\":\"unavailable\"}}'\n", dir.display())).unwrap();
-        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        install_stub(&dir, "node", &format!("#!/bin/sh\necho run >> '{}/calls'\nsleep 0.2\necho '{{\"error\":\"unavailable\"}}'\n", dir.display()));
         let make_ctx = || {
             Arc::new(Ctx::new(
                 Host {

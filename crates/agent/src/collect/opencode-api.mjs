@@ -12,12 +12,14 @@ export class OpenCode {
   constructor({ url, password }) {
     this.url = validURL(url);
     this.password = password;
+    // 10 PDFs of 20 MiB are about 267 MiB of base64; V8 strings stop at about 512 MiB
+    this.bodyMax = 8 * 1024 * 1024; this.rowMax = 320 * 1024 * 1024; this.eventMax = 1024 * 1024;
   }
-  async request(path, { method = 'GET', body, signal } = {}) {
+  async request(path, { method = 'GET', body, signal, timeout = 15000 } = {}) {
     if (!path.startsWith('/api/') || path.startsWith('//')) throw new Error('Invalid API path');
     let response;
     try {
-      response = await fetch(this.url + path, { method, redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000), headers: { authorization: `Basic ${Buffer.from(`opencode:${this.password}`).toString('base64')}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+      response = await fetch(this.url + path, { method, redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout), headers: { authorization: `Basic ${Buffer.from(`opencode:${this.password}`).toString('base64')}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     } catch (cause) {
       if (signal?.aborted) throw cause;
       throw new Error('OpenCode API request failed');
@@ -25,10 +27,11 @@ export class OpenCode {
     if (!response.ok) { const error = new Error(`OpenCode API returned HTTP ${response.status}`); error.status = response.status; throw error; }
     if (response.status === 204) return;
     const chunks = []; let size = 0;
+    const max = /^\/api\/session\/[^/?]+\/message(?:[/?]|$)/.test(path) ? this.rowMax : this.bodyMax;
     try {
       for await (const chunk of response.body) {
         size += chunk.length;
-        if (size > 8 * 1024 * 1024) throw new Error('OpenCode API response too large');
+        if (size > max) throw new Error('OpenCode API response too large');
         chunks.push(chunk);
       }
     } catch (error) {
@@ -40,8 +43,9 @@ export class OpenCode {
   async messages(sid, { maxPages = 100 } = {}) {
     const messages = [], cursors = new Set(); let cursor;
     for (let pageNumber = 0; pageNumber < maxPages; pageNumber++) {
-      const query = new URLSearchParams({ limit: '100', ...(cursor ? { cursor } : { order: 'asc' }) });
-      const page = await this.request(`/api/session/${encodeURIComponent(sid)}/message?${query}`);
+      const get = limit => this.request(`/api/session/${encodeURIComponent(sid)}/message?${new URLSearchParams({ limit, ...(cursor ? { cursor } : { order: 'asc' }) })}`);
+      // a page of big rows (attachments) may be too large: read one row from the same cursor, then back to pages
+      const page = await get('100').catch(error => { if (/too large/i.test(error.message)) return get('1'); throw error; });
       if (!Array.isArray(page?.data)) throw new Error('Invalid OpenCode message page');
       messages.push(...page.data);
       cursor = page.cursor?.next;
@@ -57,13 +61,18 @@ export class OpenCode {
         const response = await fetch(this.url + '/api/event', { signal, redirect: 'error', headers: { authorization: `Basic ${Buffer.from(`opencode:${this.password}`).toString('base64')}` } });
         if (!response.ok) throw new Error(`OpenCode event stream HTTP ${response.status}`);
         onConnected();
-        const decoder = new TextDecoder(); let buffer = '';
+        const decoder = new TextDecoder(); let buffer = '', skipping = false;
         for await (const chunk of response.body) {
           buffer = (buffer + decoder.decode(chunk, { stream: true })).replace(/\r\n/g, '\n');
-          if (buffer.length > 1024 * 1024) throw new Error('OpenCode event too large');
           let end;
-          while ((end = buffer.indexOf('\n\n')) !== -1) {
+          for (;;) {
+            end = buffer.indexOf('\n\n');
+            if (end === -1) {
+              if (skipping || buffer.length > this.eventMax) { skipping = true; buffer = buffer.slice(-2); } // keep a boundary split across chunks
+              break;
+            }
             const frame = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+            if (skipping || end > this.eventMax) { skipping = false; continue; } // a frame over eventMax is dropped, not the stream
             const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
             if (!data) continue;
             let event; try { event = JSON.parse(data); } catch { continue; }

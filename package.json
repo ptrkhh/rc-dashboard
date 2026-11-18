@@ -1,8 +1,8 @@
 {
-  "name": "claude-dashboard",
+  "name": "rc-dashboard",
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test --test-timeout=120000 --test-force-exit"
   }
 }

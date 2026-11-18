@@ -59,12 +59,11 @@ if [ -n "${ANDROID_HOME:-}" ] && [ -n "${NDK_HOME:-}" ]; then
     cargo tauri android init
     cargo tauri icon "$PWD/icons/source.json"
 
-    # Gradle enables cleartext HTTP for debug only. The client's own API calls
-    # go through Rust (reqwest), which Android's cleartext policy is not
-    # expected to gate, so this may prove unnecessary — but it is cheap
-    # insurance for any WebView traffic to http://localhost:23274, and a release
-    # APK that cannot reach Termux fails silently. Drop it only after a release
-    # APK has been seen working without it.
+    # Gradle enables cleartext HTTP for debug only. Release needs it too: the
+    # notification service (tauri-plugin-cdash-watch) reads the agent's
+    # http:// stream with HttpURLConnection, which Android's cleartext policy
+    # gates, and without it notifications stop silently. (The client's own API
+    # calls go through Rust's reqwest, which the policy does not gate.)
     sed -i '/getByName("release")/a\        manifestPlaceholders["usesCleartextTraffic"] = "true"' \
       gen/android/app/build.gradle.kts
     # sed exits 0 when nothing matched, e.g. after a template change in the

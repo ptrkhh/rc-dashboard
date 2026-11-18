@@ -13,7 +13,7 @@ function dashboard(session = {}) {
   const timers = new Map(), rendered = [], nodes = {};
   const running = [{ name: 'cdash-new', external: false, ...session }];
   const context = {
-    cdashBackoff: globalThis.cdashBackoff, term: null, browserView: null, resLimit: 20, isTauri: false,
+    cdashBackoff: globalThis.cdashBackoff, term: null, chatFull: false, browserView: null, resLimit: 20, isTauri: false,
     document: { hidden: false },
     $: selector => nodes[selector] ||= {},
     api: async () => {
@@ -22,7 +22,7 @@ function dashboard(session = {}) {
       return { running: running.map(s => ({ ...s })) };
     },
     render: data => rendered.push(data),
-    markConnected() {}, refreshModels() {}, checkAgent() {},
+    markConnected() {}, refreshModels() {}, checkAgent() {}, flushOpen() {},
     clearTimeout: key => timers.delete(key),
     setTimeout: (fn, ms) => { timers.set(++id, { fn, at: now + ms }); return id; },
   };
@@ -95,4 +95,14 @@ test('a pending link retains failure backoff and pauses polling under Terminal',
   assert.equal(d.calls(), 2);
   await d.advance(1);
   assert.equal(d.calls(), 3);
+});
+
+test('polling pauses under a full-screen chat and continues beside a split one', async () => {
+  const run = dashboard();
+  run.context.chatFull = true;
+  await run.poll();
+  assert.equal(run.calls(), 0, 'full-screen chat pauses polling like the terminal');
+  const split = dashboard();
+  await split.poll();
+  assert.equal(split.calls(), 1);
 });

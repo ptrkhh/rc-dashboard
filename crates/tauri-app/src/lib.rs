@@ -8,6 +8,9 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[cfg(desktop)]
+mod notify;
+
 /// Thin-client platforms link no agent, so nothing there can construct a
 /// `Bound`. The commands keep their signatures across platforms; only the
 /// bodies differ.
@@ -52,6 +55,8 @@ fn server_config() -> cdash_agent::http::serve::Config {
                 .expect("none is always buildable"),
         ),
         password: None,
+        // Fixed, unlike the dashboard's port: panes outlive the app.
+        hook_port: Some(cdash_agent::http::serve::DEFAULT_HOOK_PORT),
     }
 }
 
@@ -312,9 +317,90 @@ fn agent_base(
     app: tauri::AppHandle,
     state: tauri::State<'_, ServerState>,
 ) -> Result<String, String> {
+    current_base(&app, &state)
+}
+
+fn current_base(app: &tauri::AppHandle, state: &ServerState) -> Result<String, String> {
     let inproc = addr_locked(&state.0)?;
-    let active = open_store(&app).ok().and_then(|s| active_record(&s));
+    let active = open_store(app).ok().and_then(|s| active_record(&s));
     base_url(inproc, active.as_ref()).ok_or_else(|| "server not running".to_string())
+}
+
+/// Runs `f` on the Android watch plugin off the async runtime: a plugin call
+/// blocks until Kotlin answers, and `start` waits on the user's answers to the
+/// permission and battery dialogs.
+#[cfg(target_os = "android")]
+async fn on_watch<T: Send + 'static>(
+    app: tauri::AppHandle,
+    f: impl FnOnce(&tauri_plugin_cdash_watch::Watch<tauri::Wry>) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    use tauri_plugin_cdash_watch::WatchExt;
+    tauri::async_runtime::spawn_blocking(move || f(app.watch())).await.map_err(|e| e.to_string())?
+}
+
+/// System notifications for agent notes: a watcher task on desktop, a
+/// foreground service on Android. Elsewhere the commands exist (the page calls
+/// them) but do nothing.
+#[tauri::command]
+async fn notify_set(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        use tauri::Manager;
+        use tauri_plugin_notification::{NotificationExt, PermissionState};
+        let state = app.state::<notify::NotifyState>();
+        if !on {
+            state.stop();
+            #[cfg(windows)]
+            notify::register_aumid(&app, false)?;
+            return Ok(());
+        }
+        if app.notification().request_permission().map_err(|e| e.to_string())? == PermissionState::Denied {
+            return Err("notifications are blocked for this app".into());
+        }
+        // After the permission check, so a refusal never leaves the key behind.
+        #[cfg(windows)]
+        notify::register_aumid(&app, true)?;
+        state.start(app.clone());
+        Ok(())
+    }
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        if !on {
+            return on_watch(app, |w| w.stop()).await;
+        }
+        let base = current_base(&app, &app.state::<ServerState>())?;
+        on_watch(app, move |w| w.start(&base)).await
+    }
+    #[cfg(not(any(desktop, target_os = "android")))]
+    {
+        let _ = (app, on);
+        Err("notifications are not available here".into())
+    }
+}
+
+#[tauri::command]
+async fn notify_clear(_app: tauri::AppHandle, _name: String) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        use tauri::Manager;
+        use tauri_plugin_notification::NotificationExt;
+        let id = notify::note_id(&_name);
+        _app.state::<notify::NotifyState>().clear(id);
+        _app.notification().remove_active(vec![id]).map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "android")]
+    on_watch(_app, move |w| w.clear(&_name)).await?;
+    Ok(())
+}
+
+/// A tap that launched the app (Android). A desktop tap reaches the open window directly.
+#[tauri::command]
+async fn notify_take_open(_app: tauri::AppHandle) -> Option<serde_json::Value> {
+    #[cfg(target_os = "android")]
+    return on_watch(_app, |w| w.take_open()).await.ok().flatten();
+    #[cfg(not(target_os = "android"))]
+    None
 }
 
 #[tauri::command]
@@ -349,8 +435,25 @@ fn profile_delete<R: tauri::Runtime>(
     store.save().map_err(|e| format!("cannot persist profiles: {e}"))
 }
 
+/// Nothing in the page reloads on a profile switch, so a running notification
+/// watcher is restarted to read the new agent's stream.
 #[tauri::command]
-fn profile_activate<R: tauri::Runtime>(
+fn profile_activate(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    activate_profile(app.clone(), name)?;
+    #[cfg(desktop)]
+    {
+        use tauri::Manager;
+        app.state::<notify::NotifyState>().restart(app.clone());
+    }
+    // Like the desktop restart, a failure leaves the old watch running and is not the switch's error.
+    #[cfg(target_os = "android")]
+    if let Ok(base) = current_base(&app, &tauri::Manager::state::<ServerState>(&app)) {
+        tauri::async_runtime::spawn(on_watch(app, move |w| w.retarget(&base)));
+    }
+    Ok(())
+}
+
+fn activate_profile<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     name: String,
 ) -> Result<(), String> {
@@ -575,7 +678,12 @@ fn host_platform() -> String {
 pub fn run() {
     #[cfg(inproc_agent)]
     if cdash_agent::collect::codex_proxy::run_if_requested() { return; }
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_notification::init()).manage(notify::NotifyState::default());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_cdash_watch::init());
+    builder
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .manage(ServerState::default())
@@ -598,6 +706,8 @@ pub fn run() {
         // Runs on the main thread before the event loop, which is what makes
         // start_locked's block_on legal.
         .setup(|_app| {
+            #[cfg(desktop)]
+            notify::on_tap(_app.handle());
             #[cfg(inproc_agent)]
             {
                 use tauri::Manager;
@@ -618,7 +728,10 @@ pub fn run() {
             agent_handoff,
             agent_build,
             host_platform,
-            open_external
+            open_external,
+            notify_set,
+            notify_clear,
+            notify_take_open
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1001,8 +1114,8 @@ mod tests {
 
         profile_save(handle.clone(), input("local")).unwrap();
         profile_save(handle.clone(), input("remote")).unwrap();
-        profile_activate(handle.clone(), "remote".into()).unwrap();
-        assert!(profile_activate(handle.clone(), "ghost".into()).is_err());
+        activate_profile(handle.clone(), "remote".into()).unwrap();
+        assert!(activate_profile(handle.clone(), "ghost".into()).is_err());
 
         let listed = profiles_list(handle.clone()).unwrap();
         assert_eq!(listed.len(), 2);

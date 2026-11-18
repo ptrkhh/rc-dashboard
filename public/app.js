@@ -29,6 +29,7 @@ const ICONS = {
   terminal: svg('<path d="M4 17l6-5-6-5"/><path d="M12 19h8"/>'),
   globe: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18"/>'),
   back: svg('<path d="M15 6l-6 6 6 6"/>'),
+  chat: svg('<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1.1-4.6A8 8 0 1 1 21 12z"/>'),
   x: svg('<path d="M18 6 6 18"/><path d="M6 6l12 12"/>'),
   download: svg('<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/>'),
   refresh: svg('<path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/>'),
@@ -43,6 +44,8 @@ const ICONS = {
   clock: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
   pin: svg('<path d="M16 3l5 5-4 1-3 5v3l-7-7h3l5-3zM3 21l6-6"/>'),
   star: svg('<path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.7l5.9-.9z"/>'),
+  bell: svg('<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>'),
+  bellOff: svg('<path d="M13.7 21a2 2 0 0 1-3.4 0"/><path d="M18.6 13A17 17 0 0 1 18 8a6 6 0 0 0-9.3-5"/><path d="M6.3 6.3A6 6 0 0 0 6 8c0 7-3 9-3 9h14"/><path d="M2 2l20 20"/>'),
   starFilled: `<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.7l5.9-.9z"/></svg>`,
 };
 
@@ -229,14 +232,14 @@ async function refreshModels(g, dir = $('#dir').value.trim()) {
 
 // navigator.clipboard needs a secure context, which a phone on plain-HTTP LAN
 // lacks; execCommand still works there. Last resort: show it for a long-press.
-async function copyText(text) {
-  try { await navigator.clipboard.writeText(text); toast('Session ID copied'); return; } catch {}
+async function copyText(text, label = 'Session ID') {
+  try { await navigator.clipboard.writeText(text); toast(`${label} copied`); return; } catch {}
   const ta = document.createElement('textarea');
   ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
   document.body.append(ta); ta.select();
   const ok = document.execCommand('copy');
   ta.remove();
-  toast(ok ? 'Session ID copied' : `Session ID: ${text}`);
+  toast(ok ? `${label} copied` : `${label}: ${text}`);
 }
 
 function toast(msg) {
@@ -324,12 +327,15 @@ function runningCard(r) {
     : `<span class="chip">${r.external ? 'external' : 'resumed'}</span>`;
   const peek = r.lastMessage
     ? `<div class="peek" onclick="this.classList.toggle('open')"><span class="peek-text">${esc(r.lastMessage)}</span></div>` : '';
+  // Chat leads where the agent can serve it; Open in Claude stays beside it.
+  const chatBtn = r.chat
+    ? `<button class="action primary" type="button" data-chat="${esc(r.name)}" data-title="${esc(r.dir.split('/').pop())}">${ICONS.chat}<span>Chat</span></button>` : '';
   const rc = r.provider === 'terminal' ? ''
     : r.rcLink
-    ? `<a class="action primary" href="${esc(r.rcLink)}" target="_blank" rel="noopener">${ICONS.external}<span>Open in Claude</span></a>`
+    ? `<a class="${r.chat ? 'action' : 'action primary'}" href="${esc(r.rcLink)}" target="_blank" rel="noopener">${ICONS.external}<span>Open in Claude</span></a>`
     : r.external
       ? '<span class="action pending">No Claude link · run /remote-control in original terminal</span>'
-      : r.nativeTerminal && r.rcUnavailable
+      : r.rcUnavailable
         ? '<span class="action pending">Claude link unavailable · use Terminal</span>'
         : `<span class="action pending">${ICONS.spinner}<span>Waiting for link…</span></span>`;
   const kill = r.external ? ''
@@ -343,7 +349,6 @@ function runningCard(r) {
   // The session's Chromium tab, shown only while its configured debugging port answers.
   const browserBtn = r.browser
     ? `<button class="action" type="button" data-browser="${esc(r.name)}" data-title="${esc(r.dir.split('/').pop())}">${ICONS.globe}<span>Browser</span></button>` : '';
-  const rest = `${termBtn}${browserBtn}${copyIdBtn(r.sid)}${kill}`;
   return `
     <div class="session ${status} ${r.external ? 'external' : ''}">
       <div class="session-head">
@@ -357,11 +362,14 @@ function runningCard(r) {
         <span class="time">${fmtUp(r.uptimeSec)}</span>
       </div>
       ${peek}
-      <div class="actions stacked">${rc ? `<div class="actions-row">${rc}</div>` : ''}${rest ? `<div class="actions-row">${rest}</div>` : ''}</div>
+      <div class="actions actions-stack">${[chatBtn + rc, termBtn + browserBtn + copyIdBtn(r.sid) + kill].filter(Boolean).map(row => `<div class="actions-row">${row}</div>`).join('')}</div>
     </div>`;
 }
 
 let lastRes = [];
+let listed = false; // a session list has arrived (render sets it; `polled` also counts failures)
+let lastRunning = []; // the last poll's running cards, for the chat header's Claude link
+let lastStats = null; // the last poll's stats, for the chat's usage sheet
 let lastPinned = [];
 // A session resumes only with its own provider's models: a Claude transcript and
 // a Codex thread cannot stand in for each other. Everything shown is concrete
@@ -453,6 +461,7 @@ function renderResumable() {
 }
 
 function render(d) {
+  lastStats = d.stats;
   $('#nrun').textContent = d.running.length;
   $('#npin').textContent = d.pinned?.length || 0;
   $('#nres').textContent = d.resumable.length;
@@ -492,6 +501,8 @@ function render(d) {
     if (!container.querySelector('.session')) container.innerHTML = `<div class="empty">No ${container.id === 'pinned' ? 'pinned' : 'resumable'} sessions</div>`;
   }
   lastRes = d.resumable;
+  lastRunning = d.running;
+  listed = true;
   lastPinned = d.pinned || [];
   // Same rule for the pickers: re-rendering would snap an open menu shut.
   if (!document.activeElement?.closest('.pick-dd') && !$('.pick-dd .cb-menu:not([hidden])')) renderResumable();
@@ -502,11 +513,13 @@ function render(d) {
 
 document.body.addEventListener('click', async e => {
   const t = e.target.closest('[data-term]');
-  if (t) { if (!browserView) openTerm(t.dataset.term, t.dataset.title); return; }
+  if (t) { openTerm(t.dataset.term, t.dataset.title); return; }
   const b = e.target.closest('[data-browser]');
   if (b) { openBrowser(b.dataset.browser, b.dataset.title); return; }
   const c = e.target.closest('[data-copy]');
   if (c) { copyText(c.dataset.copy); return; }
+  const ch = e.target.closest('[data-chat]');
+  if (ch) { openChat(ch.dataset.chat, ch.dataset.title); return; }
   const el = e.target.closest('[data-kill],[data-resume],[data-purge],[data-more],[data-pin]');
   if (!el) return;
   try {
@@ -606,11 +619,14 @@ document.addEventListener('keydown', e => {
    fullscreen renderer instead. */
 let term = null; // { name, xterm, fit, ro, ws, ctrl, retry } while the overlay is open
 
-// Both overlays dial the agent the same way.
+// The webview cannot proxy a WebSocket through invoke, so it dials the agent.
 async function wsUrl(q) {
-  // The webview cannot proxy a WebSocket through invoke, so it dials the agent.
   if (isTauri) return (await invoke('agent_base')).replace(/^http/, 'ws') + q;
   return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${q}`;
+}
+
+function termUrl(name, cols, rows) {
+  return wsUrl(`/api/term?name=${encodeURIComponent(name)}&cols=${cols}&rows=${rows}`);
 }
 
 function termStatus(text, reconnect) {
@@ -628,7 +644,7 @@ async function termConnect() {
   t.xterm.reset();
   termStatus('Connecting…', false);
   let url;
-  try { url = await wsUrl(`/api/term?name=${encodeURIComponent(t.name)}&cols=${t.xterm.cols}&rows=${t.xterm.rows}`); }
+  try { url = await termUrl(t.name, t.xterm.cols, t.xterm.rows); }
   catch (e) { termStatus(String(e?.message ?? e), true); return; }
   if (term !== t) return; // closed while resolving the URL
   const ws = new WebSocket(url);
@@ -641,6 +657,7 @@ async function termConnect() {
     // onResize drops sizes while connecting, and the keyboard that focus()
     // opens usually lands then; send the size the screen has now.
     ws.send(JSON.stringify({ resize: [t.xterm.cols, t.xterm.rows] }));
+    ws.send(JSON.stringify({ t: 'focus', on: cdashChat.focusNow() }));
   };
   ws.onmessage = e => { if (typeof e.data !== 'string') t.xterm.write(new Uint8Array(e.data)); };
   ws.onclose = e => {
@@ -663,7 +680,7 @@ function setCtrl(on) {
 }
 
 function openTerm(name, title) {
-  if (term) return;
+  if (term || browserView) return;
   $('#term-title').textContent = title;
   $('#term').hidden = false;
   const xterm = new Terminal({
@@ -702,6 +719,9 @@ function openTerm(name, title) {
   term.ro = new ResizeObserver(() => fit.fit());
   term.ro.observe($('#term-screen'));
   history.pushState({ term: name }, ''); // Android back closes the overlay
+  term.unwatch = cdashChat.watchFocus(on => {
+    if (term?.ws?.readyState === WebSocket.OPEN) term.ws.send(JSON.stringify({ t: 'focus', on }));
+  });
   termConnect();
   xterm.focus();
 }
@@ -710,6 +730,7 @@ function closeTerm() {
   if (!term) return;
   const t = term;
   term = null;
+  t.unwatch?.();
   t.ro.disconnect();
   t.ws?.close();
   t.xterm.dispose();
@@ -821,6 +842,7 @@ function browserShow(v, ws, meta, buf) {
 function browserTabStrip(tabs, active) {
   const strip = $('#browser-tabs');
   const left = strip.scrollLeft; // an update must not yank the strip back
+  const focused = document.activeElement?.dataset.tab;
   strip.textContent = '';
   let selected = null;
   for (const t of tabs) {
@@ -839,6 +861,7 @@ function browserTabStrip(tabs, active) {
     b.setAttribute('aria-selected', String(t.id === active));
     b.append(title, where);
     strip.appendChild(b);
+    if (t.id === focused) b.focus({ preventScroll: true });
     if (t.id === active) selected = b;
   }
   strip.scrollLeft = left;
@@ -958,6 +981,14 @@ function browserTransform(v) {
 }
 
 $('#browser-stage').addEventListener('mousedown', e => e.preventDefault());
+$('#browser-stage').addEventListener('wheel', e => {
+  e.preventDefault();
+  const pt = browserPoint(e.clientX, e.clientY);
+  if (!pt) return;
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? e.currentTarget.clientHeight : 1;
+  const scale = browserView.shown.meta.deviceWidth / $('#browser-screen').getBoundingClientRect().width;
+  browserSend({ scroll: [pt[0], pt[1], e.deltaX * unit * scale, e.deltaY * unit * scale] });
+}, { passive: false });
 $('#browser-stage').addEventListener('pointerdown', e => {
   const v = browserView;
   if (!v) return;
@@ -1001,7 +1032,10 @@ for (const type of ['pointerup', 'pointercancel']) {
     v.pointers.delete(e.pointerId);
     if (type === 'pointerup' && !p.moved && !v.multi) {
       const pt = browserPoint(e.clientX, e.clientY);
-      if (pt) browserSend({ tap: pt });
+      if (pt) {
+        browserSend({ tap: pt });
+        if (e.pointerType === 'mouse' && e.button === 0) $('#browser-input').focus({ preventScroll: true });
+      }
     }
     if (!v.pointers.size) { v.multi = false; v.pinch = null; }
   });
@@ -1060,13 +1094,11 @@ $('#browser-tabs').addEventListener('click', e => {
   browserSend({ tab: id }, false);
   browserSync();
 });
-// Like the terminal's key bar: act on pointerdown and cancel it, so a tap
-// neither moves focus nor closes the phone keyboard.
+// Keep the typing field focused on pointer use while allowing keyboard clicks.
 $('#browser-keys').addEventListener('mousedown', e => e.preventDefault());
-$('#browser-keys').addEventListener('pointerdown', e => {
+$('#browser-keys').addEventListener('click', e => {
   const b = e.target.closest('[data-bkey]');
   if (!b || !browserView) return;
-  e.preventDefault();
   const k = b.dataset.bkey;
   if (k === 'kbd') { if (browserReady()) $('#browser-input').focus(); return; }
   const key = cdashBrowser.KEYBAR[k];
@@ -1075,6 +1107,132 @@ $('#browser-keys').addEventListener('pointerdown', e => {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && browserView?.retry && !browserView.ws) browserConnect();
 });
+
+/* ---------- Chat: the session's conversation, through the agent only ----------
+   Full screen on narrow windows (polling pauses, as under Terminal); beside the
+   dashboard's narrow column on wide ones (polling continues). */
+const wide = matchMedia('(min-width: 900px)');
+let chatFull = false;
+
+function openChat(name, title) {
+  const already = cdashChat.isOpen();
+  cdashChat.open({
+    name, title, wsUrl, toast,
+    rcLink: lastRunning.find(r => r.name === name)?.rcLink || null,
+    openTerm: (n, t) => openTerm(n, t),
+    store,
+    copy: text => copyText(text, 'Text'),
+    api,
+    limits: () => ({ claude: lastStats?.claudeUsage || [], codex: lastStats?.codexUsage || [] }),
+  });
+  document.body.classList.add('chat-open');
+  chatFull = !wide.matches;
+  // Switching cards replaces the entry, so back always leaves chat in one step.
+  history[already ? 'replaceState' : 'pushState']({ chat: name }, '');
+  // Opening the chat answers the notification: clear it, ignoring failures.
+  if (isTauri) { try { invoke('notify_clear', { name }).catch(() => {}); } catch {} }
+  else if ('serviceWorker' in navigator) navigator.serviceWorker.ready
+    .then(r => r.getNotifications({ tag: name })).then(ns => ns.forEach(n => n.close())).catch(() => {});
+}
+
+function closeChat() {
+  if (!cdashChat.isOpen()) return;
+  cdashChat.close();
+  document.body.classList.remove('chat-open');
+  chatFull = false;
+  poll(); // the poll paused while a full-screen chat was open
+}
+
+$('#chat-close').innerHTML = ICONS.x;
+$('#chat-close').addEventListener('click', () => history.back()); // popstate closes it
+addEventListener('popstate', () => { if (!history.state?.chat) closeChat(); });
+wide.addEventListener('change', () => {
+  if (!cdashChat.isOpen()) return;
+  chatFull = !wide.matches;
+  if (!chatFull) poll();
+});
+
+/* ---------- Notifications: the switch, the subscription, taps ---------- */
+function notifyBlocked({ tauri, secure, push, permission }) {
+  if (tauri) return '';
+  if (!secure) return 'needs HTTPS or 127.0.0.1';
+  if (!push) return 'this browser cannot receive push notifications';
+  if (permission === 'denied') return 'notifications are blocked for this site';
+  return '';
+}
+function chatFromQuery(search) {
+  const q = new URLSearchParams(search), s = q.get('chat');
+  return s ? { s, p: q.get('title') || s } : null;
+}
+function b64urlBytes(s) {
+  return Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+}
+// Keeps the browser's subscription on the agent's key and registered; false when there is none.
+async function syncPush(pm, key, post) {
+  let sub = await pm.getSubscription();
+  if (!sub) return false;
+  const want = b64urlBytes(key), have = new Uint8Array(sub.options.applicationServerKey || 0);
+  if (have.length !== want.length || have.some((b, i) => b !== want[i])) {
+    await sub.unsubscribe();
+    sub = await pm.subscribe({ userVisibleOnly: true, applicationServerKey: want });
+  }
+  await post(sub.toJSON());
+  return true;
+}
+// A tap before the first session list is held; after it, the list says whether the session still runs.
+let pendingOpen = null;
+function noteOpen(s, p) {
+  if (!listed) { pendingOpen = [s, p]; return; }
+  if (lastRunning.some(r => r.name === s && r.chat)) openChat(s, p || s);
+  else toast('That session has ended');
+}
+function flushOpen() {
+  const o = pendingOpen;
+  if (o && listed) { pendingOpen = null; noteOpen(...o); }
+}
+/* notify wiring */
+window.cdashOpenChat = noteOpen;
+{
+  const btn = $('#notify-toggle'), KEY = 'cdash-notify';
+  const paint = on => {
+    btn.innerHTML = on ? ICONS.bell : ICONS.bellOff;
+    btn.setAttribute('aria-checked', String(on));
+  };
+  const blocked = () => notifyBlocked({ tauri: isTauri, secure: window.isSecureContext,
+    push: 'PushManager' in window && 'serviceWorker' in navigator, permission: globalThis.Notification?.permission });
+  const why = blocked();
+  paint(false);
+  if (why) { btn.disabled = true; btn.title = why; }
+  else {
+    btn.title = 'Notifications on this device';
+    const reg = () => navigator.serviceWorker.ready;
+    const post = sub => api('/api/push/subscribe', sub);
+    if (isTauri) {
+      const set = async on => { await invoke('notify_set', { on }); store.set(KEY, on ? '1' : '0'); paint(on); };
+      btn.addEventListener('click', () => set(btn.getAttribute('aria-checked') !== 'true').catch(e => toast(String(e?.message ?? e))));
+      if (store.get(KEY) === '1') { paint(true); set(true).catch(() => {}); }
+      try { invoke('notify_take_open').then(o => { if (o) noteOpen(o.s, o.p); }).catch(() => {}); } catch {}
+    } else {
+      const toggle = async () => {
+        const pm = (await reg()).pushManager, sub = await pm.getSubscription();
+        if (sub) {
+          await sub.unsubscribe();
+          await api('/api/push/unsubscribe', { endpoint: sub.endpoint });
+          return paint(false);
+        }
+        if (await Notification.requestPermission() !== 'granted') return toast('Notifications were not allowed');
+        const { key } = await api('/api/push/key');
+        await post((await pm.subscribe({ userVisibleOnly: true, applicationServerKey: b64urlBytes(key) })).toJSON());
+        paint(true);
+      };
+      btn.addEventListener('click', () => toggle().catch(e => toast(String(e?.message ?? e))));
+      reg().then(async r => paint(await syncPush(r.pushManager, (await api('/api/push/key')).key, post))).catch(() => {});
+      navigator.serviceWorker.addEventListener('message', e => { if (e.data?.t === 'open-chat') noteOpen(e.data.s, e.data.p); });
+    }
+  }
+  const tapped = chatFromQuery(location.search);
+  if (tapped) { history.replaceState(null, '', location.pathname); noteOpen(tapped.s, tapped.p); }
+}
 
 let modelDirTimer;
 $('#dir').addEventListener('input', () => {
@@ -1235,7 +1393,7 @@ function arm(delay = cdashBackoff.delay(bk)) {
 }
 
 async function tick() {
-  if (term || browserView) return; // paused under an overlay; closing it restarts the poll
+  if (term || browserView || chatFull) return; // closing a full-screen overlay restarts polling
   const g = gen;
   // Skip background polls, but never the first one. An Android WebView is
   // hidden until its activity resumes, and `visibilitychange` can fire before
@@ -1247,6 +1405,7 @@ async function tick() {
     const data = await api(`/api/sessions?resumable=${resLimit}`);
     if (g !== gen) return; // superseded mid-flight: never paint the old snapshot
     render(data);
+    flushOpen();
     $('#health').className = 'dot ok';
     $('#health-label').textContent = 'Connected';
     markConnected();

@@ -10,7 +10,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-/// One entry of `/api/sessions` `running[]`.
+/// One entry of `/api/sessions` `running[]`. Field names and shapes are the
+/// parity gate's contract — see the exemption list in the spec before changing
+/// any of them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Session {
     pub name: String,
@@ -43,13 +45,16 @@ pub struct Session {
     pub cpu: Option<f32>,
     #[serde(rename = "rssKb")]
     pub rss_kb: u64,
-    /// Milliseconds since the CPU sample was taken.
+    /// Rust-only; Node has no such field. Exempted by name in the parity gate.
     #[serde(rename = "cpuSampleAgeMs")]
     pub cpu_sample_age_ms: u128,
     /// Node omitted this key entirely for pane sessions and set it to `true`
     /// for external ones. `skip_serializing_if` reproduces that exactly.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub external: bool,
+    /// The agent can serve `/api/chat` for this card. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub chat: bool,
 }
 
 fn basename(p: &str) -> String {
@@ -90,7 +95,8 @@ pub async fn external_sessions(
         else {
             continue;
         };
-        if pane_pids.contains(&pid) || !alive.contains(&pid) {
+        // Headless claude processes of our own: `sdk-cli` is filtered below as well.
+        if pane_pids.contains(&pid) || !alive.contains(&pid) || ctx.own_pids.lock().unwrap_or_else(|e| e.into_inner()).contains(&pid) {
             continue;
         }
         let Some(sess) = session_file_for(&ctx.claude_dir, pid).await else { continue };
@@ -155,6 +161,7 @@ pub async fn external_sessions(
             rss_kb: usage.rss_kb,
             cpu_sample_age_ms: usage.cpu_sample_age_ms,
             external: true,
+            chat: false,
         });
     }
     out
@@ -249,6 +256,16 @@ mod tests {
         write_session(&d, 502, r#"{"sessionId":"s","cwd":"/p","entrypoint":"sdk-cli"}"#);
         let out = external_sessions(&ctx_for(d), &rows(&[502]), &HashSet::new(), 0.0).await;
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_headless_claude_the_agent_started_is_not_reported() {
+        let d = tempdir("own");
+        write_session(&d, 505, CLI);
+        let ctx = ctx_for(d);
+        assert_eq!(external_sessions(&ctx, &rows(&[505]), &HashSet::new(), 0.0).await.len(), 1);
+        ctx.own_pids.lock().unwrap().insert(505);
+        assert!(external_sessions(&ctx, &rows(&[505]), &HashSet::new(), 0.0).await.is_empty());
     }
 
     #[tokio::test]

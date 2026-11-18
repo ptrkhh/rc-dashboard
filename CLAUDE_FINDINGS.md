@@ -76,3 +76,353 @@ The Claude mobile/web interface's exact rendering has not been manually checked.
 Protocol acceptance and session registration were checked against the real
 service. The bridge currently accepts text and completed assistant messages;
 it does not expose the native Codex terminal interface.
+
+## Dashboard chat tap (Claude Code 2.1.322)
+
+Observed on Claude Code 2.1.322 on 2026-11-12 while designing dashboard chat
+(`docs/superpowers/specs/2026-11-12-chat-core-design.md`). These are internal
+formats and behaviours, not a supported contract; an update can change them.
+Chat reads them in `crates/agent/src/chat/tap.rs` and `claude.rs`.
+
+- **Transcript records.** `user` with string content is a prompt; with
+  `tool_result` blocks it is a tool result; a text block starting
+  `[Request interrupted by user` marks a stopped turn. `assistant` writes one
+  line per content block (`thinking`, `text`, `tool_use`), several lines
+  sharing one `message.id`. `system` with subtype `turn_duration` (carrying
+  `durationMs`) ends a turn. `isSidechain: true` is subagent traffic and
+  `isMeta: true` is injected text. `<bash-input>` and
+  `<bash-stdout>`/`<bash-stderr>` user records are `!` shell commands.
+  `promptSource` is `typed`, `queued` or `system`.
+- **Pasted prompts (seen on 2.1.323).** A long bracketed paste, which is how
+  chat sends text, is recorded as
+  `\n\n<pasted_content id="N">\n…\n</pasted_content id="N">\n`; short ones are
+  recorded as typed. The tap unwraps the blocks before matching and display.
+- **Handed-back prompt.** Escape before any reply puts the prompt back in the
+  input box. Its `user` record stays in the file with no marker, and the next
+  prompt is written with the same `parentUuid`.
+- **The TUI's own queue.** `queue-operation` records: `enqueue` carries the
+  text, `dequeue` is followed by an ordinary `user` record, and `remove` with
+  reason `absorbed_mid_turn` means Claude took the message mid-turn; then
+  there is no `user` record, only an `attachment` of type `queued_command`
+  (`commandMode: "prompt"`) holding the text.
+- **Session state file.** `~/.claude/sessions/<pid>.json` carries `status`
+  (`busy`, `idle`, `waiting`, `shell`), `statusUpdatedAt` and `waitingFor`
+  (`dialog open`, `input needed`). Older versions write no `status`; chat then
+  falls back to the transcript. How quickly `status` follows a turn end, a
+  stop or a dialog was not timed.
+- **Keys.** A bracketed paste (`tmux paste-buffer -p`) followed by Enter about
+  0.4 s later is accepted as one prompt, multi-line included. Escape
+  interrupts a running tool in about 0.3 s; with a message in the TUI's own
+  queue, Escape stops the tool and then runs that message at once. Ctrl+U
+  clears to the start of a row, about two presses per line of a multi-line
+  input, and is harmless on an empty box.
+- **Key table (read from the installed program, not tested).** `ctrl+l` is
+  `chat:clearInput`; `ctrl+x enter` is `chat:queueSubmit`; `ctrl+enter` and
+  `ctrl+x ctrl+s` are `chat:sendNow`.
+- **Status file details (observed on 2.1.323).** `status: "shell"` is idle
+  with background work still running. `waitingFor: "dialog open"` is also
+  set for the `/exit` confirmation and the rewind selector. About 0.1 s
+  after Esc during a running tool the status file shows `idle`; that turn
+  writes no `turn_duration`.
+- **API error turns (observed on 2.1.323).** In 29 of 30 observed turns, a turn
+  whose last message has `isApiErrorMessage` still ends with a
+  `turn_duration` record.
+- **Image paste (observed on 2.1.323).** A bracketed paste of a line holding
+  only an image's absolute path attaches it as an `[Image #N]` chip within
+  about 32 ms; spaces in the path are fine. `N` counts up across the session.
+  A path followed by text on the same line stays text. An Enter sent before
+  the chip is drawn is dropped. The prompt record's content is then a block
+  list: a text block (`[Image #N] <text>`) followed by
+  `{type:"image", source:{type:"base64", media_type, data}}`, with
+  `imagePasteIds`, and an `isMeta` record `[Image: source: <path>]` follows.
+  Chat pastes each path alone and waits for exactly one new chip in the input
+  box (`tmux_io::attach_image`), then pastes a space and the text.
+
+## Dashboard chat rewind (Claude Code 2.1.325)
+
+Observed on Claude Code 2.1.325 on 2026-11-15 (haiku, 160x50 pane on the
+private `tmux -L cdash-test` server, cwd a git repo holding `f.txt`). Chat
+drives this dialog in `crates/agent/src/chat/rewind.rs`; `Tap::listed()` in
+`tap.rs` predicts the list. Prompts sent in order: `Reply with only: one`,
+`!echo two`, `/rename spike-rewind`, `Append the line b to f.txt, then reply
+with only: done` (the model appended with a shell command, so no tracked code
+change), `Run sleep 3 with run_in_background, then reply with only: started`
+(a background-completion turn followed), `Run sleep 8 in the foreground, then
+reply ok` with `Reply with only: queued` sent while it ran, and later `Use the
+Edit tool (not bash) to change the line a to c in f.txt, then reply with only:
+edited`. Twice an Enter sent right after typed text was swallowed and a second
+Enter submitted it.
+
+- **Opening.** Esc, Esc 250 ms later, while idle. The cursor starts on
+  `(current)`. The list scrolls: four rows show (`(current)` included), with
+  `↑ N more` / `↓ N more` markers. On 2.1.323 all rows showed.
+
+  ```
+     Rewind
+
+     Restore the code and/or conversation to the point before…
+
+       ↑ 3 more
+       Run sleep 3 with run_in_background, then reply with only: started
+       No code changes
+
+       Run sleep 8 in the foreground, then reply ok
+       No code changes
+
+       Reply with only: queued
+       ⚠ No code restore
+
+     ❯ (current)
+
+     Enter to continue · Esc to cancel
+  ```
+
+  After eight presses of Up:
+
+  ```
+     Rewind
+     Restore the code and/or conversation to the point before…
+     ❯ Reply with only: one
+       No code changes
+       ! echo two
+       No code changes
+       Append the line b to f.txt, then reply with only: done
+       No code changes
+       Run sleep 3 with run_in_background, then reply with only: started
+       No code changes
+       ↓ 3 more
+     Enter to continue · Esc to cancel
+  ```
+
+  Once the Edit prompt was on the branch, the bottom of the list read:
+
+  ```
+       ↑ 4 more
+       Run sleep 8 in the foreground, then reply ok
+       No code changes
+       Reply with only: queued
+       ⚠ No code restore
+       Use the Edit tool (not bash) to change the line a to c in f.txt, then reply with only: edited
+       f.txt +1 -1
+     ❯ (current)
+     Enter to continue · Esc to cancel
+  ```
+
+- **(a) What the selector lists.** A row is the prompt's first line, then
+  `No code changes`, `⚠ No code restore` or `<file> +N -M`.
+  - Plain prompts: listed, verbatim.
+  - `!echo two`: listed as `! echo two` (a `<bash-input>` record).
+  - `/rename spike-rewind`: not listed. It wrote only `system`
+    `local_command` records and an `isMeta` reminder, no prompt record.
+  - A prompt whose turn edited files: listed. With a shell append the row says
+    `No code changes`; with the Edit tool, `f.txt +1 -1`.
+  - Background-notification turns (`promptSource: "system"`,
+    `<task-notification>`): not listed.
+  - The message sent mid-turn: listed as its own row with `⚠ No code
+    restore`. The transcript holds no `user` record for it, only the
+    `attachment` of type `queued_command` (`commandMode: "prompt"`) that a
+    message absorbed mid-turn writes.
+- **(b) The confirm screen.** Enter on a row without code changes:
+
+  ```
+     Rewind
+     Confirm you want to restore to the point before you sent this message:
+     │ Append the line b to f.txt, then reply with only: done
+     │ (2m ago)
+     The conversation goes back to before this message.
+     The code will be unchanged.
+     ❯ 1. Restore conversation
+       2. Summarize from here
+       3. Summarize up to here
+       4. Never mind
+  ```
+
+  Enter on the Edit-tool row:
+
+  ```
+     Rewind
+     Confirm you want to restore to the point before you sent this message:
+     │ Use the Edit tool (not bash) to change the line a to c in f.txt, then reply with only: edited
+     │ (26s ago)
+     The conversation goes back to before this message.
+     The code will be restored +1 -1 in f.txt.
+     ❯ 1. Restore code and conversation
+       2. Restore conversation
+       3. Restore code
+       4. Summarize from here
+     ↓ 5. Summarize up to here
+     ⚠ Restored files go back whole, losing later changes by anyone. Bash changes to other files are not undone.
+  ```
+
+  The digits shift with code changes (`Restore conversation` is 1 without,
+  2 with), and this list scrolls too (`6. Never mind` is below the fold).
+  Chat therefore picks the option by its label: `Restore code and
+  conversation` when files are wanted and it is offered, else `Restore
+  conversation`. One Escape goes back from the confirm screen to the list; a
+  second closes it.
+- **(c) The digit alone confirms.** `1` with no Enter, on the Edit-tool row
+  (`Restore code and conversation`): 300 ms later the dialog was gone, the
+  Edit turn was removed and `f.txt` was restored. The digit of a plain
+  `Restore conversation` was not pressed; it is the same menu. Chat sends no
+  Enter after the digit.
+- **After the rewind** (300 ms and 2 s later, the same): the conversation ends
+  after the turn before the target, and the input box holds the rewound
+  prompt verbatim, as on 2.1.323
+  (`❯ Use the Edit tool (not bash) to change the line a to c in f.txt, then reply with only: edited`).
+  Chat clears it with `tmux_io::clear_input`.
+- **Later checks (2026-11-16, haiku, 80x24 pane).**
+  - **Long and multi-line prompts.** The confirm screen quotes the whole
+    prompt, wrapped to the pane, one `│` line each, then the age line:
+
+    ```
+       │ Reply with only the single word bravo, and do not add anything else at
+       │ all to it, no punctuation, no quotes, nothing more
+       │ (51s ago)
+    ```
+
+    Claude's code quotes the first 500 characters, at most four lines. The
+    selector row still shows the first line cut with `…`. Chat compares the
+    whole quote, whitespace aside (`rewind::quote_matches`).
+  - **Slash commands.** The selector lists every `user` record that is not a
+    tool result, `isMeta`, `isCompactSummary`, `isVisibleInTranscriptOnly` or
+    command/shell output, so a slash command recorded as a prompt
+    (`<command-name>/compact</command-name>`) is a row, shown as `/compact`.
+    `/rename` and `/context` write `system` `local_command` records and are
+    not.
+  - **Compaction.** `/compact` writes `system`/`compact_boundary`
+    (`parentUuid: null`, `logicalParentUuid`: the record before it), the
+    `isCompactSummary` record, an `isMeta` caveat, the `/compact` record and
+    its `<local-command-stdout>`. The Claude that compacted still lists the
+    prompts before it, then `/compact`; a rewind there restores the
+    uncompacted conversation (asked afterwards, it recalled a word given
+    before the compaction). A Claude resumed after a compaction lists only
+    the rows from the last compaction on (`/compact`, then later prompts).
+  - **Dim text in the empty box.** A fresh session shows a placeholder and,
+    after a turn, often a suggestion, both SGR 2 (`capture-pane -e`:
+    `❯`, a no-break space, `ESC[2madd "two" to a.txtESC[0m`). Esc Esc still opens the
+    selector over a suggestion. After a rewind to a slash command the box
+    holds the command and its grey (`38;5;246`, not dim) argument hint:
+    `❯ /compact  <optional custom summarization instructions>`.
+
+## Dashboard chat prompts and menus (Claude Code 2.1.325)
+
+Observed 2026-11-16 on a private tmux server with haiku at low effort. None of
+this is a supported contract; each item is what this version did.
+
+- **The `PermissionRequest` matcher filters.** With
+  `"matcher":"AskUserQuestion|ExitPlanMode"`, an AskUserQuestion and an
+  ExitPlanMode each reached the hook listener (`hook … AskUserQuestion: card`,
+  `ExitPlanMode: card`), while a Bash permission dialog in manual mode produced
+  no hook call at all; chat showed the "Answer in Terminal" banner for it.
+- **A held hook and a Terminal answer.** Answering a question in the TUI with
+  Enter cleared the card within a second and the hook settled empty
+  (`AskUserQuestion: empty (settled)`); the held connection on the hook port
+  was still established one second later. Escape in the TUI cleared the card
+  within two seconds and Claude closed the held connection.
+- **ExitPlanMode can carry the previous plan (E1c).** Asked to write a new plan
+  and call ExitPlanMode in the same message, the transcript's ExitPlanMode
+  input held the earlier plan; the plan file held the new one. Chat reads the
+  plan file, so its card showed the new plan.
+- **Plan mode switches the model.** Turning plan mode on from a haiku session
+  ran the plan turns on `claude-sonnet-5-5`, and back on `claude-haiku-5-5`
+  after it was turned off.
+- **`/model` confirms; `/effort` does not.** With a warm cache, `/model sonnet`
+  opened a dialog titled `Switch model?` with `❯ 1. Yes, switch to Sonnet 5.5`
+  and `2. No, go back`; the session file read `"status":"waiting"`,
+  `"waitingFor":"dialog open"`. `/effort high` and `/effort medium` (also right
+  after a reply) applied at once with no dialog: `Set effort level to high
+  (saved as your default for new sessions)`. Both commands write the default
+  into `~/.claude/settings.json`.
+- **A slash command's result reads as a dialog for a moment.** Typed
+  `/effort medium`, `/effort low` and a cold-cache `/model sonnet` each turned
+  the session file to `"status":"waiting"`, `"waitingFor":"dialog open"` for
+  about 100 to 200 ms while the result line was drawn (a `▔▔▔` rule over the
+  box), then back to `idle`, with no dialog on screen. The picker had pressed
+  Escape on that and reported an unexpected dialog, though the setting was
+  applied. `/effort` showed no confirmation a third time.
+- **`/model` to a cheaper model asks the same way.** From sonnet with a warm
+  cache, `/model haiku` opened `Switch model?`, "Your next response will be
+  slower and use more tokens", "This conversation is cached for the current
+  model. Switching to Haiku 5.5 means the full history gets re-read.",
+  `❯ 1. Yes, switch to Haiku 5.5`, `2. No, go back`.
+- **The transcript records the permission mode.** Each prompt record carries
+  `"permissionMode"`, and Claude appends `{"type":"permission-mode",
+  "permissionMode":…}` lines with its metadata; after a plan card was answered
+  in Terminal one read `bypassPermissions`. A shift+tab in Terminal writes
+  nothing until the next prompt.
+- **Slash menu.** The command list came back with 152 commands without
+  creating a transcript or a session.
+
+## Dashboard chat later tier (Claude Code 2.1.325, codex-cli 0.167.0, OpenCode 2.2.6)
+
+Observed 2026-11-16; not a supported contract.
+
+### Claude Code
+
+- **Side questions.** `claude -p --resume <sid> --fork-session
+  --no-session-persistence --tools "" --strict-mcp-config --mcp-config
+  {"mcpServers":{}} --settings {"disableAllHooks":true} --model <id>
+  --output-format stream-json --verbose -- <question>` answered from the
+  conversation (a question starting with `-` included), left the transcript's
+  md5 unchanged, added no session file and no dashboard session. The run takes
+  a few seconds.
+- **Model id and window.** Haiku reports `claude-haiku-5-5`. `/context` shows
+  "Auto-compact window: 135k tokens" for it, below the model's 1M; the usage
+  sheet leaves its window blank.
+- **Rewind (see also the rewind section above).** `waitingFor` with the selector open is `"dialog open"` (status
+  `waiting`); after Escape the status is `idle`.
+- **After a rewind** the restored prompt is in the box about 0.45 s after the
+  digit. A new prompt is parented on the target's parent, the same as a
+  Terminal rewind.
+
+### Codex
+
+- `thread/revert` took about 140 ms. `thread/reverted` reached the connection
+  that asked for it. No token usage is sent after a revert.
+- `Turn.startedAt` is in seconds.
+- A side question (fork, inject, turn) answered in about 4 s. The fork reported
+  sandbox `readOnly` and `forkedFromId` = the parent, with `parentThreadId`
+  null; MCP tools were present in it. A write asked for inside it did not
+  happen.
+- An edit's diff is in the `fileChange` item's `changes[].diff` as a bare hunk
+  (`@@ -1 +1,2 @@`), with no file header.
+- The app-server keeps a 16 MiB limit per WebSocket frame on what it receives
+  and closes the connection on a bigger one; whole messages may be up to
+  64 MiB. A 15 MB image prompt is a 20 MB `turn/start` line.
+- A pasted image path in the TUI becomes `[Image #1]` in the composer and stays
+  in the prompt text.
+
+### OpenCode
+
+- `session.revert.staged` deletes no rows; `session.revert.committed` fires
+  just before the next prompt is queued. No row-delete events reach the stream.
+- `shell.created` carries `data.info` (`id` `sh_…`, `metadata.sessionID`). A
+  child `session.created` has `data.sessionID` (no `id`) and `parentID`. The
+  subagent tool is named `subagent`.
+- An edit tool's `metadata.files[]` has `file`, `patch`, `status`,
+  `additions`, `deletions`. A patch starts `Index: a.txt`, a `====` rule, then
+  `--- a.txt` / `+++ a.txt` with no `a/` `b/` prefixes.
+
+### Thinking, the checklist and day rows (Claude Code 2.1.325)
+
+Observed 2026-11-16; not a supported contract.
+
+- **Thinking text is redacted by default.** Thinking blocks carry
+  `"thinking":""` and a signature (5212 characters in one sample). With
+  `{"showThinkingSummaries":true}` in settings, haiku at medium effort wrote
+  readable thinking (423 characters), and chat showed it as a Thinking row.
+- **The task tools load only with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`.**
+  Without it, neither TaskCreate, TaskUpdate nor TodoWrite was available, on
+  haiku or sonnet, and they were not among the ToolSearch-deferred tools. With
+  it, haiku ran `ToolSearch` (`select:TaskCreate,TaskUpdate`), then:
+  - TaskCreate input `{"subject":"alpha","description":"alpha"}`, result
+    `toolUseResult: {"task":{"id":"1","subject":"alpha","description":"alpha"}}`,
+    content "Task #1 created successfully: alpha";
+  - TaskUpdate input `{"taskId":"1","status":"completed"}`, result
+    `{"success":true,"taskId":"1","updatedFields":["status"],"statusChange":{"from":"pending","to":"completed"}}`,
+    content "Updated task #1 status".
+
+  Chat's pinned checklist showed "1 of 3 done" and the struck-through item.
+- **Day rows.** A transcript whose first half was dated a day earlier, resumed
+  with `claude --resume`, showed one day separator between the two days and
+  none before the first.

@@ -110,7 +110,7 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
                 provider: Some("terminal".into()), native_terminal: None, browser: false,
                 rc_link: None, rc_unavailable: true,
                 git: git.as_deref().map(parse_git_status), working: false, last_message: None, sid: None,
-                cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms, external: false,
+                cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms, external: false, chat: false,
             });
             continue;
         }
@@ -125,7 +125,7 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
                 provider: Some("opencode".into()), native_terminal: Some(s.native_terminal), browser: false,
                 rc_link: super::opencode::link(ctx, &p.name).await, rc_unavailable: s.rc_unavailable,
                 git: git.as_deref().map(parse_git_status), working: s.working, last_message: s.last_message, sid: s.sid,
-                cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms, external: false,
+                cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms, external: false, chat: s.chat_sock.is_some(),
             });
             continue;
         }
@@ -144,7 +144,7 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
                 git: git.as_deref().map(parse_git_status), working: s.working,
                 last_message: s.last_message, sid: s.sid,
                 cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms,
-                external: false,
+                external: false, chat: s.native_terminal && s.chat_sock.is_some(),
             });
             continue;
         }
@@ -208,18 +208,23 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
             None => None,
         };
 
+        let uptime_sec = ((now / 1000.0 - p.created as f64).round() as i64).max(0);
+        // No link by the end of the launch's link-poll window: Remote Control
+        // is not coming, so say so instead of "Waiting for link" forever.
+        let rc_window = (super::spawn::RC_POLL_INTERVAL * super::spawn::RC_POLL_ATTEMPTS).as_secs() as i64;
         running.push(Session {
             display_name,
             name: p.name.clone(),
             dir: p.path.clone(),
             pid: p.pid,
-            uptime_sec: ((now / 1000.0 - p.created as f64).round() as i64).max(0),
+            uptime_sec,
             model: meta.model.clone(),
             effort: meta.effort.clone(),
             variant: None,
             provider: None,
-            native_terminal: None, browser: false,
-            rc_unavailable: false,
+            native_terminal: None,
+            browser: false,
+            rc_unavailable: rc_link.is_none() && uptime_sec > rc_window,
             rc_link,
             git: git_out.as_deref().map(parse_git_status),
             working,
@@ -229,14 +234,16 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
             rss_kb: cpu_state.rss_kb,
             cpu_sample_age_ms: cpu_state.cpu_sample_age_ms,
             external: false,
+            chat: true,
         });
     }
 
-    // Keyed by the pane's own path (the one /api/browser resolves), not a
-    // provider's saved dir.
-    let dirs: Vec<&str> = panes.iter().map(|p| p.path.as_str()).collect();
+    // Match /api/browser: the first pane per session supplies the directory.
+    let mut seen = HashSet::new();
+    let browser_panes: Vec<_> = panes.iter().filter(|p| seen.insert(p.name.as_str())).collect();
+    let dirs: Vec<_> = browser_panes.iter().map(|p| p.path.as_str()).collect();
     let flags = super::browser::browser_flags(&ctx.claude_dir, &dirs).await;
-    let live: HashSet<&str> = panes.iter().zip(flags).filter(|(_, on)| *on).map(|(p, _)| p.name.as_str()).collect();
+    let live: HashSet<_> = browser_panes.into_iter().zip(flags).filter(|(_, on)| *on).map(|(p, _)| p.name.as_str()).collect();
     for row in &mut running {
         row.browser = live.contains(row.name.as_str());
     }
@@ -373,10 +380,8 @@ mod tests {
     fn ctx_for(claude_dir: PathBuf) -> Arc<Ctx> {
         let log = Arc::new(LogBuffer::new());
         // Summary jobs must never reach real provider subscriptions from unit tests.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(claude_dir.join("node"), "#!/bin/sh\necho '{\"error\":\"test\"}'\n").unwrap();
-        std::fs::set_permissions(claude_dir.join("node"), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let path = format!("{}:{}", claude_dir.display(), std::env::var("PATH").unwrap_or_default());
+        let bin = crate::chat::tmux_io::tests::install_stub(&claude_dir, "node", "#!/bin/sh\necho '{\"error\":\"test\"}'\n");
+        let path = format!("{bin}:{}", std::env::var("PATH").unwrap_or_default());
         let host = crate::host::init::Host {
             runner: crate::host::cmd::Runner::new(path.clone(), Arc::clone(&log)),
             log,
@@ -618,16 +623,10 @@ mod tests {
     /// `collect_sessions` can be exercised without a real server. Without this
     /// the whole pane loop — the majority of the function — has no test at all.
     fn fake_tmux(dir: &Path, pane_line: &str) -> String {
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n  list-panes) echo '{pane_line}' ;;\n  *) echo '' ;;\nesac\n"
         );
-        let p = bin.join("tmux");
-        std::fs::write(&p, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bin.to_string_lossy().into_owned()
+        crate::chat::tmux_io::tests::install_stub(dir, "tmux", &script)
     }
 
     fn ctx_with_path(claude_dir: PathBuf, path: String) -> Arc<Ctx> {
@@ -652,6 +651,21 @@ mod tests {
         let t = &r.running[0];
         assert_eq!((t.provider.as_deref(), t.model.as_deref()), (Some("terminal"), Some("Terminal")));
         assert!(t.rc_link.is_none() && t.rc_unavailable && t.sid.is_none());
+        assert!(!t.chat);
+    }
+
+    #[tokio::test]
+    async fn a_claude_pane_with_no_link_after_the_poll_window_reports_remote_control_unavailable() {
+        let d = tempdir("rc-unavailable");
+        std::fs::write(d.join("history.jsonl"), "").unwrap();
+        std::fs::write(d.join("sessions/4242.json"), r#"{"sessionId":"s-9","cwd":"/proj"}"#).unwrap();
+        let old = fake_tmux(&d, "cdash-test-1200-abc|4242|1785050000||/proj");      // created long ago
+        let r = collect_sessions(&ctx_with_path(d.clone(), old), RESUMABLE_MAX).await;
+        assert!(r.running[0].rc_unavailable && r.running[0].rc_link.is_none() && r.running[0].chat);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let young = fake_tmux(&d, &format!("cdash-test-1200-abc|4242|{now}||/proj"));
+        let r = collect_sessions(&ctx_with_path(d, young), RESUMABLE_MAX).await;
+        assert!(!r.running[0].rc_unavailable, "still inside the window: keep waiting");
     }
 
     #[tokio::test]
@@ -676,6 +690,7 @@ mod tests {
             r.running[0].rc_link.as_deref(),
             Some("https://claude.ai/code/session_pane")
         );
+        assert!(r.running[0].chat);
     }
 
     #[tokio::test]
@@ -698,6 +713,12 @@ mod tests {
         assert!(response.running[0].working);
         assert_eq!(response.running[0].variant.as_deref(), Some("deep"));
         assert_eq!(response.running[0].rc_link.as_deref(), Some("https://claude.ai/code/session_test"));
+        assert!(serde_json::to_value(&response.running[0]).unwrap().get("chat").is_none(), "no socket, no chat");
+        let mut with_chat = state.clone();
+        with_chat["chat_sock"] = "/tmp/x/chat.sock".into();
+        std::fs::write(root.join("cdash-test-1200-abc.native"), with_chat.to_string()).unwrap();
+        let chatty = collect_sessions(&ctx, RESUMABLE_MAX).await;
+        assert_eq!(serde_json::to_value(&chatty.running[0]).unwrap()["chat"], true);
         assert_eq!(response.resumable.len(), 1);
         assert_eq!(response.resumable[0].sid, "ses_saved");
         assert_eq!(response.resumable[0].variant.as_deref(), Some("deep"));
@@ -748,7 +769,12 @@ mod tests {
             let card = serde_json::to_value(&response.running[0]).unwrap();
             assert_eq!(card.get("rcUnavailable"), unavailable.then_some(&serde_json::Value::Bool(true)));
             assert!(card.get("rc_unavailable").is_none());
+            assert!(card.get("chat").is_none(), "no socket, no chat");
         }
+        state["chat_sock"] = "/tmp/x/chat.sock".into();
+        std::fs::write(root.join("cdash-test-1200-abc.native"), state.to_string()).unwrap();
+        let card = serde_json::to_value(&collect_sessions(&ctx, RESUMABLE_MAX).await.running[0]).unwrap();
+        assert_eq!(card["chat"], true);
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -788,7 +814,7 @@ mod tests {
         let state = serde_json::json!({"sid":"ses_live", "dir":"/saved", "pid":4242, "native_terminal":true});
         std::fs::write(root.join("cdash-test-1200-abc.json"), state.to_string()).unwrap();
         std::fs::write(root.join("cdash-test-1200-abc.native"), state.to_string()).unwrap();
-        let path = fake_tmux(&d, "cdash-test-1200-abc|4242|1785050000||/proj\ncdash-test-1200-def|4243|1785050001||/other");
+        let path = fake_tmux(&d, "cdash-test-1200-abc|4242|1785050000||/proj\ncdash-test-1200-def|4243|1785050001||/other\ncdash-test-1200-def|4244|1785050002|terminal|/proj");
         let ctx = ctx_with_path(d, path);
         *ctx.opencode_threads.lock().await = Some((std::time::Instant::now(), serde_json::from_value(serde_json::json!([])).unwrap()));
 
@@ -796,6 +822,7 @@ mod tests {
         assert_eq!(r.running[0].dir, "/saved", "the card shows the provider's saved dir");
         assert!(r.running[0].browser, "the flag follows the pane path /proj");
         assert!(!r.running[1].browser, "an unmapped pane has no flag");
+        assert!(!r.running[2].browser, "the route resolves a split session to its first pane");
     }
 
     #[test]
@@ -807,7 +834,7 @@ mod tests {
             name: "x".into(), dir: "/x".into(), pid: 1, uptime_sec: 0,
             model: None, effort: None, variant: None, provider: None, native_terminal: None, browser: false, rc_link: None, rc_unavailable: false, git: None, working: false,
             last_message: None, sid: None, cpu: None, rss_kb: 0,
-            cpu_sample_age_ms: 0, external: false,
+            cpu_sample_age_ms: 0, external: false, chat: false,
         };
         let j = serde_json::to_string(&s).unwrap();
         assert!(!j.contains("external"));

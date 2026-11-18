@@ -1,4 +1,7 @@
 const CACHE = 'cdash';   // namespace, not a version — never bumped
+// Network-first is safe to take over mid-session; waiting for every tab to
+// close kept browsers on the old cache-first worker.
+self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))));
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
@@ -15,13 +18,34 @@ self.addEventListener('fetch', e => {
     })());
     return;
   }
-  e.respondWith(caches.match(e.request).then(hit => {             // stale-while-revalidate
-    const fresh = fetch(e.request)
-      // !r.redirected is load-bearing: the guard answers an unauthenticated
-      // sub-resource with 302 -> /login, not 401, and a followed redirect is a
-      // 200 login page that would be cached as app.js.
-      .then(r => { if (r.ok && !r.redirected) caches.open(CACHE).then(c => c.put(e.request, r.clone())).catch(() => {}); return r; })
-      .catch(() => hit);
-    return hit || fresh;
-  }));
+  // Network first, like the page itself: a cached asset answering first is
+  // how a new page ended up running with an old stylesheet. The cache is the
+  // offline copy; the agent's ETags keep the network round trip a 304.
+  e.respondWith(fetch(e.request).then(r => {
+    // !r.redirected is load-bearing: the guard answers an unauthenticated
+    // sub-resource with 302 -> /login, not 401, and a followed redirect is a
+    // 200 login page that would be cached as app.js.
+    if (r.ok && !r.redirected) { const copy = r.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {}); }
+    return r;
+  }, async () => (await caches.match(e.request)) || Response.error()));
+});
+
+const TEXT = { done: 'Finished', error: 'Stopped with an error', ask: 'Needs your answer' };
+self.addEventListener('push', e => {
+  let n = null;
+  try { n = e.data && e.data.json(); } catch {}       // unreadable payload: fall through to the generic note
+  const known = n && typeof n === 'object' && n.s && n.p;
+  e.waitUntil(known
+    ? self.registration.showNotification(n.p, { body: (Object.hasOwn(TEXT, n.k) && TEXT[n.k]) || 'Open the dashboard', tag: n.s, data: { s: n.s, p: n.p }, icon: 'icon-192.png', renotify: true })
+    : self.registration.showNotification('RC Dashboard', { body: 'Open the dashboard', tag: 'cdash', icon: 'icon-192.png', renotify: true }));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const { s, p } = e.notification.data || {};
+  e.waitUntil((async () => {
+    const [c] = await self.clients.matchAll({ type: 'window' });
+    if (!c) return self.clients.openWindow(s ? `/?chat=${encodeURIComponent(s)}&title=${encodeURIComponent(p)}` : '/');
+    await c.focus();
+    if (s) c.postMessage({ t: 'open-chat', s, p });
+  })());
 });

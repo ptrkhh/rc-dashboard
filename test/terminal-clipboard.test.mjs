@@ -14,12 +14,12 @@ function terminalKeys() {
     attachCustomKeyEventHandler(fn) { handler = fn; }
   }
   runInNewContext(`${open}\nopenTerm('test', 'Test');`, {
-    term: null, Terminal,
+    term: null, browserView: null, Terminal,
     $: () => ({}), document: { documentElement: {} },
     getComputedStyle: () => ({ getPropertyValue: () => 'monospace' }),
     FitAddon: { FitAddon: class { fit() {} } },
     ResizeObserver: class { observe() {} },
-    history: { pushState() {} }, setCtrl() {}, termConnect() {},
+    history: { pushState() {} }, setCtrl() {}, termConnect() {}, cdashChat: { watchFocus: () => () => {} },
   });
   return (key, modifiers = {}, selection = false) => {
     selected = selection;

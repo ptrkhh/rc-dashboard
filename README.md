@@ -11,7 +11,7 @@
 
 After one-time setup, your everyday coding loop can happen entirely from RC Dashboard and Claude, without opening a terminal.
 
-[Download RC Dashboard](https://github.com/ptrkhh/claude-dashboard/releases/latest) · [Quick start](#quick-start) · [Keep it private](#keep-it-private) · [Technical reference](#technical-reference)
+[Download RC Dashboard](https://github.com/ptrkhh/rc-dashboard/releases/latest) · [Which setup?](#which-setup-do-i-need) · [Run on this device](#run-on-this-device) · [Run on a server](#run-on-a-server) · [Keep it private](#keep-it-private) · [Technical reference](#technical-reference)
 
 ## Get Claude going from the screen in your hand.
 
@@ -40,57 +40,35 @@ Use the dashboard in your browser, on your desktop, or in the Android app. Runni
 
 <p align="center"><sub>The dashboard UI is real; session names and stats are sample data.</sub></p>
 
-## Quick start
+## Which setup do I need?
 
-1. [Download the app for your platform](https://github.com/ptrkhh/claude-dashboard/releases/latest).
+| If you want to | Go to |
+|---|---|
+| Use RC Dashboard on the computer or phone you already have: Windows, macOS, Linux, or Android | [Run on this device](#run-on-this-device) |
+| Keep sessions on an always-on host and reach them from any browser | [Run on a server](#run-on-a-server) |
+
+## Run on this device
+
+The app and the agent run on the same computer or phone, and your sessions run there too. Choose this to use RC Dashboard on the machine you code on.
+
+1. [Download the app for your platform](https://github.com/ptrkhh/rc-dashboard/releases/latest): a Windows `.exe`, a macOS `.dmg`, a Linux AppImage, or the Android APK.
 2. On the machine where your projects live, install tmux and Claude Code, and [sign in for Remote Control](https://code.claude.com/docs/en/remote-control#requirements).
 3. Open RC Dashboard. Linux and macOS desktop apps start the agent with the app. On Windows and Android, follow the one-time setup prompt for WSL or F-Droid Termux.
 4. Choose a project and tap **Launch**, or tap **Resume** on a previous session.
 5. When the session is ready, tap **Open in Claude** and continue coding in the Claude app or website.
 
-Installation and first-run setup may need a terminal. To sign in to Claude Code, Codex, or OpenCode on the host, choose **Terminal** in the Model menu and tap **Launch**: it opens a plain shell in tmux on the host, reachable from its card's **Terminal** button. Once setup is complete, use the dashboard to launch and resume sessions.
+Installation and first-run setup may need a terminal. To sign in to Claude Code on the host, choose **Terminal** in the Model menu and tap **Launch**: it opens a plain shell in tmux on the host, reachable from its card's **Terminal** button. Once setup is complete, use the dashboard to launch and resume sessions.
 
 | Open RC Dashboard with | Sessions run on | First-run setup |
 |---|---|---|
 | Linux or macOS desktop app | Your computer | The app starts its included agent. |
 | Windows desktop app | WSL 2 | The app guides you through starting the agent in your Linux distro. |
 | Android app | F-Droid Termux on your phone | The app gives you a setup command to paste once. |
-| Browser or installable web app | A computer running the agent | Open the local dashboard; configure protected network access before using another device. |
 
-For browser-only use, start the agent on your host and open its local address. From source, the command is in the [technical reference](#run-from-source).
-
-## Keep it private
-
-RC Dashboard can control live coding sessions. The agent listens on your own machine by default, and authentication is off by default too. Keep it local, or add an access guard before opening it to a network. Saved remote profiles in the desktop and Android apps currently support unauthenticated agents only, so use those profiles on a trusted private network.
-
-See [access and security settings](#access-and-security-settings) before exposing an agent to other devices.
-
-## How it works with Claude
-
-RC Dashboard starts or resumes Claude Code on the machine where your project lives and gives you its Remote Control link. **Open in Claude** takes you to the coding conversation in Claude’s app or website.
-
-Your code, tools, and environment stay on that host. Keep it on and reachable while you work remotely. Closing the dashboard leaves the session running.
-
-External sessions without a Claude link show instructions instead of a waiting spinner. Run `/remote-control` in that session's original terminal to enable Remote Control; the card shows **Open in Claude** once the CLI publishes its link.
-
-## Technical reference
+The apps connect to an agent on the same device. To run sessions on another host, see [Run on a server](#run-on-a-server).
 
 <details>
-<summary>Platform details, session behavior, configuration, and build notes</summary>
-
-### Run from source
-
-The local agent serves the web dashboard at <strong>http://127.0.0.1:23274</strong>.
-
-    cargo run -p cdash-agent
-
-The desktop wrapper can be started with:
-
-    cargo run -p cdash-tauri
-
-The host needs tmux and Claude Code. Node.js 22 or later is needed for conversation summaries.
-
-### Platform details
+<summary>Platform details, Android security, and running from source</summary>
 
 **Linux and macOS desktop.** The Tauri app starts the agent in-process. No separate server setup is needed.
 
@@ -98,68 +76,106 @@ The host needs tmux and Claude Code. Node.js 22 or later is needed for conversat
 
 **Android.** The app connects to an agent in F-Droid Termux. The Play Store Termux build cannot execute the agent from its private app directory. Install tmux and your coding CLI in Termux, then paste the setup command shown by RC Dashboard. The command installs or updates the agent and adds a shell guard so opening Termux starts it. It also points the agent at Termux's CA certificate bundle without overriding a custom `SSL_CERT_FILE`; re-paste the setup command to apply this fix to an existing installation.
 
-**Browser and PWA.** The agent serves the web app. It caches visited pages and assets for later offline viewing. Network access still requires a reachable host and a suitable access setup.
+**Android security.** Android apps share loopback access. The Android client cannot authenticate a saved remote profile yet, and the agent can control coding sessions. Use it only on a phone where you trust installed apps and keep remote access on a trusted private network.
 
-### Session behavior
+The desktop wrapper can be started from source with:
 
-Sessions run in tmux. Launching or resuming a session prepares its Remote Control link for **Open in Claude**. The dashboard also includes an optional **Terminal** button for direct access to the session’s live CLI interface; closing the view detaches without stopping the session. External sessions that are not in tmux do not have this control.
+    cargo run -p cdash-tauri
 
-<p align="center"><img src="docs/screenshots/terminal-demo.png" alt="Optional terminal view with keyboard controls and illustrative terminal text" width="900" /></p>
+The host needs tmux and Claude Code. Node.js 22 or later is needed for conversation summaries.
 
-The browser terminal sends input to the CLI, so anyone who can reach it can control that session. Terminal connections check the page origin, and session APIs use the configured authentication guards. The log records terminal open and close events, not typed input.
+</details>
 
-### Browser view
+## Run on a server
 
-Some sessions drive a visible Chromium browser through Playwright MCP and stop at a login or MFA prompt. A session card shows **Browser** while its browser's debugging port answers. The overlay streams that session's tab to your phone so you can tap, type, scroll, switch tabs, go back and reload, then close it and let the agent carry on. It works with any Chromium-based browser that exposes the DevTools methods it needs (Chrome, Chromium, Brave, Edge and others).
+Sessions run on an always-on host, such as a VPS, a home server, or a container. You open the dashboard from any device in a browser or as an installable web app, and sessions keep running while your own computer or phone is off. There are two ways to run the host:
 
-The agent learns which port belongs to which folder from `cdash-browsers.json` in your Claude data folder (`~/.claude`, or `CLAUDE_DIR`). Write it by hand as an object of absolute session folder to port. A session uses the longest folder that equals or contains its directory:
+- [Docker](#docker): an image with the agent, Claude Code and tmux, behind a Cloudflare Tunnel.
+- [Standalone cdash-agent](#standalone-cdash-agent): the agent binary on a Linux host you manage yourself.
 
-```json
-{ "/mnt/d/p/Downloads/JOBS": 9301, "/mnt/d/p/Downloads/INVEST": 9302 }
+### Docker
+
+The image bundles the agent, Claude Code and tmux. A second container runs cloudflared, so the dashboard is reachable only through a Cloudflare Tunnel with Cloudflare Access in front. cloudflared waits for the agent's local healthcheck before starting.
+
+1. Copy `.env.example` to `.env` and fill it in.
+2. In Cloudflare Zero Trust, create a tunnel and a public hostname that points at `http://tools:23274`. Create an Access application for that hostname with a policy that allows you. Put the tunnel token, team domain, and application audience tag in `.env`. **`CF_TEAM_DOMAIN` must be the full HTTPS issuer URL**, such as `https://example.cloudflareaccess.com`, with no trailing slash. A bare hostname causes the agent to exit with a JWKS fetch error and the container to restart.
+3. Create the directory named by `PROJECTS_DIR` and put your projects in it, then start the stack:
+
+       docker compose pull
+       docker compose up -d
+
+   The published image is `linux/amd64` only. On arm64 hosts, build from source instead (see Docker maintenance below).
+
+   Projects appear at `/home/node/projects` in the container. On Linux, the directory and project files must be writable by the container's `node` user (UID/GID 1000); creating a directory as another host user does not automatically grant that access.
+
+4. Sign in once. In the launcher, choose **Terminal** in the Model menu, open the `projects` folder and pick a directory in it, and tap **Launch**. Open the new card's **Terminal** button and run `claude`. Claude Code must be signed in with an account that supports Remote Control.
+
+The container starts with fresh CLI configuration. Host logins, plugins, trust lists, and permission settings are not imported. Configure each CLI inside the container, and set Git's `user.name` and `user.email` before committing. Dashboard-launched coding sessions set permissions on launch and resume: Claude Code uses `--dangerously-skip-permissions`. No saved permission configuration is needed for these defaults. The `home` volume preserves container logins, settings, and session history across image updates and `docker compose down`. `docker compose down -v` deletes that volume and its contents.
+
+The agent runs as `node` with passwordless `sudo`, so project dependencies can be installed from the remote terminal. Elevated commands can modify mounted host files. System packages installed interactively survive a container restart, but disappear when the container is removed or recreated; add lasting dependencies to the Dockerfile and build from source (see Docker maintenance below). The image also disables Git's ownership check for repositories, so mount repositories you trust. This does not grant filesystem write permission.
+
+Sessions run in tmux inside the container, so `docker restart`, `docker compose down`, and container replacement end them. Project files stay on the host. Cloudflare Access is the only guard: do not publish port 23274.
+
+<details>
+<summary>Docker maintenance: CLI versions, project names, and the home volume</summary>
+
+Use a separate tunnel for each independent dashboard stack. Cloudflare supports multiple connectors as replicas, but they must serve the same dashboard deployment; connectors pointing at independent stacks can send users to different code and session state. The default Compose project name is `cdash`; `-p` and `COMPOSE_PROJECT_NAME` can override it.
+
+Before changing a project name, stop the old stack explicitly, for example `docker compose -p old-project down`. Do not add `-v` if you want to retain its home volume. A new project name normally selects a new, empty home volume. To reuse the old one after stopping the old stack, save an override such as `compose.home.yml`:
+
+```yaml
+volumes:
+  home:
+    external: true
+    name: old-project_home
 ```
 
-Ports outside 1024–65535 are ignored. A missing or malformed file means no **Browser** buttons.
+Replace `old-project_home` with the existing home volume's name, then start the new project with `docker compose -p new-project -f docker-compose.yml -f compose.home.yml up -d`. Include the override in subsequent Compose commands. Never run independent dashboard stacks against the same home volume.
 
-The map follows the browser, not the project: give each Playwright profile its own port, and map every folder whose sessions drive that profile to it. Folders that share one profile share its port, and the tab picker then lists every tab in that browser, including other sessions' tabs. Playwright MCP's `--extension` mode, which drives your everyday browser through its extension, is not supported: viewing it would need a debugging port on your personal profile.
+To build from source instead of pulling, for arm64 hosts, an edited Dockerfile, or other CLI versions (the `CLAUDE_CODE_VERSION`, `CODEX_VERSION`, and `OPENCODE_VERSION` build args, set under `build.args`), save an override such as `compose.build.yml`:
 
-Open the same port in each project's Playwright MCP launcher with `--config=<file>`:
-
-```json
-{ "browser": { "browserName": "chromium", "launchOptions": { "args": ["--remote-debugging-port=9301"] } } }
+```yaml
+services:
+  tools:
+    build: .
+    image: rc-dashboard:local
 ```
 
-Keep the browser you already launch (a channel or `--executable-path`) and a dedicated `--user-data-dir` that belongs to that browser. Chrome 136 and later ignores debugging switches on its default profile folder, so a personal profile will not work. Do not add `--remote-allow-origins=*` or disable the sandbox. If the browser runs on Windows and the agent in WSL, WSL needs `networkingMode=mirrored` so its `127.0.0.1` reaches the Windows loopback port; a browser on the agent's own host needs nothing extra.
+Then run `docker compose -f docker-compose.yml -f compose.build.yml up -d --build`. Include the override in subsequent Compose commands.
 
-The agent connects only to `127.0.0.1` on the mapped port. It ignores proxies and follows no redirects. The listener must be bound to loopback only. While the port is open, any process on that machine can control the browser's logged-in tabs without a password; use this on a machine you trust.
+To check a locally built image without CLI credentials or published ports, run `docker build -t rc-dashboard:local .` and then `bash scripts/test-docker.sh rc-dashboard:local`.
 
-The view cannot show the browser's own interface: saved-password and autofill lists, "Save password?" and permission prompts, HTTP sign-in dialogs, file pickers, Windows Hello and PIN prompts. Type the password instead. It never opens, closes or resizes the browser and never brings a tab forward. A sign-in popup appears in the tab picker and you choose it. Text goes to the page one key press per character, so one-box-per-digit MFA fields fill.
+</details>
 
-The overlay says **Browser not running** when nothing answers on the port and **Browser closed** when the browser exits. **Browser view unsupported** means the browser lacks a DevTools method the view needs; the dashboard cannot work around that, so use another Chromium build. The log records open and close events and a fixed failure category, never errors, page addresses, titles or typed input.
+### Standalone cdash-agent
 
-### Claude Code sessions
+Use this on a Linux host you manage yourself, without a container.
 
-Choose a model and effort level when launching or resuming Claude Code sessions. When the Claude account supports usage lookup, meters use the same undocumented OAuth endpoint as the CLI; that endpoint may change. Missing credentials hide usage meters without blocking session controls.
+1. On the host, install tmux and Claude Code, and [sign in for Remote Control](https://code.claude.com/docs/en/remote-control#requirements). Node.js 22 or later is needed for conversation summaries.
+2. Download `cdash-agent-linux-x86_64` or `cdash-agent-linux-aarch64` from the [latest release](https://github.com/ptrkhh/rc-dashboard/releases/latest), make it executable, and run it. From a source checkout, `cargo run -p cdash-agent` does the same.
 
-Resumable cards can show conversation summaries. The agent reuses a suitable existing summary or generates one with the available supported subscription login. Summaries can omit or misstate details; the original session remains the source of truth. The selected conversation text is sent to the provider for summary generation. Tool payloads and thinking are omitted.
+       chmod +x cdash-agent-linux-x86_64
+       ./cdash-agent-linux-x86_64
 
-### OpenCode sessions
+3. The agent serves the dashboard at **http://127.0.0.1:23274**, with authentication off. To reach it from other devices, set **CDASH_BIND** and a **CDASH_AUTH** guard, or forward a protected tunnel to it. See [access and security settings](#access-and-security-settings).
 
-To use OpenCode through the dashboard, install OpenCode V2.1.4 or later in the V2 series and Node.js 22 or later on the host. Configure and sign in to your OpenCode provider, and sign in to Claude Code with an account that supports Remote Control. Choose a project first, then select an OpenCode model and, when available, its variant. Model availability follows that project's OpenCode configuration. If `OPENCODE_CONFIG_CONTENT` is set, it must contain valid JSON for dashboard model discovery.
+### Open it from a device
 
-The dashboard starts a private OpenCode server and native terminal for each managed session. **Terminal** gives access to OpenCode's full interface; **Open in Claude** connects the same session to Claude Remote Control. The bridge carries text, tool activity and supported permission approvals. Use Terminal for attachments, interactive forms, and tool output beyond the bridge's 65,536-character limit. Reasoning is not forwarded.
+Open the host's address in any browser, or install the page as a web app (PWA). The agent serves the web app, and the PWA caches visited pages and assets for later offline viewing. Network access still needs a reachable host and a suitable [access setup](#access-and-security-settings).
 
-Only OpenCode sessions created by this dashboard appear in its resumable history. Purging a card hides it from the dashboard; it does not delete the native OpenCode session. Do not run the same OpenCode session through another server at the same time. If Remote Control disconnects, the native terminal stays available while the link retries.
+The desktop and Android apps connect to an agent on the same device. Their saved remote profiles accept unauthenticated agents only, so they cannot reach a guarded server. Use a browser or the PWA for a server.
 
 ### Access and security settings
 
-The agent defaults to **127.0.0.1** and **CDASH_AUTH=none**. If you enable network access, configure a guard or put the origin behind a trusted access layer. Claude sessions launch with broad permissions; treat access to the agent as access to your coding session.
+The agent defaults to **127.0.0.1** and **CDASH_AUTH=none**. If you enable network access, configure a guard or put the origin behind a trusted access layer. Coding sessions launch with broad permissions; treat access to the agent as access to your coding session.
 
-The desktop and Android apps’ saved remote profiles currently support **auth: none**. Do not expose those connections to a public network. Android also does not isolate loopback between apps, so other apps with internet access on the phone may be able to reach a loopback agent.
+The desktop and Android apps’ saved remote profiles currently support **auth: none**. Do not expose those connections to a public network.
 
 | Setting | Default | Purpose |
 |---|---|---|
 | **PORT** | 23274 | Listening port. Set to 0 to choose an available port. |
 | **CDASH_BIND** | 127.0.0.1 | Listen address. Network access requires an explicit bind address. |
+| **CDASH_HOOK_PORT** | 23275 | Loopback port where Claude Code sessions send questions and plan approvals to chat. If another agent holds it, new sessions answer in Terminal. |
 | **CLAUDE_DIR** | ~/.claude | Claude configuration and project directory. |
 | **DISK_EXTRA** | — | Optional second disk mount to report, such as /mnt/d. |
 | **ANTHROPIC_BASE_URL** | https://api.anthropic.com | HTTPS base URL for Claude usage lookup. |
@@ -180,9 +196,83 @@ Set **CDASH_AUTH=cf-access**, **CDASH_CF_TEAM_DOMAIN**, and **CDASH_CF_AUD** to 
 
 A tunnel that forwards only to loopback can use **CDASH_AUTH=none** because there is no inbound origin to bypass. Keep an auth guard if other local users or services share the host.
 
-#### Android security note
+## Keep it private
 
-Android apps share loopback access. The Android client cannot authenticate a saved remote profile yet, and the agent can control coding sessions. Use it only on a phone where you trust installed apps and keep remote access on a trusted private network.
+RC Dashboard can control live coding sessions. The agent listens on your own machine by default, and authentication is off by default too. Keep it local, or add an access guard before opening it to a network. Saved remote profiles in the desktop and Android apps currently support unauthenticated agents only, so use those profiles on a trusted private network.
+
+See [access and security settings](#access-and-security-settings) before exposing an agent to other devices.
+
+## How it works with Claude
+
+RC Dashboard starts or resumes Claude Code on the machine where your project lives and gives you its Remote Control link. **Open in Claude** takes you to the coding conversation in Claude’s app or website.
+
+Your code, tools, and environment stay on that host. Keep it on and reachable while you work remotely. Closing the dashboard leaves the session running.
+
+External sessions without a Claude link show instructions instead of a waiting spinner. Run `/remote-control` in that session's original terminal to enable Remote Control; the card shows **Open in Claude** once the CLI publishes its link.
+
+## Chat
+
+**Chat** opens a running session's conversation inside the dashboard. It talks only to `cdash-agent` on the host, so it works when claude.ai is unreachable and for accounts without Remote Control. It is available for Claude Code, Codex and OpenCode sessions the dashboard started. **Terminal** and **Open in Claude** stay on every card, and all three can be used on one session at the same time: a prompt typed in any of them shows in the others.
+
+- Claude Code replies arrive one finished block at a time, not word by word. Codex streams text while it is written.
+- Each tool call is one line; tap it for the command, input, output and any error.
+- A message sent while the session works is held by the dashboard and listed above the composer with **Send now**, **Edit** and **Remove**. When a turn ends on its own, the next held message goes out, one per turn.
+- **Stop** interrupts the running turn. After a stop, from any door, held messages stay held until you choose what to do with each. A Claude Code prompt stopped before any reply is marked not sent and its text can be edited.
+- Questions and plan approvals appear as cards above the composer and can be answered from chat; the first answer from any door wins and the card closes everywhere. Permission prompts and other dialogs still point to Terminal, as do Claude Code sessions started before upgrading until they are restarted.
+- Type `/` for the session's commands. The chip at the top shows the model, effort and plan mode (for OpenCode, the variant and agent); tap it to change them. Claude Code's pickers work while the session is idle, and a model or effort change there also becomes the default for new Claude sessions; Codex applies changes from the next turn.
+- Attach images and files with the paperclip, by pasting into the message box or by dropping them on the chat (20 MB per file, 10 per message). Images in the conversation show as thumbnails; tap one to see it full screen. Claude Code gets images as pasted attachments, Codex gets images and OpenCode images and PDFs as their own attachments, and every other file goes to the tool as a path it reads itself.
+- Uploads stay on the host in `~/.cache/cdash/uploads/<session>` (or under `$XDG_CACHE_HOME`), readable only by you, and are deleted when the session ends and after 7 days. Images seen in history are kept in `~/.cache/cdash/media` and removed after 7 days unused. Codex and OpenCode sessions started before upgrading need a restart to show images.
+- Chat reconnects on its own and catches up without gaps or repeats. Held messages live in the agent's memory; if the agent restarts, the device that wrote them shows them as not sent.
+- Codex and OpenCode sessions started before upgrading need a restart before **Chat** appears on their cards.
+
+A Claude Code card whose Remote Control link has not arrived 30 seconds after launch says the link is unavailable instead of waiting; Chat and Terminal still work.
+
+## Browser view
+
+**Browser** streams a session's Chromium tab and forwards clicks, taps, typing and scrolling. Click the streamed field to type on desktop. On touchscreens, tap the field and then **Kbd**. Switch between existing tabs or a sign-in popup using the tab strip.
+
+1. Add `cdash-browsers.json` to `~/.claude` (or `CLAUDE_DIR`), mapping absolute session folders to debugging ports. The longest matching folder wins. Folders that share a browser profile share its port and tab list.
+
+   ```json
+   { "/home/me/projects/example": 9301 }
+   ```
+
+2. Keep your existing Chromium channel or executable and its dedicated automation profile. Add `--remote-debugging-port=9301` to its launcher. For Playwright MCP, use `--config=<file>` and append that flag to `browser.launchOptions.args`. The Browser button appears when the port answers.
+
+Keep the debugging port on `127.0.0.1`. Local processes can control logged-in tabs through it, so use a dedicated profile and keep the browser sandbox enabled. For a Windows browser viewed by a WSL agent, mirrored networking lets WSL reach the Windows loopback port. Chrome 136 and later ignores debugging switches on its default profile.
+
+The stream shows page content. Browser dialogs, saved-password menus and operating-system prompts stay on the browser host. The dashboard logs connection status and error categories without page addresses or typed input.
+
+## Notifications
+
+Each device has its own switch, **Notifications on this device**, in the dashboard; a device that leaves it off sees no change.
+
+- A browser needs HTTPS or 127.0.0.1. On any other page the switch is disabled and says `needs HTTPS or 127.0.0.1`.
+- The Windows app registers its app ID (`HKCU\Software\Classes\AppUserModelId\dev.cdash.app`, no admin rights) while notifications are on, and removes it when they are off.
+- The Android app keeps a background service running with a quiet permanent notification (`Watching for replies`) and asks for the Android notification permission and to be exempt from battery optimisation so replies still reach you. If you decline the exemption the service still runs, but Android may cut the connection while the phone sleeps.
+- A notification appears when a session finishes a turn, stops with an error, or needs your answer. The title is the project folder.
+- Push services see only encrypted payloads, and the payload they carry holds only a session name, a project folder name, a kind and a time. No message text, tool names or file names.
+
+Windows and Android notification behaviour is not yet checked on real devices.
+
+## Technical reference
+
+<details>
+<summary>Session behavior, provider notes, release builds, and branding</summary>
+
+### Session behavior
+
+Sessions run in tmux. Launching or resuming a session prepares its Remote Control link for **Open in Claude**. The dashboard also includes an optional **Terminal** button for direct access to the session’s live CLI interface; closing the view detaches without stopping the session. External sessions that are not in tmux do not have this control.
+
+<p align="center"><img src="docs/screenshots/terminal-demo.png" alt="Optional terminal view with keyboard controls and illustrative terminal text" width="900" /></p>
+
+The browser terminal sends input to the CLI, so anyone who can reach it can control that session. Terminal connections check the page origin, and session APIs use the configured authentication guards. The log records terminal open and close events, not typed input.
+
+### Claude Code sessions
+
+Choose a model and effort level when launching or resuming Claude Code sessions. When the Claude account supports usage lookup, meters use the same undocumented OAuth endpoint as the CLI; that endpoint may change. Missing credentials hide usage meters without blocking session controls.
+
+Resumable cards can show conversation summaries. The agent reuses a suitable existing summary or generates one with the available supported subscription login. Summaries can omit or misstate details; the original session remains the source of truth. The selected conversation text is sent to the provider for summary generation. Tool payloads and thinking are omitted.
 
 ### Release builds
 
@@ -195,7 +285,8 @@ The toolchain is pinned in **scripts/toolchain-env.sh**. Use **scripts/build-all
 
 | Artifact | Target |
 |---|---|
-| cdash-agent | Linux x86_64 or ARM64 |
+| cdash-agent-linux-x86_64 | Standalone agent, Linux x86_64 |
+| cdash-agent-linux-aarch64 | Standalone agent, Linux ARM64 |
 | cdash-tauri-linux-x64.AppImage | Linux desktop, x64 |
 | cdash-tauri-linux-arm64.AppImage | Linux desktop, ARM64 |
 | cdash-tauri.exe | Windows desktop, x64 or ARM64 |
