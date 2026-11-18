@@ -202,6 +202,31 @@ pub(crate) async fn send_or_drop(ws: &mut WebSocket, msg: Message) -> bool {
     )
 }
 
+/// The bridges' keepalive tick, every `PING_EVERY`. Burst (the default) would
+/// fire missed ticks back to back after a stall (a slow send on a bad mobile
+/// link), and the second would see `heard` still false and cut off a live
+/// client.
+pub(crate) fn ping_interval() -> tokio::time::Interval {
+    let mut ping = tokio::time::interval(PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping
+}
+
+/// Tell the browser why the bridge ended, then wait for its Close reply.
+/// Dropping the socket with a frame still unread (a pong, a keystroke) makes
+/// the kernel answer RST, and the browser can then lose the close code and
+/// see a plain 1006.
+pub(crate) async fn close_and_drain(ws: &mut WebSocket, code: u16, reason: &str) {
+    let _ = ws
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
+    let drain = async { while let Some(Ok(_)) = ws.recv().await {} };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), drain).await;
+}
+
 fn is_eio(e: &io::Error) -> bool {
     e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
 }
@@ -217,11 +242,7 @@ async fn pump(
     let _child = spawn_attach(name, &ctx.host.path, slave)?; // killed on drop
     let master = AsyncFd::new(master)?;
     let mut buf = vec![0u8; 16 * 1024];
-    let mut ping = tokio::time::interval(PING_EVERY);
-    // Burst (the default) would fire missed ticks back to back after a stall
-    // (a slow send on a bad mobile link), and the second would see `heard`
-    // still false and cut off a live client.
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ping = ping_interval();
     let mut heard = true;
     let mut focus = FocusGuard::new(ctx, name);
     loop {
@@ -298,23 +319,13 @@ pub async fn bridge(ctx: Arc<Ctx>, name: String, cols: u16, rows: u16, mut ws: W
         }
     };
     if let Some((code, reason)) = close {
-        let _ = ws
-            .send(Message::Close(Some(CloseFrame {
-                code,
-                reason: reason.into(),
-            })))
-            .await;
-        // Wait for the browser's Close reply. Dropping the socket with a frame
-        // still unread (a pong, a keystroke) makes the kernel answer RST, and
-        // the browser can then lose the close code and see a plain 1006.
-        let drain = async { while let Some(Ok(_)) = ws.recv().await {} };
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), drain).await;
+        close_and_drain(&mut ws, code, &reason).await;
     }
     ctx.host.log.push(format!("term close {name}"));
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::chat::tmux_io::tests::eventually;
 
@@ -417,11 +428,11 @@ mod tests {
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, Message as WsMsg};
 
-    type Ws = tokio_tungstenite::WebSocketStream<
+    pub(crate) type Ws = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    fn have_tmux() -> bool {
+    pub(crate) fn have_tmux() -> bool {
         #[allow(clippy::disallowed_types)] // test-only probe, no Runner in scope
         let ok = std::process::Command::new("tmux")
             .arg("-V")
@@ -442,24 +453,25 @@ mod tests {
     }
 
     /// A detached `sh` session, killed on drop.
-    struct Session(String);
+    pub(crate) struct Session(pub(crate) String);
     impl Session {
         fn new(tag: &str) -> Self {
+            Self::start(tag, None)
+        }
+        /// Same, with the pane's working directory set to `dir`.
+        pub(crate) fn in_dir(tag: &str, dir: &std::path::Path) -> Self {
+            Self::start(tag, Some(dir))
+        }
+        fn start(tag: &str, dir: Option<&std::path::Path>) -> Self {
             let name = format!("cdash-termtest-{}-{tag}", std::process::id());
             let _ = tmux(&["kill-session", "-t", &format!("={name}")]);
-            assert!(tmux(&[
-                "new-session",
-                "-d",
-                "-s",
-                &name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh"
-            ])
-            .status
-            .success());
+            let mut args = vec!["new-session", "-d", "-s", &name, "-x", "80", "-y", "24"];
+            let dir = dir.map(|d| d.to_string_lossy().into_owned());
+            if let Some(d) = &dir {
+                args.extend(["-c", d]);
+            }
+            args.push("sh");
+            assert!(tmux(&args).status.success());
             Self(name)
         }
         fn clients(&self) -> String {
@@ -479,7 +491,7 @@ mod tests {
         }
     }
 
-    fn tempdir(tag: &str) -> std::path::PathBuf {
+    pub(crate) fn tempdir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("cdash-term-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
@@ -502,7 +514,7 @@ mod tests {
             .map(|(ws, _)| ws)
     }
 
-    fn status_of(r: Result<Ws, tungstenite::Error>) -> u16 {
+    pub(crate) fn status_of(r: Result<Ws, tungstenite::Error>) -> u16 {
         match r {
             Err(tungstenite::Error::Http(res)) => res.status().as_u16(),
             Err(e) => panic!("expected an HTTP refusal, got {e}"),

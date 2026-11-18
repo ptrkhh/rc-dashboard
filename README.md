@@ -227,6 +227,22 @@ External sessions without a Claude link show instructions instead of a waiting s
 
 A Claude Code card whose Remote Control link has not arrived 30 seconds after launch says the link is unavailable instead of waiting; Chat and Terminal still work.
 
+## Browser view
+
+**Browser** streams a session's Chromium tab and forwards clicks, taps, typing and scrolling. Click the streamed field to type on desktop. On touchscreens, tap the field and then **Kbd**. Switch between existing tabs or a sign-in popup using the tab strip.
+
+1. Add `cdash-browsers.json` to `~/.claude` (or `CLAUDE_DIR`), mapping absolute session folders to debugging ports. The longest matching folder wins. Folders that share a browser profile share its port and tab list.
+
+   ```json
+   { "/home/me/projects/example": 9301 }
+   ```
+
+2. Keep your existing Chromium channel or executable and its dedicated automation profile. Add `--remote-debugging-port=9301` to its launcher. For Playwright MCP, use `--config=<file>` and append that flag to `browser.launchOptions.args`. The Browser button appears when the port answers.
+
+Keep the debugging port on `127.0.0.1`. Local processes can control logged-in tabs through it, so use a dedicated profile and keep the browser sandbox enabled. For a Windows browser viewed by a WSL agent, mirrored networking lets WSL reach the Windows loopback port. Chrome 136 and later ignores debugging switches on its default profile.
+
+The stream shows page content. Browser dialogs, saved-password menus and operating-system prompts stay on the browser host. The dashboard logs connection status and error categories without page addresses or typed input.
+
 ## Notifications
 
 Each device has its own switch, **Notifications on this device**, in the dashboard; a device that leaves it off sees no change.

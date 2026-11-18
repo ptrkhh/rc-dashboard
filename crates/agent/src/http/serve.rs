@@ -42,6 +42,7 @@ crate::guarded_routes! {
     get "/api/browse" => routes::get_browse,
     get "/api/hostinfo" => routes::get_hostinfo,
     get "/api/term" => routes::get_term,
+    get "/api/browser" => routes::get_browser,
     get "/api/chat" => routes::get_chat,
     get "/api/chat/diff" => routes::get_chat_diff,
     get "/api/chat/media/{ref}" => routes::get_chat_media,
@@ -182,6 +183,10 @@ async fn embedded_asset(uri: OriginalUri, req: axum::http::HeaderMap) -> Respons
         "term/keys.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("../../../../public/term/keys.js"),
+        ),
+        "browser/view.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../../../public/browser/view.js"),
         ),
         "chat/highlight.js" => (
             "text/javascript; charset=utf-8",
