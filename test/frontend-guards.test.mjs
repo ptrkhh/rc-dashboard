@@ -18,6 +18,7 @@ function statsRenderer() {
     esc: s => s, fmtKb: String, fmtReset: String,
     runningCard: () => '', resumableCard: () => '',
     resLimit: 20, lastRes: [], lastPinned: [],
+    markChatCards: () => {},
   };
   runInNewContext(`${statTile}\n${render}; this.render = render;`, context);
   return stats => {
@@ -457,6 +458,7 @@ test('a newly running conversation leaves inactive sections without disturbing a
     lastPinned: [{ sid: 'one' }], lastRes: [],
     esc: String, fmtKb: String, runningCard: () => '',
     statTile: () => '', renderResumable: () => { painted = true; },
+    markChatCards: () => {},
   };
   let removed = false;
   const card = { parentElement: { id: 'pinned', querySelector: () => null }, remove: () => { removed = true; } };
@@ -1107,4 +1109,39 @@ test('/btw opens the side sheet and is never sent; the menu offers it; aside fra
   assert.ok(submit.indexOf('cdashSheets.btw(') > 0 && submit.indexOf('cdashSheets.btw(') < submit.indexOf('submitText('), submit);
   assert.match(view, /cdashSheets\.onFrame\(/);
   assert.match(readFileSync(new URL('../public/chat/menu.js', import.meta.url), 'utf8'), /name: 'btw'/);
+});
+
+test('overlay titles carry the session headline, not just its folder', () => {
+  const src = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const card = src.slice(src.indexOf('function runningCard('), src.indexOf('\n}\n', src.indexOf('function runningCard(')) + 2);
+  const context = { esc: s => s, effortLabel: s => s, gitBadge: () => '', copyIdBtn: () => '', fmtUp: () => '', armedKill: null, ICONS: new Proxy({}, { get: () => '' }) };
+  runInNewContext(`${card}; this.runningCard = runningCard;`, context);
+  const row = {
+    name: 'cdash-a', dir: '/git/rc-dashboard', displayName: '[Codex] rc-dashboard · monkey',
+    working: false, chat: true, nativeTerminal: true, browser: true,
+  };
+  const html = context.runningCard(row);
+  for (const kind of ['chat', 'term', 'browser'])
+    assert.match(html, new RegExp(`data-${kind}="cdash-a" data-title="\\[Codex\\] rc-dashboard · monkey"`));
+  assert.match(html, /class="session-title">\[Codex\] rc-dashboard · monkey</);
+  const bare = { ...row, displayName: undefined, chat: false, browser: false };
+  assert.match(context.runningCard(bare), /data-term="cdash-a" data-title="rc-dashboard"/);
+});
+
+test('only the running card whose chat is open is marked active', () => {
+  const src = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const code = src.slice(src.indexOf('function markChatCards('), src.indexOf('\n}\n', src.indexOf('function markChatCards(')) + 2);
+  for (const open of ['a', null]) {
+    const marks = {};
+    const btn = chat => ({
+      dataset: { chat },
+      closest: () => ({ classList: { toggle: (cls, on) => { marks[chat] = [cls, on]; } } }),
+    });
+    runInNewContext(`${code}; markChatCards();`, {
+      chatOpenName: open,
+      document: { querySelectorAll: () => [btn('a'), btn('b')] },
+    });
+    assert.deepEqual(marks.a, ['chat-active', open === 'a']);
+    assert.deepEqual(marks.b, ['chat-active', open === 'b']);
+  }
 });
