@@ -212,7 +212,7 @@ test('resumable summary uses escaped, keyboard-expandable peek and retains promp
   const context = {
     esc: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'),
     fmtTs: () => '', gitBadge: () => '', pickHtml: () => '', effortLabel: String,
-    ICONS: { refresh: '', trash: '', pin: '' }, copyIdBtn: sid => `data-copy="${sid}"`,
+    ICONS: { refresh: '', trash: '', pin: '', pencil: '' }, copyIdBtn: sid => `data-copy="${sid}"`,
   };
   runInNewContext(`${card}; this.card = resumableCard;`, context);
   const session = { sid: 'one', title: 'Title', prompts: ['Earlier prompt'] };
@@ -1107,4 +1107,37 @@ test('/btw opens the side sheet and is never sent; the menu offers it; aside fra
   assert.ok(submit.indexOf('cdashSheets.btw(') > 0 && submit.indexOf('cdashSheets.btw(') < submit.indexOf('submitText('), submit);
   assert.match(view, /cdashSheets\.onFrame\(/);
   assert.match(readFileSync(new URL('../public/chat/menu.js', import.meta.url), 'utf8'), /name: 'btw'/);
+});
+
+test('cards with a session id offer Rename; terminals and sid-less panes do not', () => {
+  const card = runningCardWith({});
+  const base = { name: 'cdash-a', dir: '/p/proj', uptimeSec: 60, working: false };
+  assert.match(card({ ...base, sid: 's1' }), /data-rename="s1"[^>]*aria-label="Rename session"/);
+  assert.match(card({ ...base, sid: 's1', external: true }), /data-rename="s1"/);
+  assert.doesNotMatch(card(base), /data-rename/);
+  assert.doesNotMatch(card({ ...base, provider: 'terminal' }), /data-rename/);
+  const src = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const res = src.slice(src.indexOf('function resumableCard('), src.indexOf('function renderResumable('));
+  const context = { esc: String, fmtTs: () => '', gitBadge: () => '', pickHtml: () => '', ICONS: {}, copyIdBtn: () => '' };
+  runInNewContext(`${res}; this.card = resumableCard;`, context);
+  assert.match(context.card({ sid: 'one', prompts: [] }, true), /data-rename="one"[^>]*aria-label="Rename session"/);
+});
+
+test('a rename targets the name store of the session\'s own tool', () => {
+  const src = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const code = src.slice(src.indexOf('function renameTarget('), src.indexOf('\n}\n', src.indexOf('function renameTarget(')) + 2);
+  const context = {
+    lastRunning: [{ sid: 'run-c', dir: '/r', displayName: 'Live' }, { sid: 'run-x', dir: '/r', provider: 'codex' }],
+    lastPinned: [{ sid: 'pin-x', dir: '/p', modelId: 'codex', displayName: 'Pinned' }],
+    lastRes: [{ sid: 'ses_o', dir: '/o' }, { sid: 'res-o', dir: '/o', modelId: 'opencode:a/b' }, { sid: 'res-x', dir: '/x', modelId: 'codex:gpt' }, { sid: 'res-c', dir: '/c', modelId: 'opus' }],
+  };
+  runInNewContext(`${code}; this.target = renameTarget;`, context);
+  const t = sid => JSON.parse(JSON.stringify(context.target(sid)));
+  assert.deepEqual(t('run-c'), { sid: 'run-c', tool: 'claude', dir: '/r', name: 'Live' });
+  assert.equal(t('run-x').tool, 'codex');
+  assert.deepEqual(t('pin-x'), { sid: 'pin-x', tool: 'codex', dir: '/p', name: 'Pinned' });
+  assert.equal(t('ses_o').tool, 'opencode');
+  assert.equal(t('res-o').tool, 'opencode');
+  assert.equal(t('res-x').tool, 'codex');
+  assert.equal(t('res-c').tool, 'claude');
 });

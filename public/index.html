@@ -96,6 +96,22 @@
   </div>
 </dialog>
 
+<dialog id="rename" class="dialog" aria-label="Rename session">
+  <form id="rename-form" class="dialog-body">
+    <div class="dialog-head">
+      <h2 class="dialog-title">Rename session</h2>
+      <button id="rename-close" class="icon-btn" type="button" aria-label="Close"></button>
+    </div>
+    <div class="setup-body">
+      <input id="rename-name" class="cb-dir rename-input" maxlength="120" autocomplete="off" spellcheck="false" aria-label="Session name">
+    </div>
+    <div class="setup-foot">
+      <button id="rename-cancel" class="btn-ghost" type="button">Cancel</button>
+      <button class="btn-launch" type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="setup" class="dialog" aria-label="Set up the agent">
   <div class="dialog-body">
     <div class="dialog-head">
