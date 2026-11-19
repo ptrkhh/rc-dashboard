@@ -68,6 +68,15 @@ pub(crate) fn root(ctx: &Ctx) -> PathBuf {
     ctx.claude_dir.join("cdash-opencode")
 }
 
+/// `display_name` from `<sid>.owned.json`; a dashboard rename lands here and beats the snapshot.
+pub async fn owned_name(ctx: &Ctx, sid: &str) -> Option<String> {
+    assert_opencode_sid(sid).ok()?;
+    let owned: serde_json::Value =
+        serde_json::from_str(&read_if(&root(ctx).join(format!("{sid}.owned.json"))).await?).ok()?;
+    if owned["sid"] != sid { return None; }
+    owned["display_name"].as_str().filter(|n| !n.trim().is_empty()).map(str::to_owned)
+}
+
 async fn private_write(path: &Path, contents: &str, suffix: &str) -> Result<(), Refused> {
     write_atomic(path, contents, suffix)
         .await

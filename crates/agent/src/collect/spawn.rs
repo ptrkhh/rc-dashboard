@@ -197,7 +197,11 @@ async fn spawn_claude(
         .map(|pair| pair[1].to_string())
         .map(Ok)
         .unwrap_or_else(super::names::new_sid)?;
-    let display_name = super::names::session_name("Claude", dir, &sid);
+    // A renamed session keeps its name on resume; new sessions have no title file yet.
+    let display_name = match super::lookup::custom_title(&ctx.claude_dir, dir, &sid).await {
+        Some(title) => title,
+        None => super::names::session_name("Claude", dir, &sid),
+    };
 
     // The hook's token reaches Claude through the pane's environment (tmux
     // runs a multi-argument command with execvp, so `$CDASH_HOOK_TOKEN` in the
@@ -677,6 +681,17 @@ mod tests {
         assert!(args.contains(&format!("--resume {SID} --model opus --effort high")), "{args}");
         let m = ctx.meta_get(&name).unwrap();
         assert_eq!((m.model.as_deref(), m.effort.as_deref()), (Some("opus"), Some("high")));
+    }
+
+    #[tokio::test]
+    async fn resume_reuses_a_custom_title_for_remote_control() {
+        let (d, ctx) = ctx_with_history("resume-title").await;
+        let titled = d.join("projects").join(crate::parse::paths::project_dir_name("/tmp")).join(SID);
+        std::fs::create_dir_all(&titled).unwrap();
+        std::fs::write(titled.join("custom-title.json"), r#"{"customTitle":"Brainstorming"}"#).unwrap();
+        resume_session(&ctx, SID, None, None, None).await.unwrap();
+        let args = std::fs::read_to_string(d.join("tmux-args")).unwrap();
+        assert!(args.lines().next().unwrap().ends_with("--remote-control Brainstorming"), "{args}");
     }
 
     #[tokio::test]
