@@ -98,7 +98,7 @@ pub struct CodexSession {
     pub chat_sock: Option<String>,
 }
 
-fn root(ctx: &Ctx) -> PathBuf {
+pub(crate) fn root(ctx: &Ctx) -> PathBuf {
     ctx.claude_dir.join("cdash-codex")
 }
 

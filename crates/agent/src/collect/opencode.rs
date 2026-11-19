@@ -64,7 +64,7 @@ pub struct Thread {
 
 static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn root(ctx: &Ctx) -> PathBuf {
+pub(crate) fn root(ctx: &Ctx) -> PathBuf {
     ctx.claude_dir.join("cdash-opencode")
 }
 
