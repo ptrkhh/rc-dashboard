@@ -15,8 +15,9 @@ session from the dashboard — e.g. `[OpenCode] rc-dashboard · sheep` →
 - The new name shows in the dashboard on the next poll (resumable cards
   already read the per-sid name stores that rename writes; running
   Codex/OpenCode cards are taught to, see Constraints).
-- The name survives resume, and for Claude it lands in the same file Claude
-  Code itself reads, so renames in either direction stay visible.
+- The name survives resume, and for Claude it lands where Claude Code itself
+  records a rename (transcript entry + sidecar), so renames in either
+  direction stay visible.
 
 ## Non-goals
 
@@ -70,12 +71,20 @@ session from the dashboard — e.g. `[OpenCode] rc-dashboard · sheep` →
 
 ## Per-tool behavior (decided)
 
-- **Claude**: write `customTitle` into
+- **Claude**: do what Claude Code's own `saveCustomTitle` does (checked in the
+  2.1.327 binary): append `{"type":"custom-title","customTitle":<name>,"sessionId":<sid>}`
+  as one line to the transcript `projects/<project-slug>/<sid>.jsonl`, then
+  write `{customTitle: string}` into
   `~/.claude/projects/<project-slug>/<sid>/custom-title.json` — the file
   `collect/lookup.rs` already reads and that already beats the generated name.
+  The transcript line is required: Claude's `/resume` list prefers the
+  transcript-tail title and reads the sidecar only when there is none, so a
+  sidecar-only write is invisible inside Claude. Claude's `/resume` picker
+  renames other sessions the same way (append from another process).
   Plus the one-line `spawn.rs` fix so resume reuses an existing custom title.
-  Claude Code 2.1.327 reads this file with the schema `{customTitle: string}`
-  (checked in its binary), so write exactly that.
+  Accepted risk: a *running* Claude re-appends its in-memory title to the
+  transcript at exit/compaction, so Claude's own list can show the old name
+  again after renaming a live session; the dashboard (sidecar) is unaffected.
 - **Codex**: write `~/.claude/cdash-codex/<sid>.name`. The running Codex card
   reads that file by sid before falling back to the snapshot's name, and the
   bridge's `save` stops overwriting an existing `<sid>.name`.
@@ -90,7 +99,7 @@ session from the dashboard — e.g. `[OpenCode] rc-dashboard · sheep` →
 ## UI (decided)
 
 - **Rename** button on the cards next to Pin/Purge (resumable/pinned) and the
-  running card's actions; opens a small dialog (`<dialog class="dialog">`, the
+  running card's actions (only when the card has a sid); opens a small dialog (`<dialog class="dialog">`, the
   folder-picker pattern) with one text input pre-filled with the current name.
   `window.prompt` is unreliable in the Android webview.
 - Validation: trimmed, non-empty, ≤ 120 chars, no control characters; output
@@ -107,8 +116,8 @@ session from the dashboard — e.g. `[OpenCode] rc-dashboard · sheep` →
 
 ## Tests
 
-- Rust: each per-tool store gets written and the name wins over the generated
-  one in collection, for resumable rows *and* running cards (a sidecar name
+- Rust: each per-tool store gets written (Claude: transcript line *and*
+  sidecar) and the name wins over the generated one in collection, for resumable rows *and* running cards (a sidecar name
   beats a `.native` snapshot carrying the old name); the Claude resume path
   reuses a custom title; an OpenCode rename keeps `owned.json`'s `sid`/`dir`.
 - Bridge: Codex `save` leaves an existing `<sid>.name` alone.
