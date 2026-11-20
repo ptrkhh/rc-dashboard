@@ -192,9 +192,11 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
             tr = transcript_for(&ctx.claude_dir, &p.path, p.created).await;
         }
 
-        let (mut working, mut last_message, mut sid) = (false, None, None);
-        if let Some((file, mtime)) = &tr {
-            working = now - mtime < 10_000.0 || super::external::background_busy(file, &rows, p.pid, now).await;
+        let status = sess.as_ref().and_then(|s| s.status.as_deref());
+        let written = tr.as_ref().map(|(file, mtime)| (file.as_path(), *mtime));
+        let working = super::external::claude_working(status, written, &rows, p.pid, now).await;
+        let (mut last_message, mut sid) = (None, None);
+        if let Some((file, _)) = &tr {
             sid = file.file_stem().map(|s| s.to_string_lossy().into_owned());
             if let Some(txt) = read_tail(file).await {
                 last_message = parse_transcript(&txt).last_assistant_text;

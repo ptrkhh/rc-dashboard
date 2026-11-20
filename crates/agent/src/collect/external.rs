@@ -57,11 +57,23 @@ pub struct Session {
     pub chat: bool,
 }
 
+/// The card's Working dot. Claude's own `status` when the session file has
+/// one: `busy` in a turn, `shell` while a background shell outlives it. Unlike
+/// chat's composer (`busy` only), anything but idle or waiting counts here.
+/// Versions without `status` get the guess: a fresh transcript or background work.
+pub(super) async fn claude_working(status: Option<&str>, transcript: Option<(&Path, f64)>, rows: &[ProcRow], pid: i32, now_ms: f64) -> bool {
+    if let Some(s) = status {
+        return !matches!(s, "idle" | "waiting");
+    }
+    let Some((file, mtime)) = transcript else { return false };
+    now_ms - mtime < 10_000.0 || background_busy(file, rows, pid, now_ms).await
+}
+
 /// Claude's turn may be over while a subagent or a background shell still
 /// works for it. Subagents log to `<sid>/subagents/*.jsonl` beside the main
 /// transcript; background shells write stdout to `.../tasks/<id>.output`.
 /// shortcut: shells are found through `/proc`, so macOS misses them; read `lsof` there if needed.
-pub(super) async fn background_busy(transcript: &Path, rows: &[ProcRow], pid: i32, now_ms: f64) -> bool {
+async fn background_busy(transcript: &Path, rows: &[ProcRow], pid: i32, now_ms: f64) -> bool {
     let mut tree = vec![pid];
     let mut i = 0;
     while i < tree.len() {
@@ -150,11 +162,8 @@ pub async fn external_sessions(
                 last_message = parse_transcript(&txt).last_assistant_text;
             }
         }
-        let working = md
-            .as_ref()
-            .map(|m| now_ms - super::cache::mtime_ms(m) < 10_000.0)
-            .unwrap_or(false)
-            || background_busy(&file, rows, pid, now_ms).await;
+        let written = md.as_ref().map(|m| (file.as_path(), super::cache::mtime_ms(m)));
+        let working = claude_working(sess.status.as_deref(), written, rows, pid, now_ms).await;
 
         let usage = {
             let mut s = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner());
@@ -238,6 +247,18 @@ mod tests {
                 rss_kb: 100,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn claude_status_decides_working_and_older_versions_fall_back_to_the_guess() {
+        let t = Path::new("/no-such/s-1.jsonl");
+        for (status, working) in [("busy", true), ("shell", true), ("idle", false), ("waiting", false)] {
+            // A transcript written just now must not override Claude's own word.
+            assert_eq!(claude_working(Some(status), Some((t, 1_000.0)), &[], 1, 1_000.0).await, working, "{status}");
+        }
+        assert!(claude_working(None, Some((t, 1_000.0)), &[], 1, 5_000.0).await, "no status: a fresh transcript");
+        assert!(!claude_working(None, Some((t, 1_000.0)), &[], 1, 60_000.0).await, "no status: a quiet transcript");
+        assert!(!claude_working(None, None, &[], 1, 1_000.0).await, "no status, no transcript");
     }
 
     #[tokio::test]
