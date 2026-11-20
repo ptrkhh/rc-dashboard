@@ -445,7 +445,7 @@ async function supervise(statePath, name) {
       state.sid = session.id;
       await atomic(join(root, `${state.sid}.owned.json`), JSON.stringify({ sid: state.sid, dir: state.dir, display_name: state.display_name }));
     }
-    state.pid = process.pid; state.native_terminal = true; state.working = false; state.rc_unavailable = false;
+    state.pid = process.pid; state.native_terminal = true; state.working = false; state.rc_unavailable = false; state.tasks = 0;
     await atomic(statePath, JSON.stringify(state)); await saveNative();
     // Dashboard chat. Its own state object, so the worker's file is never
     // touched; the `dash:` prefix differs from the sink's sid on purpose, so
@@ -604,7 +604,12 @@ async function supervise(statePath, name) {
     // The running list: shells of the session or its subagents, and the subagents themselves.
     const children = new Map(); // child session id -> title
     const shells = new Map(), subagents = new Map();
-    const publishTasks = () => feed.setTasks([...shells.values(), ...subagents.values()]);
+    // The dashboard card stays Working while a shell or subagent outlives the turn.
+    const publishTasks = () => {
+      feed.setTasks([...shells.values(), ...subagents.values()]);
+      const n = shells.size + subagents.size;
+      if (state.tasks !== n) { state.tasks = n; saveNative().catch(() => {}); }
+    };
     const addShell = info => {
       if (info?.id && info.status === 'running' && (info.metadata?.sessionID === state.sid || children.has(info.metadata?.sessionID)))
         shells.set(info.id, { id: info.id, kind: 'shell', title: info.command, started: new Date(Number.isFinite(Number(info.time?.started)) ? Number(info.time.started) : Date.now()).toISOString() });

@@ -96,14 +96,17 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
         s.sample()
     };
 
-    let mut running: Vec<Session> = Vec::new();
+    // Each card carries its last chat activity (ms) so the list reads like a
+    // messenger inbox: newest conversation first.
+    let mut running: Vec<(f64, Session)> = Vec::new();
     for p in &panes {
+        let launched = p.created as f64 * 1000.0;
         if p.terminal {
             // A bare shell has no transcript, model, or Remote Control link;
             // guessing a Claude transcript from its cwd would mislabel it.
             let cpu = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner()).tree_usage(p.pid);
             let git = Arc::clone(&ctx.git).status_for(Arc::clone(&ctx.runner), &p.path, now as u64);
-            running.push(Session {
+            running.push((launched, Session {
                 display_name: None, name: p.name.clone(), dir: p.path.clone(), pid: p.pid,
                 uptime_sec: ((now / 1000.0 - p.created as f64).round() as i64).max(0),
                 model: Some("Terminal".into()), effort: None, variant: None,
@@ -111,30 +114,34 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
                 rc_link: None, rc_unavailable: true,
                 git: git.as_deref().map(parse_git_status), working: false, last_message: None, sid: None,
                 cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms, external: false, chat: false,
-            });
+            }));
             continue;
         }
         if let Some(s) = super::opencode::snapshot(ctx, &p.name, p.pid).await {
             let renamed = match s.sid.as_deref() { Some(sid) => super::opencode::owned_name(ctx, sid).await, None => None };
+            let active = match s.sid.as_deref() { Some(sid) => super::opencode::last_activity(ctx, sid).await, None => None };
+            let active = active.unwrap_or(s.ts).max(launched);
             let cpu = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner()).tree_usage(p.pid);
             let git = Arc::clone(&ctx.git).status_for(Arc::clone(&ctx.runner), &p.path, now as u64);
-            running.push(Session {
+            running.push((active, Session {
                 display_name: renamed.or(s.display_name).or_else(|| s.sid.as_deref().map(|sid| super::names::session_name("OpenCode", &s.dir, sid))),
                 name: p.name.clone(), dir: s.dir, pid: p.pid,
                 uptime_sec: ((now / 1000.0 - p.created as f64).round() as i64).max(0),
                 model: s.model_label.or(s.model).or_else(|| Some("OpenCode".into())), effort: None, variant: s.variant,
                 provider: Some("opencode".into()), native_terminal: Some(s.native_terminal), browser: false,
                 rc_link: super::opencode::link(ctx, &p.name).await, rc_unavailable: s.rc_unavailable,
-                git: git.as_deref().map(parse_git_status), working: s.working, last_message: s.last_message, sid: s.sid,
+                git: git.as_deref().map(parse_git_status), working: s.working || s.tasks > 0, last_message: s.last_message, sid: s.sid,
                 cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms, external: false, chat: s.chat_sock.is_some(),
-            });
+            }));
             continue;
         }
         if let Some(s) = super::codex::snapshot(ctx, &p.name, p.pid).await {
             let renamed = match s.sid.as_deref() { Some(sid) => super::codex::sid_name(ctx, sid).await, None => None };
+            let active = match s.sid.as_deref() { Some(sid) => super::codex::last_activity(ctx, sid).await, None => None };
+            let active = active.unwrap_or(s.ts).max(launched);
             let cpu = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner()).tree_usage(p.pid);
             let git = Arc::clone(&ctx.git).status_for(Arc::clone(&ctx.runner), &p.path, now as u64);
-            running.push(Session {
+            running.push((active, Session {
                 display_name: renamed.or(s.display_name).or_else(|| s.sid.as_deref().map(|sid| super::names::session_name("Codex", &s.dir, sid))),
                 name: p.name.clone(), dir: s.dir, pid: p.pid,
                 uptime_sec: ((now / 1000.0 - p.created as f64).round() as i64).max(0),
@@ -143,11 +150,11 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
                 native_terminal: Some(s.native_terminal), browser: false,
                 rc_link: super::codex::link(ctx, &p.name).await,
                 rc_unavailable: s.rc_unavailable,
-                git: git.as_deref().map(parse_git_status), working: s.working,
+                git: git.as_deref().map(parse_git_status), working: s.working || s.tasks > 0,
                 last_message: s.last_message, sid: s.sid,
                 cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms,
                 external: false, chat: s.native_terminal && s.chat_sock.is_some(),
-            });
+            }));
             continue;
         }
         let meta = ctx.meta_get(&p.name).unwrap_or_default();
@@ -185,9 +192,11 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
             tr = transcript_for(&ctx.claude_dir, &p.path, p.created).await;
         }
 
-        let (mut working, mut last_message, mut sid) = (false, None, None);
-        if let Some((file, mtime)) = &tr {
-            working = now - mtime < 10_000.0;
+        let status = sess.as_ref().and_then(|s| s.status.as_deref());
+        let written = tr.as_ref().map(|(file, mtime)| (file.as_path(), *mtime));
+        let working = super::external::claude_working(status, written, &rows, p.pid, now).await;
+        let (mut last_message, mut sid) = (None, None);
+        if let Some((file, _)) = &tr {
             sid = file.file_stem().map(|s| s.to_string_lossy().into_owned());
             if let Some(txt) = read_tail(file).await {
                 last_message = parse_transcript(&txt).last_assistant_text;
@@ -214,7 +223,8 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
         // No link by the end of the launch's link-poll window: Remote Control
         // is not coming, so say so instead of "Waiting for link" forever.
         let rc_window = (super::spawn::RC_POLL_INTERVAL * super::spawn::RC_POLL_ATTEMPTS).as_secs() as i64;
-        running.push(Session {
+        let active = tr.as_ref().map_or(launched, |(_, mtime)| mtime.max(launched));
+        running.push((active, Session {
             display_name,
             name: p.name.clone(),
             dir: p.path.clone(),
@@ -237,8 +247,11 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
             cpu_sample_age_ms: cpu_state.cpu_sample_age_ms,
             external: false,
             chat: true,
-        });
+        }));
     }
+    // Stable: equal times keep tmux's name order instead of flickering.
+    running.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut running: Vec<Session> = running.into_iter().map(|(_, s)| s).collect();
 
     // Match /api/browser: the first pane per session supplies the directory.
     let mut seen = HashSet::new();
@@ -657,6 +670,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_cards_are_ordered_by_latest_chat_activity() {
+        let d = tempdir("activity-order");
+        std::fs::write(d.join("history.jsonl"), "").unwrap();
+        std::fs::write(d.join("sessions/4242.json"), r#"{"sessionId":"s-9","cwd":"/proj"}"#).unwrap();
+        let projects = d.join("projects").join(project_dir_name("/proj"));
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("s-9.jsonl"), "").unwrap(); // just touched: the newest chat
+        // tmux lists by name (a, b, c); the oldest launch talked last.
+        let path = fake_tmux(&d, "cdash-a-1200-abc|4242|1785050000||/proj\n\
+                                 cdash-b-1200-abc|4343|1785050100|terminal|/proj\n\
+                                 cdash-c-1200-abc|4444|1785050200|terminal|/proj");
+        let r = collect_sessions(&ctx_with_path(d, path), RESUMABLE_MAX).await;
+        let names: Vec<_> = r.running.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["cdash-a-1200-abc", "cdash-c-1200-abc", "cdash-b-1200-abc"]);
+    }
+
+    #[tokio::test]
     async fn a_claude_pane_with_no_link_after_the_poll_window_reports_remote_control_unavailable() {
         let d = tempdir("rc-unavailable");
         std::fs::write(d.join("history.jsonl"), "").unwrap();
@@ -844,10 +874,11 @@ mod tests {
         *ctx.opencode_threads.lock().await = Some((std::time::Instant::now(), serde_json::from_value(serde_json::json!([])).unwrap()));
 
         let r = collect_sessions(&ctx, RESUMABLE_MAX).await;
-        assert_eq!(r.running[0].dir, "/saved", "the card shows the provider's saved dir");
-        assert!(r.running[0].browser, "the flag follows the pane path /proj");
-        assert!(!r.running[1].browser, "an unmapped pane has no flag");
-        assert!(!r.running[2].browser, "the route resolves a split session to its first pane");
+        let card = |pid| r.running.iter().find(|s| s.pid == pid).unwrap();
+        assert_eq!(card(4242).dir, "/saved", "the card shows the provider's saved dir");
+        assert!(card(4242).browser, "the flag follows the pane path /proj");
+        assert!(!card(4243).browser, "an unmapped pane has no flag");
+        assert!(!card(4244).browser, "the route resolves a split session to its first pane");
     }
 
     #[test]

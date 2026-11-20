@@ -37,6 +37,9 @@ pub struct OpenCodeSession {
     pub native_terminal: bool,
     #[serde(default)]
     pub working: bool,
+    /// Background shells and subagents still running, as the supervisor counts them.
+    #[serde(default)]
+    pub tasks: usize,
     #[serde(default)]
     pub rc_unavailable: bool,
     #[serde(default)]
@@ -248,20 +251,28 @@ async fn threads(ctx: &Ctx) -> Result<Vec<Thread>, Refused> {
     .map_err(|_| Refused::Failed("Invalid OpenCode history".into()))
 }
 
+async fn cached_threads(ctx: &Ctx) -> Vec<Thread> {
+    let mut cache = ctx.opencode_threads.lock().await;
+    if let Some((_, rows)) = cache
+        .as_ref()
+        .filter(|(when, _)| when.elapsed() < Duration::from_secs(10))
+    {
+        rows.clone()
+    } else {
+        let rows = threads(ctx).await.unwrap_or_default();
+        *cache = Some((Instant::now(), rows.clone()));
+        rows
+    }
+}
+
+/// OpenCode keeps every chat in one database, so there is no per-chat file to
+/// stat; its own `time.updated` for the session is the equivalent signal.
+pub async fn last_activity(ctx: &Ctx, sid: &str) -> Option<f64> {
+    cached_threads(ctx).await.into_iter().find(|t| t.sid == sid).map(|t| t.ts).filter(|ts| *ts > 0.0)
+}
+
 pub async fn history(ctx: &Ctx, limit: usize) -> Vec<Resumable> {
-    let rows = {
-        let mut cache = ctx.opencode_threads.lock().await;
-        if let Some((_, rows)) = cache
-            .as_ref()
-            .filter(|(when, _)| when.elapsed() < Duration::from_secs(10))
-        {
-            rows.clone()
-        } else {
-            let rows = threads(ctx).await.unwrap_or_default();
-            *cache = Some((Instant::now(), rows.clone()));
-            rows
-        }
-    };
+    let rows = cached_threads(ctx).await;
     rows.into_iter()
         .filter(|t| assert_opencode_sid(&t.sid).is_ok())
         .take(limit.min(100))

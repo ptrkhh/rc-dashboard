@@ -87,6 +87,9 @@ pub struct CodexSession {
     pub sid: Option<String>,
     #[serde(default)]
     pub working: bool,
+    /// Background shells and subagents still running, as the supervisor counts them.
+    #[serde(default)]
+    pub tasks: usize,
     pub last_message: Option<String>,
     #[serde(default)]
     pub ts: f64,
@@ -392,20 +395,33 @@ pub async fn resume(
 /// node, which is real work on a phone host at a 4s poll.
 const THREADS_TTL: Duration = Duration::from_secs(10);
 
-pub async fn history(ctx: &Ctx) -> Vec<Resumable> {
-    let rows = {
-        let mut cache = ctx.codex_threads.lock().await;
-        match cache.as_ref().filter(|(when, _)| when.elapsed() < THREADS_TTL) {
-            Some((_, rows)) => rows.clone(),
-            None => {
-                // An unreadable Codex means no Codex rows, and is cached like a
-                // good answer so a broken install is not retried every poll.
-                let rows = threads(ctx).await.unwrap_or_default();
-                *cache = Some((Instant::now(), rows.clone()));
-                rows
-            }
+async fn cached_threads(ctx: &Ctx) -> Vec<Thread> {
+    let mut cache = ctx.codex_threads.lock().await;
+    match cache.as_ref().filter(|(when, _)| when.elapsed() < THREADS_TTL) {
+        Some((_, rows)) => rows.clone(),
+        None => {
+            // An unreadable Codex means no Codex rows, and is cached like a
+            // good answer so a broken install is not retried every poll.
+            let rows = threads(ctx).await.unwrap_or_default();
+            *cache = Some((Instant::now(), rows.clone()));
+            rows
         }
+    }
+}
+
+/// When Codex last wrote this thread's rollout file: the same signal as a
+/// Claude transcript's mtime. None for a thread Codex does not list yet.
+pub async fn last_activity(ctx: &Ctx, sid: &str) -> Option<f64> {
+    let t = cached_threads(ctx).await.into_iter().find(|t| t.sid == sid)?;
+    let written = match &t.rollout_path {
+        Some(p) => tokio::fs::metadata(p).await.ok().map(|m| super::cache::mtime_ms(&m)),
+        None => None,
     };
+    Some(written.unwrap_or(t.ts))
+}
+
+pub async fn history(ctx: &Ctx) -> Vec<Resumable> {
+    let rows = cached_threads(ctx).await;
     // Labels only from a catalog already fetched: the poll must never wait on one.
     let catalog = ctx
         .codex_models
@@ -524,6 +540,23 @@ mod tests {
         state.sid = Some("other-thread".into());
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
         assert_eq!(snapshot(&ctx, "cdash-test", 42).await.unwrap().model.as_deref(), Some("old"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn last_activity_is_the_rollout_mtime_like_a_claude_transcript() {
+        let (dir, ctx) = codex_ctx("activity");
+        let rollout = dir.join("rollout.jsonl");
+        std::fs::write(&rollout, "").unwrap();
+        let thread = |rollout: Option<&std::path::Path>| -> Vec<Thread> {
+            serde_json::from_value(serde_json::json!([{ "sid": SID, "dir": "/tmp", "ts": 5.0, "rollout_path": rollout }])).unwrap()
+        };
+        *ctx.codex_threads.lock().await = Some((Instant::now(), thread(Some(&rollout))));
+        let written = super::super::cache::mtime_ms(&std::fs::metadata(&rollout).unwrap());
+        assert_eq!(last_activity(&ctx, SID).await, Some(written));
+        *ctx.codex_threads.lock().await = Some((Instant::now(), thread(None)));
+        assert_eq!(last_activity(&ctx, SID).await, Some(5.0), "no rollout: Codex's own updated_at");
+        assert_eq!(last_activity(&ctx, "unknown").await, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

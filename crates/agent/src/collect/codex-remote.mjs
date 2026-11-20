@@ -578,6 +578,7 @@ async function nativeLauncher(statePath, state, script) {
   let usage = { cwd: state.dir, model: state.model, context: null, tokens: null, cost: null };
   const openRequests = new Set(); // ids of server requests not yet resolved
   const running = new Map(), children = new Map(); // id -> task; thread id -> { agent, title }
+  state.tasks = 0; // a count saved by an earlier supervisor is not ours
   // A side question: { id, child, turnId, item, cancelled, closed }. `asking` holds it by question id from the
   // moment it is asked; `sides` by its thread, kept once closed so the thread's late notifications are still dropped.
   // ponytail: `sides` keeps one small entry per side question for the session's life.
@@ -604,7 +605,11 @@ async function nativeLauncher(statePath, state, script) {
       if (!side.cancelled) feed.pushAside(side.id, '', true, e.message);
     }
   };
-  const publishTasks = () => feed.setTasks([...running.values()]);
+  // The dashboard card stays Working while a shell or subagent outlives the turn.
+  const publishTasks = () => {
+    feed.setTasks([...running.values()]);
+    if (state.tasks !== running.size) { state.tasks = running.size; saveNative().catch(() => {}); }
+  };
   const publishSettings = () => feed.setSettings({ model: state.model, effort: state.effort, plan, agent: null, variant: null });
   const modelList = async () => models ??= await control.models();
   let skillCache = null, skillsAt = 0;
