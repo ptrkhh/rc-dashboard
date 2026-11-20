@@ -21,3 +21,4 @@ pub mod names;
 pub mod summaries;
 
 pub mod opencode;
+pub mod rename;

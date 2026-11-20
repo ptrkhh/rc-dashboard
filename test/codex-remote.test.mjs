@@ -232,6 +232,8 @@ createInterface({input:process.stdin}).on('line',line=>{
   for (const m of (await messages()).filter(m => ['turn/start','turn/steer'].includes(m.rpc?.method)))
     assert.match(m.rpc.params.clientUserMessageId, /^[0-9a-f-]{36}$/i);
   await stop();
+  const sidName = join(dir, '01234567-1234-1234-1234-0123456789ab.name');
+  await writeFile(sidName, 'Renamed'); // a dashboard rename while the worker was down
   const before = (await messages()).length;
   output = ''; start();
   await waitFor(async () => (await messages()).slice(before).some(m => m.url?.includes('from_sequence_num=12')));
@@ -273,6 +275,7 @@ createInterface({input:process.stdin}).on('line',line=>{
     {threadId:'01234567-1234-1234-1234-0123456789ab',limit:50,sortDirection:'asc',itemsView:'full',cursor:'next-turn'},
   ]);
   await waitFor(async () => JSON.parse(await readFile(state, 'utf8')).remote_sequence === 2);
+  assert.equal(await readFile(sidName, 'utf8'), 'Renamed', 'restarted workers must not overwrite a renamed sidecar');
   assert.equal((await messages()).slice(historyStart).some(m => ['turn/start','turn/steer'].includes(m.rpc?.method)), false, 'uploaded user history must never become a new prompt');
   await stop();
   const historyRestart = (await messages()).length;

@@ -42,6 +42,7 @@ const ICONS = {
   folder: svg('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   chevronRight: svg('<path d="M9 6l6 6-6 6"/>'),
   clock: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
+  pencil: svg('<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M14 6l4 4"/>'),
   pin: svg('<path d="M16 3l5 5-4 1-3 5v3l-7-7h3l5-3zM3 21l6-6"/>'),
   star: svg('<path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.7l5.9-.9z"/>'),
   bell: svg('<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>'),
@@ -351,6 +352,8 @@ function runningCard(r) {
   // The session's Chromium tab, shown only while its configured debugging port answers.
   const browserBtn = r.browser
     ? `<button class="action" type="button" data-browser="${esc(r.name)}" data-title="${title}">${ICONS.globe}<span>Browser</span></button>` : '';
+  const rename = r.sid
+    ? `<button class="action ghost" type="button" data-rename="${esc(r.sid)}" title="Rename session" aria-label="Rename session">${ICONS.pencil}</button>` : '';
   return `
     <div class="session ${status} ${r.external ? 'external' : ''}">
       <div class="session-head">
@@ -364,7 +367,7 @@ function runningCard(r) {
         <span class="time">${fmtUp(r.uptimeSec)}</span>
       </div>
       ${peek}
-      <div class="actions actions-stack">${[chatBtn + rc, termBtn + browserBtn + copyIdBtn(r.sid) + kill].filter(Boolean).map(row => `<div class="actions-row">${row}</div>`).join('')}</div>
+      <div class="actions actions-stack">${[chatBtn + rc, termBtn + browserBtn + copyIdBtn(r.sid) + rename + kill].filter(Boolean).map(row => `<div class="actions-row">${row}</div>`).join('')}</div>
     </div>`;
 }
 
@@ -439,6 +442,7 @@ function resumableCard(s, pinned = false) {
       <div class="actions">
         <button class="action" type="button" data-resume="${esc(s.sid)}">${ICONS.refresh}<span>Resume</span></button>
         ${copyIdBtn(s.sid)}
+        <button class="action ghost" type="button" data-rename="${esc(s.sid)}" title="Rename session" aria-label="Rename session">${ICONS.pencil}</button>
         <button class="action pin" type="button" data-pin="${esc(s.sid)}" aria-pressed="${pinned}">${ICONS.pin}<span>${pinned ? 'Unpin' : 'Pin'}</span></button>
         <button class="action ghost" type="button" data-purge="${esc(s.sid)}" aria-label="Purge from list">${ICONS.trash}</button>
       </div>
@@ -523,7 +527,7 @@ document.body.addEventListener('click', async e => {
   if (c) { copyText(c.dataset.copy); return; }
   const ch = e.target.closest('[data-chat]');
   if (ch) { openChat(ch.dataset.chat, ch.dataset.title); return; }
-  const el = e.target.closest('[data-kill],[data-resume],[data-purge],[data-more],[data-pin]');
+  const el = e.target.closest('[data-kill],[data-resume],[data-purge],[data-more],[data-pin],[data-rename]');
   if (!el) return;
   try {
     if (el.dataset.more !== undefined) { resLimit += 20; poll(); }
@@ -538,6 +542,8 @@ document.body.addEventListener('click', async e => {
       const selection = resumePayload([...lastPinned, ...lastRes].find(s => s.sid === el.dataset.resume) || { sid: el.dataset.resume });
       try { await api('/api/resume', selection); delete picks[el.dataset.resume]; poll(); }
       finally { el.disabled = false; }
+    } else if (el.dataset.rename) {
+      openRename(el.dataset.rename);
     } else if (el.dataset.purge) {
       if (lastPinned.some(s => s.sid === el.dataset.purge)) await api('/api/pin', { sid: el.dataset.purge, pinned: false });
       await api('/api/purge', { sid: el.dataset.purge }); poll();
@@ -1267,6 +1273,37 @@ $('#launcher').addEventListener('submit', async e => {
   try { await api('/api/launch', { dir, ...selection }); $('#dir').value = ''; poll(); }
   catch (err) { toast(err.message); poll(); } // re-arm even when the launch failed
   finally { btn.disabled = false; btn.innerHTML = `${ICONS.play}<span>Launch</span>`; }
+});
+
+/* ---------- Rename dialog ----------
+   window.prompt is unreliable in the Android webview, hence a <dialog>. */
+// Which name store a rename writes. History rows mark their tool like pickState does.
+function renameTarget(sid) {
+  const live = lastRunning.find(r => r.sid === sid);
+  if (live) return { sid, tool: live.provider || 'claude', dir: live.dir, name: live.displayName || '' };
+  const s = [...lastPinned, ...lastRes].find(r => r.sid === sid) || {};
+  const tool = s.modelId?.startsWith('opencode:') || sid.startsWith('ses_') ? 'opencode'
+    : s.modelId?.startsWith('codex') ? 'codex' : 'claude';
+  return { sid, tool, dir: s.dir || '', name: s.displayName || '' };
+}
+const renameDlg = $('#rename');
+let renaming = null;
+function openRename(sid) {
+  renaming = renameTarget(sid);
+  $('#rename-name').value = renaming.name;
+  renameDlg.showModal();
+}
+$('#rename-close').innerHTML = ICONS.x;
+$('#rename-close').onclick = $('#rename-cancel').onclick = () => renameDlg.close();
+renameDlg.addEventListener('click', e => { if (e.target === renameDlg) renameDlg.close(); }); // backdrop
+$('#rename-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const name = $('#rename-name').value.trim();
+  if (!name || [...name].length > 120 || /[\u0000-\u001f\u007f-\u009f]/.test(name)) {
+    toast('Name must be 1–120 characters, no control characters'); return;
+  }
+  try { await api('/api/rename', { ...renaming, name }); renameDlg.close(); poll(); }
+  catch (err) { toast(err.message); }
 });
 
 /* ---------- Folder picker ----------

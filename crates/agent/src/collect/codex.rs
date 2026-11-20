@@ -98,7 +98,7 @@ pub struct CodexSession {
     pub chat_sock: Option<String>,
 }
 
-fn root(ctx: &Ctx) -> PathBuf {
+pub(crate) fn root(ctx: &Ctx) -> PathBuf {
     ctx.claude_dir.join("cdash-codex")
 }
 
@@ -150,10 +150,16 @@ async fn threads(ctx: &Ctx) -> Result<Vec<Thread>, String> {
         .map_err(|e| format!("Codex threads: {e}"))?;
     for thread in &mut rows {
         if assert_valid_sid(&thread.sid).is_ok() {
-            thread.display_name = read_if(&root(ctx).join(format!("{}.name", thread.sid))).await;
+            thread.display_name = sid_name(ctx, &thread.sid).await;
         }
     }
     Ok(rows)
+}
+
+/// The per-sid name sidecar; a dashboard rename lands here and beats the snapshot.
+pub async fn sid_name(ctx: &Ctx, sid: &str) -> Option<String> {
+    assert_valid_sid(sid).ok()?;
+    read_if(&root(ctx).join(format!("{sid}.name"))).await.filter(|n| !n.trim().is_empty())
 }
 
 pub async fn link(ctx: &Ctx, name: &str) -> Option<String> {
