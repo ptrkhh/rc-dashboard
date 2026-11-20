@@ -119,8 +119,8 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
         }
         if let Some(s) = super::opencode::snapshot(ctx, &p.name, p.pid).await {
             let renamed = match s.sid.as_deref() { Some(sid) => super::opencode::owned_name(ctx, sid).await, None => None };
-            // `ts` only moves when a turn ends, so a working session is active now.
-            let active = if s.working { now } else { s.ts.max(launched) };
+            let active = match s.sid.as_deref() { Some(sid) => super::opencode::last_activity(ctx, sid).await, None => None };
+            let active = active.unwrap_or(s.ts).max(launched);
             let cpu = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner()).tree_usage(p.pid);
             let git = Arc::clone(&ctx.git).status_for(Arc::clone(&ctx.runner), &p.path, now as u64);
             running.push((active, Session {
@@ -137,7 +137,8 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
         }
         if let Some(s) = super::codex::snapshot(ctx, &p.name, p.pid).await {
             let renamed = match s.sid.as_deref() { Some(sid) => super::codex::sid_name(ctx, sid).await, None => None };
-            let active = if s.working { now } else { s.ts.max(launched) };
+            let active = match s.sid.as_deref() { Some(sid) => super::codex::last_activity(ctx, sid).await, None => None };
+            let active = active.unwrap_or(s.ts).max(launched);
             let cpu = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner()).tree_usage(p.pid);
             let git = Arc::clone(&ctx.git).status_for(Arc::clone(&ctx.runner), &p.path, now as u64);
             running.push((active, Session {
