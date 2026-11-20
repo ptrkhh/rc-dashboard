@@ -57,6 +57,37 @@ pub struct Session {
     pub chat: bool,
 }
 
+/// Claude's turn may be over while a subagent or a background shell still
+/// works for it. Subagents log to `<sid>/subagents/*.jsonl` beside the main
+/// transcript; background shells write stdout to `.../tasks/<id>.output`.
+/// shortcut: shells are found through `/proc`, so macOS misses them; read `lsof` there if needed.
+pub(super) async fn background_busy(transcript: &Path, rows: &[ProcRow], pid: i32, now_ms: f64) -> bool {
+    let mut tree = vec![pid];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        tree.extend(rows.iter().filter(|r| r.ppid == parent).map(|r| r.pid));
+        i += 1;
+    }
+    let task_output = |child: &i32| {
+        std::fs::read_link(format!("/proc/{child}/fd/1")).is_ok_and(|out| {
+            out.extension().is_some_and(|e| e == "output") && out.parent().is_some_and(|d| d.ends_with("tasks"))
+        })
+    };
+    if tree[1..].iter().any(task_output) {
+        return true;
+    }
+    let Ok(mut subagents) = tokio::fs::read_dir(transcript.with_extension("").join("subagents")).await else {
+        return false;
+    };
+    while let Ok(Some(e)) = subagents.next_entry().await {
+        if e.metadata().await.is_ok_and(|m| now_ms - super::cache::mtime_ms(&m) < 10_000.0) {
+            return true;
+        }
+    }
+    false
+}
+
 fn basename(p: &str) -> String {
     Path::new(p)
         .file_name()
@@ -122,7 +153,8 @@ pub async fn external_sessions(
         let working = md
             .as_ref()
             .map(|m| now_ms - super::cache::mtime_ms(m) < 10_000.0)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || background_busy(&file, rows, pid, now_ms).await;
 
         let usage = {
             let mut s = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner());
@@ -206,6 +238,30 @@ mod tests {
                 rss_kb: 100,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_running_subagent_or_background_shell_keeps_the_session_busy() {
+        let d = tempdir("busy");
+        let transcript = d.join("s-1.jsonl");
+        let now = super::super::cache::mtime_ms(&std::fs::metadata(&d).unwrap()) + 1_000.0;
+        assert!(!background_busy(&transcript, &[], 1, now).await, "nothing running");
+
+        std::fs::create_dir_all(d.join("s-1/subagents")).unwrap();
+        std::fs::write(d.join("s-1/subagents/agent-a.jsonl"), "").unwrap();
+        let now = super::super::cache::mtime_ms(&std::fs::metadata(d.join("s-1/subagents/agent-a.jsonl")).unwrap());
+        assert!(background_busy(&transcript, &[], 1, now + 1_000.0).await, "a subagent wrote just now");
+        assert!(!background_busy(&transcript, &[], 1, now + 60_000.0).await, "a quiet subagent is done");
+
+        std::fs::create_dir_all(d.join("tasks")).unwrap();
+        let ctx = ctx_for(d.clone());
+        let out = d.join("tasks/b1.output").to_string_lossy().into_owned();
+        let pid = ctx.runner.run("sh", &["-c", "sleep 5 >\"$0\" 2>&1 & echo $!", &out], "test shell").await;
+        let pid: i32 = pid.trim().parse().unwrap();
+        let tree = [ProcRow { pid, ppid: 1, name: "sleep".into(), cpu: 0.0, rss_kb: 0 }];
+        let busy = background_busy(&transcript, &tree, 1, now + 60_000.0).await;
+        ctx.runner.run("kill", &[&pid.to_string()], "test kill").await;
+        assert!(busy, "a child writing to tasks/*.output is a background shell");
     }
 
     const CLI: &str = r#"{"sessionId":"s-1","cwd":"/proj","entrypoint":"cli","startedAt":1000,"name":"api"}"#;
