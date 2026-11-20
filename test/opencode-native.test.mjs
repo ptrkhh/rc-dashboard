@@ -512,9 +512,11 @@ test('OpenCode facts: usage, running shells and subagents', { timeout: 20000 }, 
   assert.deepEqual(c.lines.findLast(l => l.t === 'usage').usage, { cwd: f.dir, model: 'fixture/model', context: { used: 50, window: 200000 },
     tokens: { input: 10, output: 6, cache_read: 100, cache_write: 20 }, cost: 0.42 });
   assert.deepEqual(c.lines.findLast(l => l.t === 'tasks').tasks.map(x => [x.id, x.kind, x.title]), [['sh_1', 'shell', 'sleep 60'], ['ses_child', 'agent', 'Explore the repo']]);
+  await f.wait(() => f.native()?.tasks === 2); // the dashboard card reads this
   await f.emit({ type: 'shell.exited', data: { id: 'sh_1', status: 'exited' } });
   await f.emit({ type: 'session.execution.succeeded', data: { sessionID: 'ses_child' } });
   await until(() => c.lines.findLast(l => l.t === 'tasks').tasks.length === 0);
+  await f.wait(() => f.native()?.tasks === 0);
   await f.emit({ type: 'session.usage.updated', data: { sessionID: 'ses_fixture', cost: 0.5, tokens: { input: 20, output: 5, reasoning: 0, cache: { read: 100, write: 20 } } } });
   await until(() => c.lines.findLast(l => l.t === 'usage').usage.cost === 0.5);
 });

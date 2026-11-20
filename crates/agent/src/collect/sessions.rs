@@ -130,7 +130,7 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
                 model: s.model_label.or(s.model).or_else(|| Some("OpenCode".into())), effort: None, variant: s.variant,
                 provider: Some("opencode".into()), native_terminal: Some(s.native_terminal), browser: false,
                 rc_link: super::opencode::link(ctx, &p.name).await, rc_unavailable: s.rc_unavailable,
-                git: git.as_deref().map(parse_git_status), working: s.working, last_message: s.last_message, sid: s.sid,
+                git: git.as_deref().map(parse_git_status), working: s.working || s.tasks > 0, last_message: s.last_message, sid: s.sid,
                 cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms, external: false, chat: s.chat_sock.is_some(),
             }));
             continue;
@@ -150,7 +150,7 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
                 native_terminal: Some(s.native_terminal), browser: false,
                 rc_link: super::codex::link(ctx, &p.name).await,
                 rc_unavailable: s.rc_unavailable,
-                git: git.as_deref().map(parse_git_status), working: s.working,
+                git: git.as_deref().map(parse_git_status), working: s.working || s.tasks > 0,
                 last_message: s.last_message, sid: s.sid,
                 cpu: cpu.cpu, rss_kb: cpu.rss_kb, cpu_sample_age_ms: cpu.cpu_sample_age_ms,
                 external: false, chat: s.native_terminal && s.chat_sock.is_some(),

@@ -87,6 +87,9 @@ pub struct CodexSession {
     pub sid: Option<String>,
     #[serde(default)]
     pub working: bool,
+    /// Background shells and subagents still running, as the supervisor counts them.
+    #[serde(default)]
+    pub tasks: usize,
     pub last_message: Option<String>,
     #[serde(default)]
     pub ts: f64,

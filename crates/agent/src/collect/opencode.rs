@@ -37,6 +37,9 @@ pub struct OpenCodeSession {
     pub native_terminal: bool,
     #[serde(default)]
     pub working: bool,
+    /// Background shells and subagents still running, as the supervisor counts them.
+    #[serde(default)]
+    pub tasks: usize,
     #[serde(default)]
     pub rc_unavailable: bool,
     #[serde(default)]
