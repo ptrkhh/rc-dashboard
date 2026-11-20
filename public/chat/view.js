@@ -740,6 +740,8 @@
     open,
     close,
     isOpen: () => !!c,
+    // opts is shared with the Terminal button's handler, so it picks the new title up too.
+    retitle: title => { if (c) { c.opts.title = title; $('#chat-title').textContent = title; } },
     name: () => c?.opts.name ?? null,
   };
 })(typeof globalThis === 'undefined' ? this : globalThis);

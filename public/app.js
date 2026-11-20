@@ -509,6 +509,7 @@ function render(d) {
   }
   lastRes = d.resumable;
   lastRunning = d.running;
+  retitleOverlays();
   listed = true;
   lastPinned = d.pinned || [];
   // Same rule for the pickers: re-rendering would snap an open menu shut.
@@ -1126,6 +1127,17 @@ let chatOpenName = null; // the session whose chat overlay is open; its running 
 
 // render() repaints the grid on every poll, so the highlight rides along there;
 // opening and closing apply it immediately, as polling pauses full-screen.
+// A rename lands on the next poll; overlays already open take the new headline too.
+function retitleOverlays() {
+  const title = name => { const r = lastRunning.find(r => r.name === name); return r && (r.displayName || r.dir.split('/').pop()); };
+  const chat = chatOpenName && title(chatOpenName);
+  if (chat) cdashChat.retitle(chat);
+  const t = term && title(term.name);
+  if (t) $('#term-title').textContent = t;
+  const b = browserView && title(browserView.name);
+  if (b) $('#browser-title').textContent = `Browser · ${b}`;
+}
+
 function markChatCards() {
   for (const b of document.querySelectorAll('#running [data-chat]'))
     b.closest('.session')?.classList?.toggle('chat-active', b.dataset.chat === chatOpenName);

@@ -18,7 +18,7 @@ function statsRenderer() {
     esc: s => s, fmtKb: String, fmtReset: String,
     runningCard: () => '', resumableCard: () => '',
     resLimit: 20, lastRes: [], lastPinned: [],
-    markChatCards: () => {},
+    markChatCards: () => {}, retitleOverlays: () => {},
   };
   runInNewContext(`${statTile}\n${render}; this.render = render;`, context);
   return stats => {
@@ -458,7 +458,7 @@ test('a newly running conversation leaves inactive sections without disturbing a
     lastPinned: [{ sid: 'one' }], lastRes: [],
     esc: String, fmtKb: String, runningCard: () => '',
     statTile: () => '', renderResumable: () => { painted = true; },
-    markChatCards: () => {},
+    markChatCards: () => {}, retitleOverlays: () => {},
   };
   let removed = false;
   const card = { parentElement: { id: 'pinned', querySelector: () => null }, remove: () => { removed = true; } };
@@ -1177,4 +1177,23 @@ test('a rename targets the name store of the session\'s own tool', () => {
   assert.equal(t('res-o').tool, 'opencode');
   assert.equal(t('res-x').tool, 'codex');
   assert.equal(t('res-c').tool, 'claude');
+});
+
+test('open overlays take a session\'s new name on the next poll', () => {
+  const src = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const code = src.slice(src.indexOf('function retitleOverlays('), src.indexOf('\n}\n', src.indexOf('function retitleOverlays(')) + 2);
+  const els = { '#term-title': { textContent: 'old' }, '#browser-title': { textContent: 'old' } };
+  let chat = 'old';
+  const context = {
+    $: id => els[id], cdashChat: { retitle: t => { chat = t; } },
+    lastRunning: [{ name: 'cdash-a', dir: '/p/proj', displayName: 'Renamed' }, { name: 'cdash-b', dir: '/p/bare' }],
+    chatOpenName: 'cdash-a', term: { name: 'cdash-b' }, browserView: { name: 'cdash-a' },
+  };
+  runInNewContext(`${code}; retitleOverlays();`, context);
+  assert.equal(chat, 'Renamed');
+  assert.equal(els['#term-title'].textContent, 'bare', 'no custom name: the folder, as the card shows');
+  assert.equal(els['#browser-title'].textContent, 'Browser · Renamed');
+  chat = 'kept';
+  runInNewContext(`${code}; retitleOverlays();`, { ...context, chatOpenName: 'gone', term: null, browserView: null });
+  assert.equal(chat, 'kept', 'an ended session leaves the open overlay alone');
 });
