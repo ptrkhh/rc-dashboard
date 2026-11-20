@@ -298,6 +298,8 @@ button, input, select { font: inherit; }
 .session.resumable { background: var(--surface-2); box-shadow: var(--shadow-sm); }
 .session.resumable::before { background: var(--border-strong); }
 .session.pinned::before { background: var(--accent); }
+/* The card whose chat is open in the overlay beside the grid. */
+.session.chat-active { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring); }
 
 .session-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 /* Title + branch + tag share one truncating group so the status pill always

@@ -322,6 +322,8 @@ const copyIdBtn = sid => sid
 
 function runningCard(r) {
   const status = r.working ? 'working' : 'idle';
+  // The headline doubles as the header of the chat, terminal and browser overlays.
+  const title = esc(r.displayName || r.dir.split('/').pop());
   const chips = [r.model, r.effort && effortLabel(r.effort), r.variant && `Variant: ${r.variant}`].filter(Boolean);
   const chipHtml = chips.length
     ? chips.map(x => `<span class="chip">${esc(x)}</span>`).join('')
@@ -330,7 +332,7 @@ function runningCard(r) {
     ? `<div class="peek" onclick="this.classList.toggle('open')"><span class="peek-text">${esc(r.lastMessage)}</span></div>` : '';
   // Chat leads where the agent can serve it; Open in Claude stays beside it.
   const chatBtn = r.chat
-    ? `<button class="action primary" type="button" data-chat="${esc(r.name)}" data-title="${esc(r.dir.split('/').pop())}">${ICONS.chat}<span>Chat</span></button>` : '';
+    ? `<button class="action primary" type="button" data-chat="${esc(r.name)}" data-title="${title}">${ICONS.chat}<span>Chat</span></button>` : '';
   const rc = r.provider === 'terminal' ? ''
     : r.rcLink
     ? `<a class="${r.chat ? 'action' : 'action primary'}" href="${esc(r.rcLink)}" target="_blank" rel="noopener">${ICONS.external}<span>Open in Claude</span></a>`
@@ -346,17 +348,17 @@ function runningCard(r) {
   const termBtn = r.external ? ''
     : r.provider === 'codex' && !r.nativeTerminal
       ? '<span class="action pending">Terminal available for new or resumed sessions</span>'
-      : `<button class="action" type="button" data-term="${esc(r.name)}" data-title="${esc(r.dir.split('/').pop())}">${ICONS.terminal}<span>Terminal</span></button>`;
+      : `<button class="action" type="button" data-term="${esc(r.name)}" data-title="${title}">${ICONS.terminal}<span>Terminal</span></button>`;
   // The session's Chromium tab, shown only while its configured debugging port answers.
   const browserBtn = r.browser
-    ? `<button class="action" type="button" data-browser="${esc(r.name)}" data-title="${esc(r.dir.split('/').pop())}">${ICONS.globe}<span>Browser</span></button>` : '';
+    ? `<button class="action" type="button" data-browser="${esc(r.name)}" data-title="${title}">${ICONS.globe}<span>Browser</span></button>` : '';
   const rename = r.sid
     ? `<button class="action ghost" type="button" data-rename="${esc(r.sid)}" title="Rename session" aria-label="Rename session">${ICONS.pencil}</button>` : '';
   return `
     <div class="session ${status} ${r.external ? 'external' : ''}">
       <div class="session-head">
         <div class="session-headline">
-          <span class="session-title">${esc(r.displayName || r.dir.split('/').pop())}</span>
+          <span class="session-title">${title}</span>
         </div>
         ${r.provider === 'terminal' ? '' : `<span class="status ${r.working ? 'on' : 'off'}"><span class="dot"></span>${r.working ? 'Working' : 'Waiting'}</span>`}
       </div>
@@ -496,6 +498,7 @@ function render(d) {
     .map(row => `<div class="stats-row">${row.map(statTile).join('')}</div>`).join('');
 
   $('#running').innerHTML = d.running.map(runningCard).join('') || '<div class="empty">No running sessions</div>';
+  markChatCards();
   const runningSids = new Set(d.running.map(s => s.sid).filter(Boolean));
   // Remove stale cards even when an unrelated open picker defers the full render.
   for (const button of document.querySelectorAll('#pinned [data-resume], #resumable [data-resume]')) {
@@ -506,6 +509,7 @@ function render(d) {
   }
   lastRes = d.resumable;
   lastRunning = d.running;
+  retitleOverlays();
   listed = true;
   lastPinned = d.pinned || [];
   // Same rule for the pickers: re-rendering would snap an open menu shut.
@@ -1119,8 +1123,28 @@ document.addEventListener('visibilitychange', () => {
    dashboard's narrow column on wide ones (polling continues). */
 const wide = matchMedia('(min-width: 900px)');
 let chatFull = false;
+let chatOpenName = null; // the session whose chat overlay is open; its running card is highlighted
+
+// render() repaints the grid on every poll, so the highlight rides along there;
+// opening and closing apply it immediately, as polling pauses full-screen.
+// A rename lands on the next poll; overlays already open take the new headline too.
+function retitleOverlays() {
+  const title = name => { const r = lastRunning.find(r => r.name === name); return r && (r.displayName || r.dir.split('/').pop()); };
+  const chat = chatOpenName && title(chatOpenName);
+  if (chat) cdashChat.retitle(chat);
+  const t = term && title(term.name);
+  if (t) $('#term-title').textContent = t;
+  const b = browserView && title(browserView.name);
+  if (b) $('#browser-title').textContent = `Browser · ${b}`;
+}
+
+function markChatCards() {
+  for (const b of document.querySelectorAll('#running [data-chat]'))
+    b.closest('.session')?.classList?.toggle('chat-active', b.dataset.chat === chatOpenName);
+}
 
 function openChat(name, title) {
+  chatOpenName = name;
   const already = cdashChat.isOpen();
   cdashChat.open({
     name, title, wsUrl, toast,
@@ -1139,6 +1163,7 @@ function openChat(name, title) {
   if (isTauri) { try { invoke('notify_clear', { name }).catch(() => {}); } catch {} }
   else if ('serviceWorker' in navigator) navigator.serviceWorker.ready
     .then(r => r.getNotifications({ tag: name })).then(ns => ns.forEach(n => n.close())).catch(() => {});
+  markChatCards();
 }
 
 function closeChat() {
@@ -1146,6 +1171,8 @@ function closeChat() {
   cdashChat.close();
   document.body.classList.remove('chat-open');
   chatFull = false;
+  chatOpenName = null;
+  markChatCards();
   poll(); // the poll paused while a full-screen chat was open
 }
 
@@ -1189,7 +1216,7 @@ async function syncPush(pm, key, post) {
 let pendingOpen = null;
 function noteOpen(s, p) {
   if (!listed) { pendingOpen = [s, p]; return; }
-  if (lastRunning.some(r => r.name === s && r.chat)) openChat(s, p || s);
+  if (lastRunning.some(r => r.name === s && r.chat)) openChat(s, lastRunning.find(r => r.name === s)?.displayName || p || s);
   else toast('That session has ended');
 }
 function flushOpen() {
