@@ -5,6 +5,7 @@ import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { createServer, createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
 import { readFile, writeFile, rename, mkdir, chmod, rm, readdir, mkdtemp, open, access, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
@@ -360,7 +361,8 @@ async function worker() {
     saved = saved.then(async () => {
       await atomic(statePath, json);
       if (namePath && namePath !== savedNamePath) {
-        await atomic(namePath, state.display_name);
+        // A dashboard rename owns the sidecar once it exists; resume carries it back into state.
+        if (!existsSync(namePath)) await atomic(namePath, state.display_name);
         savedNamePath = namePath;
       }
     });

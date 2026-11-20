@@ -53,6 +53,7 @@ crate::guarded_routes! {
     post "/api/push/unsubscribe" => routes::post_push_unsubscribe,
     post "/api/favorites" => routes::post_favorites,
     post "/api/pin" => routes::post_pin,
+    post "/api/rename" => routes::post_rename,
     post "/api/launch" => routes::post_launch,
     post "/api/resume" => routes::post_resume,
     post "/api/kill" => routes::post_kill,

@@ -115,10 +115,11 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
             continue;
         }
         if let Some(s) = super::opencode::snapshot(ctx, &p.name, p.pid).await {
+            let renamed = match s.sid.as_deref() { Some(sid) => super::opencode::owned_name(ctx, sid).await, None => None };
             let cpu = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner()).tree_usage(p.pid);
             let git = Arc::clone(&ctx.git).status_for(Arc::clone(&ctx.runner), &p.path, now as u64);
             running.push(Session {
-                display_name: s.display_name.or_else(|| s.sid.as_deref().map(|sid| super::names::session_name("OpenCode", &s.dir, sid))),
+                display_name: renamed.or(s.display_name).or_else(|| s.sid.as_deref().map(|sid| super::names::session_name("OpenCode", &s.dir, sid))),
                 name: p.name.clone(), dir: s.dir, pid: p.pid,
                 uptime_sec: ((now / 1000.0 - p.created as f64).round() as i64).max(0),
                 model: s.model_label.or(s.model).or_else(|| Some("OpenCode".into())), effort: None, variant: s.variant,
@@ -130,10 +131,11 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
             continue;
         }
         if let Some(s) = super::codex::snapshot(ctx, &p.name, p.pid).await {
+            let renamed = match s.sid.as_deref() { Some(sid) => super::codex::sid_name(ctx, sid).await, None => None };
             let cpu = ctx.host.sampler.lock().unwrap_or_else(|e| e.into_inner()).tree_usage(p.pid);
             let git = Arc::clone(&ctx.git).status_for(Arc::clone(&ctx.runner), &p.path, now as u64);
             running.push(Session {
-                display_name: s.display_name.or_else(|| s.sid.as_deref().map(|sid| super::names::session_name("Codex", &s.dir, sid))),
+                display_name: renamed.or(s.display_name).or_else(|| s.sid.as_deref().map(|sid| super::names::session_name("Codex", &s.dir, sid))),
                 name: p.name.clone(), dir: s.dir, pid: p.pid,
                 uptime_sec: ((now / 1000.0 - p.created as f64).round() as i64).max(0),
                 model: s.model_label.or(s.model).or_else(|| Some("Codex".into())), effort: s.effort, variant: None,
@@ -723,6 +725,29 @@ mod tests {
         assert_eq!(response.resumable[0].sid, "ses_saved");
         assert_eq!(response.resumable[0].variant.as_deref(), Some("deep"));
         assert_eq!(response.resumable[0].prompts, ["Resume work"]);
+    }
+
+    #[tokio::test]
+    async fn a_renamed_sidecar_beats_the_running_snapshot_name() {
+        const SID: &str = "0123abcd-0123-4567-89ab-0123456789ab";
+        for (tool, sid, sidecar, contents) in [
+            ("cdash-codex", SID, format!("{SID}.name"), "Renamed".to_string()),
+            ("cdash-opencode", "ses_live", "ses_live.owned.json".into(), r#"{"sid":"ses_live","dir":"/proj","display_name":"Renamed"}"#.into()),
+        ] {
+            let d = tempdir(&format!("renamed-{tool}"));
+            let root = d.join(tool);
+            std::fs::create_dir_all(&root).unwrap();
+            let state = serde_json::json!({"sid":sid, "dir":"/proj", "pid":4242, "native_terminal":true, "display_name":"Old"});
+            std::fs::write(root.join("cdash-test-1200-abc.json"), state.to_string()).unwrap();
+            std::fs::write(root.join("cdash-test-1200-abc.native"), state.to_string()).unwrap();
+            std::fs::write(root.join(&sidecar), contents).unwrap();
+            let path = fake_tmux(&d, "cdash-test-1200-abc|4242|1785050000||/proj");
+            let ctx = ctx_with_path(d, path);
+            *ctx.opencode_threads.lock().await = Some((std::time::Instant::now(), Vec::new()));
+            *ctx.codex_threads.lock().await = Some((std::time::Instant::now(), Vec::new()));
+            let r = collect_sessions(&ctx, RESUMABLE_MAX).await;
+            assert_eq!(r.running[0].display_name.as_deref(), Some("Renamed"), "{tool}");
+        }
     }
 
     #[tokio::test]

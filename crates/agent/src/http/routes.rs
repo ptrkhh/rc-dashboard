@@ -159,6 +159,18 @@ pub struct PinBody {
 }
 
 #[derive(Deserialize)]
+pub struct RenameBody {
+    #[serde(default)]
+    pub tool: String,
+    #[serde(default)]
+    pub sid: String,
+    #[serde(default)]
+    pub dir: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Deserialize)]
 pub struct ResumeBody {
     #[serde(default)]
     pub sid: String,
@@ -191,6 +203,14 @@ pub async fn post_pin(
     Json(body): Json<PinBody>,
 ) -> Result<Response, ApiError> {
     crate::collect::pins::set_pin(&ctx, &body.sid, body.pinned).await?;
+    Ok(Json(serde_json::json!({ "ok": true })).into_response())
+}
+
+pub async fn post_rename(
+    State(ctx): State<Arc<Ctx>>,
+    Json(body): Json<RenameBody>,
+) -> Result<Response, ApiError> {
+    crate::collect::rename::rename(&ctx, &body.tool, &body.sid, &body.dir, &body.name).await?;
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
