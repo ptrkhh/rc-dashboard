@@ -18,7 +18,8 @@ const FAILED: &str = "rewind failed; use Terminal";
 pub(crate) const DRAFT: &str = "Clear the Terminal input first";
 const RESUMED: &str = "Claude was resumed after a compaction and cannot rewind to before it";
 const SELECTOR_HEAD: &str = "Restore the code and/or conversation to the point before";
-const CONFIRM_HEAD: &str = "Confirm you want to restore to the point before you sent this message:";
+/// 2.1.325 leads with `Confirm you want to restore`, 2.1.327 with `Restore`.
+const CONFIRM_HEAD: &str = "to the point before you sent this message:";
 
 /// The pane chat drives. Named `Tui` because `tmux_io::Pane` already exists.
 pub trait Tui: Sync {
@@ -499,7 +500,7 @@ mod tests {
                 }
                 View::Confirm => {
                     let quote = self.quote.clone().unwrap_or_else(|| self.entries[s.cursor].clone());
-                    out += "   Confirm you want to restore to the point before you sent this message:\n";
+                    out += "   Restore to the point before you sent this message:\n";
                     // Wrapped at a word to the pane, as Claude does.
                     let mut line = String::new();
                     for w in quote.split(' ') {
@@ -612,6 +613,8 @@ mod tests {
         let c = confirm(CONFIRM).unwrap();
         assert_eq!(c.quoted, "Append the line b to f.txt, then reply with only: done");
         assert_eq!(c.options, owned(&NO_CODE));
+        let new_head = CONFIRM.replace("Confirm you want to restore", "Restore");
+        assert_eq!(confirm(&new_head).unwrap().quoted, c.quoted, "the 2.1.327 heading");
         let code = confirm(CONFIRM_CODE).unwrap();
         assert_eq!(code.options, owned(&WITH_CODE), "the scrolled `↓ 5.` row is not an option to press");
         assert!(selector_entry("❯ hello").is_none() && confirm(SELECTOR).is_none() && selector_entry(CONFIRM).is_none(), "an input box or the other screen is not mistaken");
