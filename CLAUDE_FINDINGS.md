@@ -222,7 +222,9 @@ Enter submitted it.
     restore`. The transcript holds no `user` record for it, only the
     `attachment` of type `queued_command` (`commandMode: "prompt"`) that a
     message absorbed mid-turn writes.
-- **(b) The confirm screen.** Enter on a row without code changes:
+- **(b) The confirm screen.** Enter on a row without code changes (on
+  2.1.327 the heading reads `Restore to the point before you sent this
+  message:`; the rest is the same):
 
   ```
      Rewind
