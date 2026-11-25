@@ -1,6 +1,6 @@
 use super::ctx::Ctx;
 use super::fsio::write_atomic;
-use super::validate::{assert_valid_sid, Refused};
+use super::validate::{assert_opencode_sid, assert_valid_sid, Refused};
 use std::collections::BTreeSet;
 
 pub async fn read_pins(ctx: &Ctx) -> std::io::Result<BTreeSet<String>> {
@@ -12,7 +12,7 @@ pub async fn read_pins(ctx: &Ctx) -> std::io::Result<BTreeSet<String>> {
 }
 
 pub async fn set_pin(ctx: &Ctx, sid: &str, pinned: bool) -> Result<(), Refused> {
-    assert_valid_sid(sid)?;
+    if sid.starts_with("ses_") { assert_opencode_sid(sid)?; } else { assert_valid_sid(sid)?; }
     // Serialize read-modify-write so concurrent clients cannot lose another pin.
     let _guard = ctx.pin_lock.lock().await;
     let save = async {

@@ -621,6 +621,8 @@ mod tests {
         let (status, _) = http_post(&url, &serde_json::json!({"sid":sid,"pinned":false}).to_string()).await;
         assert_eq!(status, 200);
         assert_eq!(std::fs::read_to_string(d.join("cdash-pins.json")).unwrap(), "[]");
+        let (status, _) = http_post(&url, r#"{"sid":"ses_e028af63cffe5o14lTvyLMZI20","pinned":true}"#).await;
+        assert_eq!(status, 200, "OpenCode sids are pinnable");
     }
 
     #[tokio::test]
