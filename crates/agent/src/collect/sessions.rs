@@ -195,11 +195,13 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
         let status = sess.as_ref().and_then(|s| s.status.as_deref());
         let written = tr.as_ref().map(|(file, mtime)| (file.as_path(), *mtime));
         let working = super::external::claude_working(status, written, &rows, p.pid, now).await;
-        let (mut last_message, mut sid) = (None, None);
+        let (mut last_message, mut sid, mut last_ts) = (None, None, None);
         if let Some((file, _)) = &tr {
             sid = file.file_stem().map(|s| s.to_string_lossy().into_owned());
             if let Some(txt) = read_tail(file).await {
-                last_message = parse_transcript(&txt).last_assistant_text;
+                let parsed = parse_transcript(&txt);
+                last_message = parsed.last_assistant_text;
+                last_ts = parsed.last_ts_ms;
             }
         }
 
@@ -223,7 +225,14 @@ pub async fn collect_sessions(ctx: &Arc<Ctx>, limit: usize) -> SessionsResponse 
         // No link by the end of the launch's link-poll window: Remote Control
         // is not coming, so say so instead of "Waiting for link" forever.
         let rc_window = (super::spawn::RC_POLL_INTERVAL * super::spawn::RC_POLL_ATTEMPTS).as_secs() as i64;
-        let active = tr.as_ref().map_or(launched, |(_, mtime)| mtime.max(launched));
+        // The records' own clock outranks the filesystem's: a background tool
+        // can (and here does) re-stamp an idle transcript's mtime, but it
+        // cannot edit the conversation. mtime is only the fallback when the
+        // tail yielded no timestamp.
+        let active = last_ts
+            .or_else(|| tr.as_ref().map(|(_, mtime)| *mtime))
+            .unwrap_or(launched)
+            .max(launched);
         running.push((active, Session {
             display_name,
             name: p.name.clone(),

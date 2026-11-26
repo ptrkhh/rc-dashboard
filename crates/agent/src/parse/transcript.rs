@@ -12,6 +12,22 @@ pub struct Transcript {
     /// same turn's effort (`None` on models with no effort setting).
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Epoch ms of the newest `timestamp` among the parsed records. A file's
+    /// mtime is no proof of conversation activity (background tools re-stamp
+    /// it); the records' own timestamps are.
+    pub last_ts_ms: Option<f64>,
+}
+
+/// Lenient like history's numeric acceptance: JSON numbers are epoch ms,
+/// strings are RFC 3339; anything else is treated as absent.
+fn timestamp_ms(v: &Value) -> Option<f64> {
+    use time::format_description::well_known::Rfc3339;
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => time::OffsetDateTime::parse(s, &Rfc3339).ok()
+            .map(|t| t.unix_timestamp_nanos() as f64 / 1e6),
+        _ => None,
+    }
 }
 
 /// Parse a session transcript (newline-delimited JSON) into summary fields.
@@ -25,6 +41,10 @@ pub fn parse_transcript(jsonl: &str) -> Transcript {
     let mut t = Transcript::default();
 
     for e in parse_lines::<Value>(jsonl) {
+        if let Some(ms) = e.get("timestamp").and_then(timestamp_ms) {
+            t.last_ts_ms = Some(t.last_ts_ms.map_or(ms, |cur| cur.max(ms)));
+        }
+
         if t.branch.is_none() {
             if let Some(b) = e.get("gitBranch").and_then(|v| v.as_str()) {
                 if !b.is_empty() && b != "HEAD" {
@@ -172,6 +192,29 @@ mod tests {
         .join("\n");
         let m = parse_transcript(&jsonl);
         assert_eq!((m.model.as_deref(), m.effort.as_deref()), (Some("claude-haiku-4-5-20251001"), None));
+    }
+
+    #[test]
+    fn last_ts_is_the_newest_record_timestamp_in_epoch_ms() {
+        let jsonl = [
+            r#"{"type":"user","timestamp":"2026-11-25T09:00:00.000Z"}"#,
+            r#"{"type":"system","timestamp":"not a time"}"#,
+        ]
+        .join("\n");
+        assert_eq!(parse_transcript(&jsonl).last_ts_ms, Some(1_795_597_200_000.0));
+
+        // Numbers count as epoch ms (history.jsonl's shape); the newest wins.
+        let jsonl = [
+            r#"{"type":"user","timestamp":300}"#,
+            r#"{"type":"assistant","timestamp":100}"#,
+        ]
+        .join("\n");
+        assert_eq!(parse_transcript(&jsonl).last_ts_ms, Some(300.0));
+
+        // Absent, wrong-typed, or a truncated tail line simply yield None.
+        assert_eq!(parse_transcript(r#"{"type":"assistant"}"#).last_ts_ms, None);
+        assert_eq!(parse_transcript(r#"{"timestamp":true}"#).last_ts_ms, None);
+        assert_eq!(parse_transcript(r#"{"timestamp":1,"cut"#).last_ts_ms, None);
     }
 
     #[test]
