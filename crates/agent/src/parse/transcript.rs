@@ -18,16 +18,10 @@ pub struct Transcript {
     pub last_ts_ms: Option<f64>,
 }
 
-/// Lenient like history's numeric acceptance: JSON numbers are epoch ms,
-/// strings are RFC 3339; anything else is treated as absent.
+/// Transcript records stamp RFC 3339 strings; anything else is treated as absent.
 fn timestamp_ms(v: &Value) -> Option<f64> {
-    use time::format_description::well_known::Rfc3339;
-    match v {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => time::OffsetDateTime::parse(s, &Rfc3339).ok()
-            .map(|t| t.unix_timestamp_nanos() as f64 / 1e6),
-        _ => None,
-    }
+    let t = time::OffsetDateTime::parse(v.as_str()?, &time::format_description::well_known::Rfc3339).ok()?;
+    Some(t.unix_timestamp_nanos() as f64 / 1e6)
 }
 
 /// Parse a session transcript (newline-delimited JSON) into summary fields.
@@ -196,24 +190,18 @@ mod tests {
 
     #[test]
     fn last_ts_is_the_newest_record_timestamp_in_epoch_ms() {
+        // The newest wins even when an older record comes later.
         let jsonl = [
             r#"{"type":"user","timestamp":"2026-11-25T09:00:00.000Z"}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-25T08:00:00.000Z"}"#,
             r#"{"type":"system","timestamp":"not a time"}"#,
         ]
         .join("\n");
         assert_eq!(parse_transcript(&jsonl).last_ts_ms, Some(1_795_597_200_000.0));
 
-        // Numbers count as epoch ms (history.jsonl's shape); the newest wins.
-        let jsonl = [
-            r#"{"type":"user","timestamp":300}"#,
-            r#"{"type":"assistant","timestamp":100}"#,
-        ]
-        .join("\n");
-        assert_eq!(parse_transcript(&jsonl).last_ts_ms, Some(300.0));
-
         // Absent, wrong-typed, or a truncated tail line simply yield None.
         assert_eq!(parse_transcript(r#"{"type":"assistant"}"#).last_ts_ms, None);
-        assert_eq!(parse_transcript(r#"{"timestamp":true}"#).last_ts_ms, None);
+        assert_eq!(parse_transcript(r#"{"timestamp":300}"#).last_ts_ms, None);
         assert_eq!(parse_transcript(r#"{"timestamp":1,"cut"#).last_ts_ms, None);
     }
 
